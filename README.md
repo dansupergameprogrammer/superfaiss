@@ -44,6 +44,27 @@ zero-norm row is a bake-time error, not a runtime branch). Interchange is a two-
 sidecar: `<name>.wvbank.json` (header) + `<name>.wvbank.bin` (raw float32 rows) — trivial
 to emit from any pipeline in a few lines.
 
+## Documentation
+
+- [FORMAT.md](docs/FORMAT.md) — the `.wvbank` interchange format and baked memory
+  layout (the format is an open standard; emit it from any pipeline)
+- [API.md](docs/API.md) — full public API reference
+- [DETERMINISM.md](docs/DETERMINISM.md) — the bit-exactness guarantees, their
+  mechanisms, and embedder obligations
+- [INTEGRATION.md](docs/INTEGRATION.md) — embedding in an engine: build flags,
+  memory/threading/pipeline seams, the performance model, what to test
+
+## Measured (desktop, AVX2, 40k vectors x 100 dims, int8, exact top-10)
+
+| Path | Per query |
+|---|---|
+| Serial scan, one core | ~0.5 ms |
+| Chunk-parallel (host scheduler over `ScoreChunk` + `MergeTopK`) | ~0.13 ms |
+| Batched (64 queries, one pass, pair kernels) | ~0.06 ms |
+
+Same answers on every path, bit for bit — that equivalence is test-enforced, not
+aspirational.
+
 ## Building
 
 Any C++17 compiler. `build.bat` (MSVC), or CMake:
