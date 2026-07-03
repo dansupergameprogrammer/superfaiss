@@ -1,0 +1,40 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build
+      - run: cmake --build build --config Release
+      - shell: pwsh
+        run: |
+          $out = & build/Release/superfaiss_tests.exe
+          Write-Output $out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($out -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
+
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: |
+          out=$(./build/superfaiss_tests)
+          echo "$out"
+          echo "$out" | grep -E "simd path: (sse|avx2)" > /dev/null
+
+  # GitHub macOS runners are Apple Silicon: this executes the NEON path on real ARM.
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: |
+          out=$(./build/superfaiss_tests)
+          echo "$out"
+          echo "$out" | grep "simd path: neon" > /dev/null
