@@ -1,7 +1,10 @@
 # SuperFAISS
 
+[![tests](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml/badge.svg)](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml)
+
 Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding banks,
 built for game runtimes. Dependency-free C++17 — the standard library and nothing else.
+CI-verified on Windows x64, Linux x64 (AVX2), and macOS arm64 (NEON); four compilers.
 
 SuperFAISS is an **independent implementation**. It is **not a fork of, derived from, or
 affiliated with Meta's FAISS**; the name is nominative homage to the library that defined
