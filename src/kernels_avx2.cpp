@@ -101,24 +101,24 @@ float DotF32Avx2(const float* row, const float* query, int32_t paddedDims)
 	int32_t i = 0;
 	for (; i + 32 <= paddedDims; i += 32)
 	{
-		acc0 = _mm256_fmadd_ps(_mm256_load_ps(row + i), _mm256_load_ps(query + i), acc0);
-		acc1 = _mm256_fmadd_ps(_mm256_load_ps(row + i + 8), _mm256_load_ps(query + i + 8), acc1);
-		acc2 = _mm256_fmadd_ps(_mm256_load_ps(row + i + 16), _mm256_load_ps(query + i + 16), acc2);
-		acc3 = _mm256_fmadd_ps(_mm256_load_ps(row + i + 24), _mm256_load_ps(query + i + 24), acc3);
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(query + i), acc0);
+		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i + 8), _mm256_loadu_ps(query + i + 8), acc1);
+		acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i + 16), _mm256_loadu_ps(query + i + 16), acc2);
+		acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i + 24), _mm256_loadu_ps(query + i + 24), acc3);
 	}
 	if (i + 8 <= paddedDims)
 	{
-		acc0 = _mm256_fmadd_ps(_mm256_load_ps(row + i), _mm256_load_ps(query + i), acc0);
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(query + i), acc0);
 		i += 8;
 	}
 	if (i + 8 <= paddedDims)
 	{
-		acc1 = _mm256_fmadd_ps(_mm256_load_ps(row + i), _mm256_load_ps(query + i), acc1);
+		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(query + i), acc1);
 		i += 8;
 	}
 	if (i + 8 <= paddedDims)
 	{
-		acc2 = _mm256_fmadd_ps(_mm256_load_ps(row + i), _mm256_load_ps(query + i), acc2);
+		acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(query + i), acc2);
 	}
 	return (SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3));
 }
@@ -133,10 +133,10 @@ float L2F32Avx2(const float* row, const float* query, int32_t paddedDims)
 	int32_t i = 0;
 	for (; i + 32 <= paddedDims; i += 32)
 	{
-		const __m256 d0 = _mm256_sub_ps(_mm256_load_ps(query + i), _mm256_load_ps(row + i));
-		const __m256 d1 = _mm256_sub_ps(_mm256_load_ps(query + i + 8), _mm256_load_ps(row + i + 8));
-		const __m256 d2 = _mm256_sub_ps(_mm256_load_ps(query + i + 16), _mm256_load_ps(row + i + 16));
-		const __m256 d3 = _mm256_sub_ps(_mm256_load_ps(query + i + 24), _mm256_load_ps(row + i + 24));
+		const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(query + i), _mm256_loadu_ps(row + i));
+		const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 8), _mm256_loadu_ps(row + i + 8));
+		const __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 16), _mm256_loadu_ps(row + i + 16));
+		const __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(query + i + 24), _mm256_loadu_ps(row + i + 24));
 		acc0 = _mm256_fmadd_ps(d0, d0, acc0);
 		acc1 = _mm256_fmadd_ps(d1, d1, acc1);
 		acc2 = _mm256_fmadd_ps(d2, d2, acc2);
@@ -144,19 +144,19 @@ float L2F32Avx2(const float* row, const float* query, int32_t paddedDims)
 	}
 	if (i + 8 <= paddedDims)
 	{
-		const __m256 d = _mm256_sub_ps(_mm256_load_ps(query + i), _mm256_load_ps(row + i));
+		const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(query + i), _mm256_loadu_ps(row + i));
 		acc0 = _mm256_fmadd_ps(d, d, acc0);
 		i += 8;
 	}
 	if (i + 8 <= paddedDims)
 	{
-		const __m256 d = _mm256_sub_ps(_mm256_load_ps(query + i), _mm256_load_ps(row + i));
+		const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(query + i), _mm256_loadu_ps(row + i));
 		acc1 = _mm256_fmadd_ps(d, d, acc1);
 		i += 8;
 	}
 	if (i + 8 <= paddedDims)
 	{
-		const __m256 d = _mm256_sub_ps(_mm256_load_ps(query + i), _mm256_load_ps(row + i));
+		const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(query + i), _mm256_loadu_ps(row + i));
 		acc2 = _mm256_fmadd_ps(d, d, acc2);
 	}
 	return (SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3));
@@ -172,16 +172,16 @@ float DotI8Avx2(const int8_t* row, float scale, const float* query, int32_t padd
 	int32_t i = 0;
 	for (; i + 32 <= paddedDims; i += 32)
 	{
-		acc0 = _mm256_fmadd_ps(WidenI8x8(row + i), _mm256_load_ps(query + i), acc0);
-		acc1 = _mm256_fmadd_ps(WidenI8x8(row + i + 8), _mm256_load_ps(query + i + 8), acc1);
-		acc2 = _mm256_fmadd_ps(WidenI8x8(row + i + 16), _mm256_load_ps(query + i + 16), acc2);
-		acc3 = _mm256_fmadd_ps(WidenI8x8(row + i + 24), _mm256_load_ps(query + i + 24), acc3);
+		acc0 = _mm256_fmadd_ps(WidenI8x8(row + i), _mm256_loadu_ps(query + i), acc0);
+		acc1 = _mm256_fmadd_ps(WidenI8x8(row + i + 8), _mm256_loadu_ps(query + i + 8), acc1);
+		acc2 = _mm256_fmadd_ps(WidenI8x8(row + i + 16), _mm256_loadu_ps(query + i + 16), acc2);
+		acc3 = _mm256_fmadd_ps(WidenI8x8(row + i + 24), _mm256_loadu_ps(query + i + 24), acc3);
 	}
 	// Int8 stride is a multiple of 16: at most one 16-element half-block remains.
 	if (i + 16 <= paddedDims)
 	{
-		acc0 = _mm256_fmadd_ps(WidenI8x8(row + i), _mm256_load_ps(query + i), acc0);
-		acc1 = _mm256_fmadd_ps(WidenI8x8(row + i + 8), _mm256_load_ps(query + i + 8), acc1);
+		acc0 = _mm256_fmadd_ps(WidenI8x8(row + i), _mm256_loadu_ps(query + i), acc0);
+		acc1 = _mm256_fmadd_ps(WidenI8x8(row + i + 8), _mm256_loadu_ps(query + i + 8), acc1);
 	}
 	return scale * ((SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3)));
 }
@@ -197,10 +197,10 @@ float L2I8Avx2(const int8_t* row, float scale, const float* query, int32_t padde
 	int32_t i = 0;
 	for (; i + 32 <= paddedDims; i += 32)
 	{
-		const __m256 d0 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i), _mm256_load_ps(query + i));
-		const __m256 d1 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 8), _mm256_load_ps(query + i + 8));
-		const __m256 d2 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 16), _mm256_load_ps(query + i + 16));
-		const __m256 d3 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 24), _mm256_load_ps(query + i + 24));
+		const __m256 d0 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i), _mm256_loadu_ps(query + i));
+		const __m256 d1 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 8), _mm256_loadu_ps(query + i + 8));
+		const __m256 d2 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 16), _mm256_loadu_ps(query + i + 16));
+		const __m256 d3 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 24), _mm256_loadu_ps(query + i + 24));
 		acc0 = _mm256_fmadd_ps(d0, d0, acc0);
 		acc1 = _mm256_fmadd_ps(d1, d1, acc1);
 		acc2 = _mm256_fmadd_ps(d2, d2, acc2);
@@ -208,8 +208,8 @@ float L2I8Avx2(const int8_t* row, float scale, const float* query, int32_t padde
 	}
 	if (i + 16 <= paddedDims)
 	{
-		const __m256 d0 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i), _mm256_load_ps(query + i));
-		const __m256 d1 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 8), _mm256_load_ps(query + i + 8));
+		const __m256 d0 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i), _mm256_loadu_ps(query + i));
+		const __m256 d1 = _mm256_fnmadd_ps(scaleV, WidenI8x8(row + i + 8), _mm256_loadu_ps(query + i + 8));
 		acc0 = _mm256_fmadd_ps(d0, d0, acc0);
 		acc1 = _mm256_fmadd_ps(d1, d1, acc1);
 	}
