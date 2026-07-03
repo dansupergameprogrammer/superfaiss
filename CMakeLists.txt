@@ -24,6 +24,11 @@ if(MSVC)
 	set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
 	target_compile_options(superfaiss PRIVATE -Wall -Wextra -ffp-contract=off)
+	# GCC/Clang default to the SSE2 baseline on x86; the SSE kernels are SSE4.1.
+	# (The AVX2 TU needs no flags — its functions carry target("avx2,fma") attributes.)
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+		set_source_files_properties(src/kernels.cpp PROPERTIES COMPILE_OPTIONS "-msse4.2")
+	endif()
 endif()
 
 add_executable(superfaiss_tests tests/test_main.cpp)
