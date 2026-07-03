@@ -32,6 +32,7 @@ enum class Status : uint8_t
 	BadAlignment,
 	BadFormat,
 	ZeroNormRow,
+	OutOfMemory,
 };
 
 // Required alignment of bank row data and query buffers, in bytes.

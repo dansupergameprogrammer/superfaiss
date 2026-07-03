@@ -33,6 +33,10 @@ namespace detail
 
 // Reusable query scratch. Reserve() sizes it for a given k and batch width; queries
 // then run allocation-free until a larger reservation is needed.
+//
+// Ownership contract: a Workspace has a single owner and is NOT thread-safe. It serves
+// one Query/QueryBatch call at a time; concurrent queries need one Workspace each
+// (an async host should pool them, one per in-flight task).
 class Workspace
 {
 public:

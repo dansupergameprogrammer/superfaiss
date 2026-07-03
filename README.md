@@ -46,12 +46,15 @@ to emit from any pipeline in a few lines.
 Any C++17 compiler. `build.bat` (MSVC), or CMake:
 
 ```
-cmake -B build && cmake --build build && build/tests/superfaiss_tests
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests
 ```
+(MSVC multi-config: `build/Release/superfaiss_tests.exe`; or use `build.bat`.)
 
-SIMD is selected at compile time: SSE4.1 on x86/x64, NEON on ARM/ARM64, and a scalar
-fallback that is bit-identical to the SIMD paths (same striped accumulation order)
-everywhere else.
+SIMD: NEON on ARM/ARM64 and SSE4.1 on x86/x64 are selected at compile time, with a
+runtime cpuid upgrade to AVX2+FMA on x86 hardware that supports it, and a scalar
+fallback elsewhere. Every path has a scalar mirror with the identical accumulation
+(and, for AVX2, `std::fma`) structure, so SIMD and mirror results are bit-identical on
+a given device — enforced by the test suite.
 
 ## License
 

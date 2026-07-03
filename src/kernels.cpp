@@ -54,7 +54,12 @@ namespace detail
 #endif
 	}
 
-	static const bool GAvx2 = DetectAvx2Fma();
+	// Lazy magic-static: immune to cross-TU static-init ordering (Poirot O2).
+	static bool IsAvx2()
+	{
+		static const bool v = DetectAvx2Fma();
+		return v;
+	}
 }
 #endif // SUPERFAISS_SIMD_SSE
 
@@ -63,7 +68,7 @@ SimdPath ActiveSimdPath()
 #if defined(SUPERFAISS_SIMD_NEON)
 	return SimdPath::NEON;
 #elif defined(SUPERFAISS_SIMD_SSE)
-	return detail::GAvx2 ? SimdPath::AVX2 : SimdPath::SSE;
+	return detail::IsAvx2() ? SimdPath::AVX2 : SimdPath::SSE;
 #else
 	return SimdPath::Scalar;
 #endif
@@ -355,28 +360,28 @@ static float L2I8Sse(const int8_t* row, float scale, const float* query, int32_t
 
 float DotF32(const float* row, const float* query, int32_t paddedDims)
 {
-	return (GAvx2 && (paddedDims % 8) == 0)
+	return (IsAvx2() && (paddedDims % 8) == 0)
 		? DotF32Avx2(row, query, paddedDims)
 		: DotF32Sse(row, query, paddedDims);
 }
 
 float L2F32(const float* row, const float* query, int32_t paddedDims)
 {
-	return (GAvx2 && (paddedDims % 8) == 0)
+	return (IsAvx2() && (paddedDims % 8) == 0)
 		? L2F32Avx2(row, query, paddedDims)
 		: L2F32Sse(row, query, paddedDims);
 }
 
 float DotI8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
 {
-	return GAvx2
+	return IsAvx2()
 		? DotI8Avx2(row, scale, query, paddedDims)
 		: DotI8Sse(row, scale, query, paddedDims);
 }
 
 float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
 {
-	return GAvx2
+	return IsAvx2()
 		? L2I8Avx2(row, scale, query, paddedDims)
 		: L2I8Sse(row, scale, query, paddedDims);
 }
@@ -385,28 +390,28 @@ float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDim
 
 float DotF32Mirror(const float* row, const float* query, int32_t paddedDims)
 {
-	return (GAvx2 && (paddedDims % 8) == 0)
+	return (IsAvx2() && (paddedDims % 8) == 0)
 		? DotF32ScalarAvx2(row, query, paddedDims)
 		: DotF32Scalar(row, query, paddedDims);
 }
 
 float L2F32Mirror(const float* row, const float* query, int32_t paddedDims)
 {
-	return (GAvx2 && (paddedDims % 8) == 0)
+	return (IsAvx2() && (paddedDims % 8) == 0)
 		? L2F32ScalarAvx2(row, query, paddedDims)
 		: L2F32Scalar(row, query, paddedDims);
 }
 
 float DotI8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
 {
-	return GAvx2
+	return IsAvx2()
 		? DotI8ScalarAvx2(row, scale, query, paddedDims)
 		: DotI8Scalar(row, scale, query, paddedDims);
 }
 
 float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
 {
-	return GAvx2
+	return IsAvx2()
 		? L2I8ScalarAvx2(row, scale, query, paddedDims)
 		: L2I8Scalar(row, scale, query, paddedDims);
 }

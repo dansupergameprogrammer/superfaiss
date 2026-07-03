@@ -33,7 +33,7 @@ Status Query(
 
 	if (!workspace.Reserve(params.k, 1))
 	{
-		return Status::InvalidArgument;
+		return Status::OutOfMemory;
 	}
 
 	TopK topk;
@@ -56,7 +56,7 @@ static constexpr int32_t kSubBatchWidth = 64;
 
 namespace
 {
-	Status QuerySubBatch(
+	void QuerySubBatch(
 		const BankView& bank,
 		const float* paddedQueries,
 		int32_t queryCount,
@@ -91,7 +91,6 @@ namespace
 		{
 			outCounts[m] = topks[m].Finalize(outHits + static_cast<int64_t>(m) * params.k);
 		}
-		return Status::Ok;
 	}
 }
 
@@ -130,14 +129,14 @@ Status QueryBatch(
 	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
 	if (!workspace.Reserve(params.k, maxWidth))
 	{
-		return Status::InvalidArgument;
+		return Status::OutOfMemory;
 	}
 
 	for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
 	{
 		const int32_t width =
 			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
-		const Status s = QuerySubBatch(
+		QuerySubBatch(
 			bank,
 			paddedQueries + static_cast<int64_t>(base) * bank.paddedDims,
 			width,
@@ -145,10 +144,6 @@ Status QueryBatch(
 			workspace,
 			outHits + static_cast<int64_t>(base) * params.k,
 			outCounts + base);
-		if (s != Status::Ok)
-		{
-			return s;
-		}
 	}
 	return Status::Ok;
 }

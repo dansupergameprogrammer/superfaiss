@@ -786,10 +786,150 @@ static void TestSimdEqualsScalar()
 }
 
 // ---------------------------------------------------------------------------
+// T12 — MergeTopK: per-chunk scans merged externally are bit-identical to a single
+// Query over the same bank (the parallel-driver contract; Poirot M1).
+
+static void TestMergeTopK()
+{
+	Rng rng(43);
+	// Big enough for several chunks; includes duplicate rows so merge sees ties.
+	const int32_t count = 5000;
+	TestBank bank(rng, count, 64, Quantization::Float32, Metric::Dot);
+	// Duplicate row 7 into rows 100..104 (crosses chunk boundaries at this size).
+	{
+		float* rows = static_cast<float*>(const_cast<void*>(bank.view.rows));
+		for (int32_t r = 100; r < 105; ++r)
+		{
+			std::memcpy(rows + static_cast<size_t>(r) * bank.view.paddedDims,
+				rows + static_cast<size_t>(7) * bank.view.paddedDims,
+				static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+		}
+	}
+
+	std::vector<float> q(64);
+	for (auto& v : q)
+	{
+		v = rng.NextFloat();
+	}
+	AlignedBuf qbuf(bank.view.paddedDims * sizeof(float));
+	PadQuery(q, bank.view.paddedDims, qbuf.F32());
+
+	const int32_t k = 16;
+	QueryParams params;
+	params.k = k;
+
+	// Reference: the normal single-call path.
+	Workspace ws;
+	std::vector<Hit> whole(static_cast<size_t>(k));
+	int32_t wholeCount = 0;
+	CHECK(Query(bank.view, qbuf.F32(), params, ws, whole.data(), &wholeCount) == Status::Ok);
+
+	// Chunked: one TopK per chunk, finalized, then merged — in order and in a shuffled
+	// order (the total order makes list order irrelevant; prove it).
+	const int32_t chunks = ChunkCount(bank.view);
+	std::vector<std::vector<Hit>> lists(static_cast<size_t>(chunks));
+	std::vector<Hit> heap(static_cast<size_t>(k));
+	for (int32_t c = 0; c < chunks; ++c)
+	{
+		TopK topk;
+		topk.Init(heap.data(), k, bank.view.metric);
+		ScoreChunk(bank.view, qbuf.F32(), c, nullptr, topk);
+		lists[static_cast<size_t>(c)].resize(static_cast<size_t>(k));
+		const int32_t n = topk.Finalize(lists[static_cast<size_t>(c)].data());
+		lists[static_cast<size_t>(c)].resize(static_cast<size_t>(n));
+	}
+
+	auto merge = [&](bool reversed) {
+		std::vector<const Hit*> ptrs;
+		std::vector<int32_t> counts;
+		for (int32_t c = 0; c < chunks; ++c)
+		{
+			const int32_t idx = reversed ? (chunks - 1 - c) : c;
+			ptrs.push_back(lists[static_cast<size_t>(idx)].data());
+			counts.push_back(static_cast<int32_t>(lists[static_cast<size_t>(idx)].size()));
+		}
+		std::vector<Hit> scratch(static_cast<size_t>(k));
+		std::vector<Hit> merged(static_cast<size_t>(k));
+		const int32_t n = MergeTopK(ptrs.data(), counts.data(), chunks, bank.view.metric,
+			k, scratch.data(), merged.data());
+		CHECK(n == wholeCount);
+		if (n == wholeCount)
+		{
+			CHECK(std::memcmp(merged.data(), whole.data(),
+				static_cast<size_t>(n) * sizeof(Hit)) == 0);
+		}
+	};
+	merge(false);
+	merge(true);
+
+	// Edge: merging empty lists yields empty.
+	const Hit* noLists[1] = {nullptr};
+	int32_t noCounts[1] = {0};
+	std::vector<Hit> scratch(static_cast<size_t>(k));
+	std::vector<Hit> merged(static_cast<size_t>(k));
+	CHECK(MergeTopK(noLists, noCounts, 1, bank.view.metric, k, scratch.data(), merged.data()) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// T13 — ValidateBankData rejection matrix (Poirot S2).
+
+static void TestValidateBankData()
+{
+	Rng rng(47);
+	int32_t badRow = -1;
+
+	// Healthy float32 bank passes.
+	TestBank f32(rng, 20, 6, Quantization::Float32, Metric::Dot); // dims 6 -> pad lanes exist
+	CHECK(ValidateBankData(f32.view, &badRow) == Status::Ok);
+
+	// Non-finite row lane rejected.
+	{
+		float* rows = static_cast<float*>(const_cast<void*>(f32.view.rows));
+		const float saved = rows[static_cast<size_t>(3) * f32.view.paddedDims + 2];
+		rows[static_cast<size_t>(3) * f32.view.paddedDims + 2] = NAN;
+		CHECK(ValidateBankData(f32.view, &badRow) == Status::BadFormat);
+		CHECK(badRow == 3);
+		rows[static_cast<size_t>(3) * f32.view.paddedDims + 2] = saved;
+	}
+
+	// Non-zero pad lane rejected.
+	{
+		float* rows = static_cast<float*>(const_cast<void*>(f32.view.rows));
+		rows[static_cast<size_t>(5) * f32.view.paddedDims + 7] = 0.25f; // lane 7 is padding
+		CHECK(ValidateBankData(f32.view, &badRow) == Status::BadFormat);
+		CHECK(badRow == 5);
+		rows[static_cast<size_t>(5) * f32.view.paddedDims + 7] = 0.0f;
+	}
+
+	// Healthy int8 bank passes; bad scales and pad bytes rejected.
+	TestBank i8(rng, 20, 20, Quantization::Int8, Metric::Dot); // dims 20 -> pad bytes exist
+	CHECK(ValidateBankData(i8.view, &badRow) == Status::Ok);
+	{
+		float* scales = const_cast<float*>(i8.view.scales);
+		const float saved = scales[4];
+		scales[4] = -0.5f;
+		CHECK(ValidateBankData(i8.view, &badRow) == Status::BadFormat);
+		CHECK(badRow == 4);
+		scales[4] = NAN;
+		CHECK(ValidateBankData(i8.view, &badRow) == Status::BadFormat);
+		scales[4] = saved;
+
+		int8_t* rows = static_cast<int8_t*>(const_cast<void*>(i8.view.rows));
+		rows[static_cast<size_t>(9) * i8.view.paddedDims + 25] = 1; // lane 25 is padding
+		CHECK(ValidateBankData(i8.view, &badRow) == Status::BadFormat);
+		CHECK(badRow == 9);
+		rows[static_cast<size_t>(9) * i8.view.paddedDims + 25] = 0;
+	}
+	CHECK(ValidateBankData(i8.view, &badRow) == Status::Ok);
+}
+
+// ---------------------------------------------------------------------------
 
 int main()
 {
 	TestSimdEqualsScalar();
+	TestMergeTopK();
+	TestValidateBankData();
 	TestKnownGeometry();
 	TestRandomizedAgainstReference();
 	TestTieBreak();

@@ -86,4 +86,58 @@ Status ValidateQuery(const BankView& bank, const float* paddedQuery)
 	return Status::Ok;
 }
 
+Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
+{
+	const Status structural = ValidateBank(bank);
+	if (structural != Status::Ok)
+	{
+		return structural;
+	}
+
+	const int32_t pd = bank.paddedDims;
+	for (int32_t r = 0; r < bank.count; ++r)
+	{
+		bool bad = false;
+		if (bank.quant == Quantization::Float32)
+		{
+			const float* row = static_cast<const float*>(bank.rows) + static_cast<int64_t>(r) * pd;
+			for (int32_t i = 0; i < bank.dims; ++i)
+			{
+				if (!std::isfinite(row[i]))
+				{
+					bad = true;
+					break;
+				}
+			}
+			for (int32_t i = bank.dims; !bad && i < pd; ++i)
+			{
+				bad = row[i] != 0.0f;
+			}
+		}
+		else
+		{
+			const int8_t* row = static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(r) * pd;
+			for (int32_t i = bank.dims; i < pd; ++i)
+			{
+				if (row[i] != 0)
+				{
+					bad = true;
+					break;
+				}
+			}
+			const float scale = bank.scales[r];
+			bad = bad || !std::isfinite(scale) || scale < 0.0f;
+		}
+		if (bad)
+		{
+			if (outBadRow != nullptr)
+			{
+				*outBadRow = r;
+			}
+			return Status::BadFormat;
+		}
+	}
+	return Status::Ok;
+}
+
 } // namespace superfaiss

@@ -15,6 +15,8 @@ Status NormalizeRows(float* rows, int32_t count, int32_t dims, int32_t* outBadRo
 
 // Symmetric per-row int8 quantization: scale = maxAbs/127, q = round(v/scale) clamped
 // to [-127,127]. A zero row gets scale 0 and all-zero lanes (dequantizes to zero).
+// Input must be finite: run ValidateSourceRows first — a NaN row would otherwise
+// quantize to a silent zero row (NaN comparisons are false, so maxAbs stays 0).
 // Source stride is `dims` (unpadded); destination stride is `paddedDims` with zero-filled
 // pad lanes. outScales has `count` entries.
 void QuantizeRowsInt8(
