@@ -20,6 +20,19 @@ void ScoreChunk(
 	const uint32_t* excludeBits,
 	TopK& inout);
 
+// Scores one chunk against TWO queries in a single row pass: row loads (and int8
+// widening) are shared while each query keeps the exact single-query accumulation
+// structure, so pair results are bit-identical to two ScoreChunk calls. This is the
+// batch amortization primitive (plan E2).
+void ScoreChunkPair(
+	const BankView& bank,
+	const float* paddedQueryA,
+	const float* paddedQueryB,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	TopK& inoutA,
+	TopK& inoutB);
+
 // Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
 // upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
 // per-device determinism promise is unaffected. Exposed for tests and diagnostics.

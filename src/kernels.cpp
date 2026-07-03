@@ -628,6 +628,103 @@ float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t pad
 
 } // namespace detail
 
+#if defined(SUPERFAISS_SIMD_SSE)
+namespace detail
+{
+	// Defined in kernels_avx2.cpp.
+	void DotF32PairAvx2(const float* row, const float* qa, const float* qb,
+		int32_t paddedDims, float* outA, float* outB);
+	void L2F32PairAvx2(const float* row, const float* qa, const float* qb,
+		int32_t paddedDims, float* outA, float* outB);
+	void DotI8PairAvx2(const int8_t* row, float scale, const float* qa, const float* qb,
+		int32_t paddedDims, float* outA, float* outB);
+	void L2I8PairAvx2(const int8_t* row, float scale, const float* qa, const float* qb,
+		int32_t paddedDims, float* outA, float* outB);
+}
+#endif
+
+void ScoreChunkPair(
+	const BankView& bank,
+	const float* paddedQueryA,
+	const float* paddedQueryB,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	TopK& inoutA,
+	TopK& inoutB)
+{
+#if defined(SUPERFAISS_SIMD_SSE)
+	// AVX2 pair kernels share the row pass; identical per-query accumulation keeps
+	// results bit-equal to two single ScoreChunk calls.
+	const bool pairPath = detail::IsAvx2() &&
+		(bank.quant == Quantization::Int8 || (bank.paddedDims % 8) == 0);
+	if (pairPath)
+	{
+		const int32_t chunkRows = ChunkRows(bank);
+		const int32_t begin = chunkIndex * chunkRows;
+		int32_t end = begin + chunkRows;
+		if (end > bank.count)
+		{
+			end = bank.count;
+		}
+		const int32_t pd = bank.paddedDims;
+		const bool isL2 = bank.metric == Metric::L2;
+		float scoreA = 0.0f;
+		float scoreB = 0.0f;
+
+		if (bank.quant == Quantization::Float32)
+		{
+			const float* rows = static_cast<const float*>(bank.rows);
+			for (int32_t r = begin; r < end; ++r)
+			{
+				if (IsExcluded(excludeBits, r))
+				{
+					continue;
+				}
+				const float* row = rows + static_cast<int64_t>(r) * pd;
+				if (isL2)
+				{
+					detail::L2F32PairAvx2(row, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
+				}
+				else
+				{
+					detail::DotF32PairAvx2(row, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
+				}
+				inoutA.Push(r, scoreA);
+				inoutB.Push(r, scoreB);
+			}
+		}
+		else
+		{
+			const int8_t* rows = static_cast<const int8_t*>(bank.rows);
+			for (int32_t r = begin; r < end; ++r)
+			{
+				if (IsExcluded(excludeBits, r))
+				{
+					continue;
+				}
+				const int8_t* row = rows + static_cast<int64_t>(r) * pd;
+				const float scale = bank.scales[r];
+				if (isL2)
+				{
+					detail::L2I8PairAvx2(row, scale, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
+				}
+				else
+				{
+					detail::DotI8PairAvx2(row, scale, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
+				}
+				inoutA.Push(r, scoreA);
+				inoutB.Push(r, scoreB);
+			}
+		}
+		return;
+	}
+#endif
+	// Fallback: two single passes (bit-identical by definition; SSE/NEON pair kernels
+	// are a recorded follow-up).
+	ScoreChunk(bank, paddedQueryA, chunkIndex, excludeBits, inoutA);
+	ScoreChunk(bank, paddedQueryB, chunkIndex, excludeBits, inoutB);
+}
+
 void ScoreChunk(
 	const BankView& bank,
 	const float* paddedQuery,

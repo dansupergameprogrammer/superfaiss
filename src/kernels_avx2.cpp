@@ -216,6 +216,206 @@ float L2I8Avx2(const int8_t* row, float scale, const float* query, int32_t padde
 	return (SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3));
 }
 
+// --- Pair kernels: one row pass, two queries. Each query's accumulation is the exact
+// --- single-kernel structure, so results are bit-identical to the single kernels.
+
+SUPERFAISS_AVX2_TARGET
+void DotF32PairAvx2(const float* row, const float* qa, const float* qb,
+	int32_t paddedDims, float* outA, float* outB)
+{
+	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+	__m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+	__m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+	int32_t i = 0;
+	for (; i + 32 <= paddedDims; i += 32)
+	{
+		const __m256 r0 = _mm256_loadu_ps(row + i);
+		const __m256 r1 = _mm256_loadu_ps(row + i + 8);
+		const __m256 r2 = _mm256_loadu_ps(row + i + 16);
+		const __m256 r3 = _mm256_loadu_ps(row + i + 24);
+		a0 = _mm256_fmadd_ps(r0, _mm256_loadu_ps(qa + i), a0);
+		a1 = _mm256_fmadd_ps(r1, _mm256_loadu_ps(qa + i + 8), a1);
+		a2 = _mm256_fmadd_ps(r2, _mm256_loadu_ps(qa + i + 16), a2);
+		a3 = _mm256_fmadd_ps(r3, _mm256_loadu_ps(qa + i + 24), a3);
+		b0 = _mm256_fmadd_ps(r0, _mm256_loadu_ps(qb + i), b0);
+		b1 = _mm256_fmadd_ps(r1, _mm256_loadu_ps(qb + i + 8), b1);
+		b2 = _mm256_fmadd_ps(r2, _mm256_loadu_ps(qb + i + 16), b2);
+		b3 = _mm256_fmadd_ps(r3, _mm256_loadu_ps(qb + i + 24), b3);
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		a0 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qa + i), a0);
+		b0 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qb + i), b0);
+		i += 8;
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		a1 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qa + i), a1);
+		b1 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qb + i), b1);
+		i += 8;
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		a2 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qa + i), a2);
+		b2 = _mm256_fmadd_ps(r, _mm256_loadu_ps(qb + i), b2);
+	}
+	*outA = (SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3));
+	*outB = (SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3));
+}
+
+SUPERFAISS_AVX2_TARGET
+void L2F32PairAvx2(const float* row, const float* qa, const float* qb,
+	int32_t paddedDims, float* outA, float* outB)
+{
+	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+	__m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+	__m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+	int32_t i = 0;
+	for (; i + 32 <= paddedDims; i += 32)
+	{
+		const __m256 r0 = _mm256_loadu_ps(row + i);
+		const __m256 r1 = _mm256_loadu_ps(row + i + 8);
+		const __m256 r2 = _mm256_loadu_ps(row + i + 16);
+		const __m256 r3 = _mm256_loadu_ps(row + i + 24);
+		const __m256 da0 = _mm256_sub_ps(_mm256_loadu_ps(qa + i), r0);
+		const __m256 da1 = _mm256_sub_ps(_mm256_loadu_ps(qa + i + 8), r1);
+		const __m256 da2 = _mm256_sub_ps(_mm256_loadu_ps(qa + i + 16), r2);
+		const __m256 da3 = _mm256_sub_ps(_mm256_loadu_ps(qa + i + 24), r3);
+		a0 = _mm256_fmadd_ps(da0, da0, a0);
+		a1 = _mm256_fmadd_ps(da1, da1, a1);
+		a2 = _mm256_fmadd_ps(da2, da2, a2);
+		a3 = _mm256_fmadd_ps(da3, da3, a3);
+		const __m256 db0 = _mm256_sub_ps(_mm256_loadu_ps(qb + i), r0);
+		const __m256 db1 = _mm256_sub_ps(_mm256_loadu_ps(qb + i + 8), r1);
+		const __m256 db2 = _mm256_sub_ps(_mm256_loadu_ps(qb + i + 16), r2);
+		const __m256 db3 = _mm256_sub_ps(_mm256_loadu_ps(qb + i + 24), r3);
+		b0 = _mm256_fmadd_ps(db0, db0, b0);
+		b1 = _mm256_fmadd_ps(db1, db1, b1);
+		b2 = _mm256_fmadd_ps(db2, db2, b2);
+		b3 = _mm256_fmadd_ps(db3, db3, b3);
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		const __m256 da = _mm256_sub_ps(_mm256_loadu_ps(qa + i), r);
+		const __m256 db = _mm256_sub_ps(_mm256_loadu_ps(qb + i), r);
+		a0 = _mm256_fmadd_ps(da, da, a0);
+		b0 = _mm256_fmadd_ps(db, db, b0);
+		i += 8;
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		const __m256 da = _mm256_sub_ps(_mm256_loadu_ps(qa + i), r);
+		const __m256 db = _mm256_sub_ps(_mm256_loadu_ps(qb + i), r);
+		a1 = _mm256_fmadd_ps(da, da, a1);
+		b1 = _mm256_fmadd_ps(db, db, b1);
+		i += 8;
+	}
+	if (i + 8 <= paddedDims)
+	{
+		const __m256 r = _mm256_loadu_ps(row + i);
+		const __m256 da = _mm256_sub_ps(_mm256_loadu_ps(qa + i), r);
+		const __m256 db = _mm256_sub_ps(_mm256_loadu_ps(qb + i), r);
+		a2 = _mm256_fmadd_ps(da, da, a2);
+		b2 = _mm256_fmadd_ps(db, db, b2);
+	}
+	*outA = (SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3));
+	*outB = (SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3));
+}
+
+SUPERFAISS_AVX2_TARGET
+void DotI8PairAvx2(const int8_t* row, float scaleA, const float* qa, const float* qb,
+	int32_t paddedDims, float* outA, float* outB)
+{
+	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+	__m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+	__m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+	int32_t i = 0;
+	for (; i + 32 <= paddedDims; i += 32)
+	{
+		const __m256 f0 = WidenI8x8(row + i);
+		const __m256 f1 = WidenI8x8(row + i + 8);
+		const __m256 f2 = WidenI8x8(row + i + 16);
+		const __m256 f3 = WidenI8x8(row + i + 24);
+		a0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(qa + i), a0);
+		a1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(qa + i + 8), a1);
+		a2 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(qa + i + 16), a2);
+		a3 = _mm256_fmadd_ps(f3, _mm256_loadu_ps(qa + i + 24), a3);
+		b0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(qb + i), b0);
+		b1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(qb + i + 8), b1);
+		b2 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(qb + i + 16), b2);
+		b3 = _mm256_fmadd_ps(f3, _mm256_loadu_ps(qb + i + 24), b3);
+	}
+	if (i + 16 <= paddedDims)
+	{
+		const __m256 f0 = WidenI8x8(row + i);
+		const __m256 f1 = WidenI8x8(row + i + 8);
+		a0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(qa + i), a0);
+		a1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(qa + i + 8), a1);
+		b0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(qb + i), b0);
+		b1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(qb + i + 8), b1);
+	}
+	*outA = scaleA * ((SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3)));
+	*outB = scaleA * ((SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3)));
+}
+
+SUPERFAISS_AVX2_TARGET
+void L2I8PairAvx2(const int8_t* row, float scaleA, const float* qa, const float* qb,
+	int32_t paddedDims, float* outA, float* outB)
+{
+	const __m256 scaleV = _mm256_set1_ps(scaleA);
+	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+	__m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+	__m256 b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+	int32_t i = 0;
+	for (; i + 32 <= paddedDims; i += 32)
+	{
+		const __m256 f0 = WidenI8x8(row + i);
+		const __m256 f1 = WidenI8x8(row + i + 8);
+		const __m256 f2 = WidenI8x8(row + i + 16);
+		const __m256 f3 = WidenI8x8(row + i + 24);
+		const __m256 da0 = _mm256_fnmadd_ps(scaleV, f0, _mm256_loadu_ps(qa + i));
+		const __m256 da1 = _mm256_fnmadd_ps(scaleV, f1, _mm256_loadu_ps(qa + i + 8));
+		const __m256 da2 = _mm256_fnmadd_ps(scaleV, f2, _mm256_loadu_ps(qa + i + 16));
+		const __m256 da3 = _mm256_fnmadd_ps(scaleV, f3, _mm256_loadu_ps(qa + i + 24));
+		a0 = _mm256_fmadd_ps(da0, da0, a0);
+		a1 = _mm256_fmadd_ps(da1, da1, a1);
+		a2 = _mm256_fmadd_ps(da2, da2, a2);
+		a3 = _mm256_fmadd_ps(da3, da3, a3);
+		const __m256 db0 = _mm256_fnmadd_ps(scaleV, f0, _mm256_loadu_ps(qb + i));
+		const __m256 db1 = _mm256_fnmadd_ps(scaleV, f1, _mm256_loadu_ps(qb + i + 8));
+		const __m256 db2 = _mm256_fnmadd_ps(scaleV, f2, _mm256_loadu_ps(qb + i + 16));
+		const __m256 db3 = _mm256_fnmadd_ps(scaleV, f3, _mm256_loadu_ps(qb + i + 24));
+		b0 = _mm256_fmadd_ps(db0, db0, b0);
+		b1 = _mm256_fmadd_ps(db1, db1, b1);
+		b2 = _mm256_fmadd_ps(db2, db2, b2);
+		b3 = _mm256_fmadd_ps(db3, db3, b3);
+	}
+	if (i + 16 <= paddedDims)
+	{
+		const __m256 f0 = WidenI8x8(row + i);
+		const __m256 f1 = WidenI8x8(row + i + 8);
+		const __m256 da0 = _mm256_fnmadd_ps(scaleV, f0, _mm256_loadu_ps(qa + i));
+		const __m256 da1 = _mm256_fnmadd_ps(scaleV, f1, _mm256_loadu_ps(qa + i + 8));
+		a0 = _mm256_fmadd_ps(da0, da0, a0);
+		a1 = _mm256_fmadd_ps(da1, da1, a1);
+		const __m256 db0 = _mm256_fnmadd_ps(scaleV, f0, _mm256_loadu_ps(qb + i));
+		const __m256 db1 = _mm256_fnmadd_ps(scaleV, f1, _mm256_loadu_ps(qb + i + 8));
+		b0 = _mm256_fmadd_ps(db0, db0, b0);
+		b1 = _mm256_fmadd_ps(db1, db1, b1);
+	}
+	*outA = (SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3));
+	*outB = (SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3));
+}
+
 // --- Scalar mirrors of the AVX2 path (std::fma; test reference, not a hot path) ------
 
 float DotF32ScalarAvx2(const float* row, const float* query, int32_t paddedDims)

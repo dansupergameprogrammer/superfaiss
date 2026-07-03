@@ -71,12 +71,24 @@ namespace
 			topks[m].Init(workspace.HeapStorage(m), params.k, bank.metric);
 		}
 
-		// Chunk loop outermost: each chunk's rows are scored against every query while
-		// cache-resident — this is the batch amortization.
+		// Chunk loop outermost (cache amortization); queries processed in pairs so the
+		// pair kernels share each row's loads and widening.
 		const int32_t chunks = ChunkCount(bank);
 		for (int32_t c = 0; c < chunks; ++c)
 		{
-			for (int32_t m = 0; m < queryCount; ++m)
+			int32_t m = 0;
+			for (; m + 2 <= queryCount; m += 2)
+			{
+				ScoreChunkPair(
+					bank,
+					paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+					paddedQueries + static_cast<int64_t>(m + 1) * bank.paddedDims,
+					c,
+					params.excludeBits,
+					topks[m],
+					topks[m + 1]);
+			}
+			if (m < queryCount)
 			{
 				ScoreChunk(
 					bank,
