@@ -18,11 +18,12 @@ path. Non-negotiable flags (the shipped `CMakeLists.txt` applies them):
 | AVX2 TU | nothing (`target` attributes) | `/arch:AVX2` on `kernels_avx2.cpp` |
 
 If your build system compiles these sources under fast-math defaults (game engines
-usually do), scope strict behavior around the inclusion: `float_control(precise)` for
-MSVC **plus** `#pragma clang fp contract(off)` for clang — clang ignores
-`float_control` for contraction. Then keep a mirror-equality test
-(`detail::DotF32 == detail::DotF32Mirror` over random inputs) in your own suite as the
-permanent tripwire.
+usually do), you must override the *flags* for these translation units — source-level
+pragmas are NOT sufficient on clang (its backend fuses under fast-math regardless of
+`float_control` or `clang fp contract` pragmas; verified at the compiler). In Unreal
+Engine: `FPSemantics = FPSemanticsMode.Precise` in the module's Build.cs. Then keep a
+mirror-equality test (`detail::DotF32 == detail::DotF32Mirror` over random inputs) in
+your own suite as the permanent tripwire.
 
 SIMD is selected per platform automatically (NEON on ARM, SSE4.1 on x86 with a runtime
 CPUID upgrade to AVX2+FMA, scalar anywhere else). There is no platform-specific code:

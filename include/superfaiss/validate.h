@@ -11,7 +11,9 @@ Status ValidateBank(const BankView& bank);
 
 // Query validation: pointer alignment, finiteness, zero-filled pad lanes, and the
 // cosine zero-norm rule. This gate covers the QUERY side only; bank content is
-// covered by ValidateBankData below.
+// covered by ValidateBankData below. Note: finite inputs whose products/sums overflow
+// float range can still produce Inf/NaN *scores*; keep embedding magnitudes sane
+// (normalized embeddings cannot overflow).
 Status ValidateQuery(const BankView& bank, const float* paddedQuery);
 
 // Full bank-content validation — O(count x paddedDims); intended for load time, not

@@ -651,10 +651,17 @@ static void TestAllocationFlat()
 
 static void TestBatchEquivalence()
 {
+	// Covers every pair-kernel variant (dot/L2 x f32/i8) plus the sub-batch boundary
+	// and the odd-pair tail: batch must be bit-identical to singles in all of them.
 	Rng rng(31);
-	TestBank bank(rng, 2000, 32, Quantization::Float32, Metric::L2);
+	const Metric metrics[] = {Metric::Dot, Metric::Cosine, Metric::L2};
+	const Quantization quants[] = {Quantization::Float32, Quantization::Int8};
+	for (Metric metric : metrics)
+	for (Quantization quant : quants)
+	{
+	TestBank bank(rng, 2000, 32, quant, metric);
 
-	const int32_t m = 100; // crosses the sub-batch boundary (64)
+	const int32_t m = 101; // crosses the sub-batch boundary (64) and the pair tail
 	const int32_t pd = bank.view.paddedDims;
 	AlignedBuf queries(static_cast<size_t>(m) * pd * sizeof(float));
 	for (int32_t q = 0; q < m; ++q)
@@ -690,6 +697,7 @@ static void TestBatchEquivalence()
 			CHECK(a.index == b.index);
 			CHECK(a.score == b.score); // bit-identical, same kernels
 		}
+	}
 	}
 }
 

@@ -330,7 +330,7 @@ void L2F32PairAvx2(const float* row, const float* qa, const float* qb,
 }
 
 SUPERFAISS_AVX2_TARGET
-void DotI8PairAvx2(const int8_t* row, float scaleA, const float* qa, const float* qb,
+void DotI8PairAvx2(const int8_t* row, float rowScale, const float* qa, const float* qb,
 	int32_t paddedDims, float* outA, float* outB)
 {
 	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
@@ -362,15 +362,15 @@ void DotI8PairAvx2(const int8_t* row, float scaleA, const float* qa, const float
 		b0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(qb + i), b0);
 		b1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(qb + i + 8), b1);
 	}
-	*outA = scaleA * ((SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3)));
-	*outB = scaleA * ((SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3)));
+	*outA = rowScale * ((SumLanes8(a0) + SumLanes8(a1)) + (SumLanes8(a2) + SumLanes8(a3)));
+	*outB = rowScale * ((SumLanes8(b0) + SumLanes8(b1)) + (SumLanes8(b2) + SumLanes8(b3)));
 }
 
 SUPERFAISS_AVX2_TARGET
-void L2I8PairAvx2(const int8_t* row, float scaleA, const float* qa, const float* qb,
+void L2I8PairAvx2(const int8_t* row, float rowScale, const float* qa, const float* qb,
 	int32_t paddedDims, float* outA, float* outB)
 {
-	const __m256 scaleV = _mm256_set1_ps(scaleA);
+	const __m256 scaleV = _mm256_set1_ps(rowScale);
 	__m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
 	__m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
 	__m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();

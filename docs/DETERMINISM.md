@@ -60,13 +60,13 @@ version of the promise.
 ## 3. Embedder obligations
 
 1. **Do not let your compiler contract the float math.** Implicit FMA contraction in
-   the scalar mirrors (or reassociation anywhere) breaks SIMD≡mirror equality. Build
-   the library with `-ffp-contract=off` (GCC/Clang) or `/fp:precise` (MSVC) — the
-   shipped CMake does this. If you compile the sources under an engine's fast-math
-   defaults, scope strict float behavior around them; **on clang, `float_control`
-   pragmas do NOT stop contraction — you need `#pragma clang fp contract(off)`.**
-   Ship a mirror-equality test in your integration; it is the tripwire that catches a
-   toolchain silently breaking this.
+   the scalar mirrors (or reassociation anywhere) breaks SIMD≡mirror equality. Build the library with `-ffp-contract=off` (GCC/Clang) or `/fp:precise` (MSVC) — the
+   shipped CMake does this. **Compile flags are the only reliable mechanism: under
+   clang fast-math, source-level pragmas (`float_control`, `clang fp contract(off)`,
+   `STDC FP_CONTRACT`) do NOT stop backend fusion — verified at the compiler.** In
+   Unreal Engine, set `FPSemantics = FPSemanticsMode.Precise` on the module that
+   compiles these sources. Ship a mirror-equality test in your integration; it is the
+   tripwire that catches a toolchain silently breaking this.
 2. **Respect the format's content rules** (zero pad lanes, finite values, non-negative
    scales) — validate at load with `ValidateBankData`, not per query.
 3. **Feed identical bytes.** Determinism is a property of bank + query bytes. If you
