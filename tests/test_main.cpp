@@ -728,9 +728,68 @@ static void TestRepeatDeterminism()
 }
 
 // ---------------------------------------------------------------------------
+// T11 — SIMD ≡ scalar bit-equality (plan §9 mechanism, Day 1 gate). On a scalar-only
+// build this is trivially true; on SSE/NEON builds it is the load-bearing check.
+
+static void TestSimdEqualsScalar()
+{
+	Rng rng(41);
+	const int32_t dimsSet[] = {4, 8, 20, 36, 64, 100, 256, 768};
+	for (int32_t dims : dimsSet)
+	{
+		// float32 kernels.
+		{
+			const int32_t pd = PaddedDims(dims, Quantization::Float32);
+			AlignedBuf row(static_cast<size_t>(pd) * sizeof(float));
+			AlignedBuf query(static_cast<size_t>(pd) * sizeof(float));
+			for (int32_t rep = 0; rep < 50; ++rep)
+			{
+				for (int32_t i = 0; i < dims; ++i)
+				{
+					row.F32()[i] = rng.NextFloat();
+					query.F32()[i] = rng.NextFloat();
+				}
+				const float dotSimd = superfaiss::detail::DotF32(row.F32(), query.F32(), pd);
+				const float dotScalar = superfaiss::detail::DotF32Mirror(row.F32(), query.F32(), pd);
+				CHECK_MSG(dotSimd == dotScalar, "DotF32 dims=%d: simd %.9g scalar %.9g",
+					dims, dotSimd, dotScalar);
+				const float l2Simd = superfaiss::detail::L2F32(row.F32(), query.F32(), pd);
+				const float l2Scalar = superfaiss::detail::L2F32Mirror(row.F32(), query.F32(), pd);
+				CHECK_MSG(l2Simd == l2Scalar, "L2F32 dims=%d: simd %.9g scalar %.9g",
+					dims, l2Simd, l2Scalar);
+			}
+		}
+		// int8 kernels.
+		{
+			const int32_t pd = PaddedDims(dims, Quantization::Int8);
+			AlignedBuf row(static_cast<size_t>(pd));
+			AlignedBuf query(static_cast<size_t>(pd) * sizeof(float));
+			for (int32_t rep = 0; rep < 50; ++rep)
+			{
+				for (int32_t i = 0; i < dims; ++i)
+				{
+					row.I8()[i] = static_cast<int8_t>(rng.NextIndex(255) - 127);
+					query.F32()[i] = rng.NextFloat();
+				}
+				const float scale = 0.01f + 0.5f * (rng.NextFloat() + 1.0f);
+				const float dotSimd = superfaiss::detail::DotI8(row.I8(), scale, query.F32(), pd);
+				const float dotScalar = superfaiss::detail::DotI8Mirror(row.I8(), scale, query.F32(), pd);
+				CHECK_MSG(dotSimd == dotScalar, "DotI8 dims=%d: simd %.9g scalar %.9g",
+					dims, dotSimd, dotScalar);
+				const float l2Simd = superfaiss::detail::L2I8(row.I8(), scale, query.F32(), pd);
+				const float l2Scalar = superfaiss::detail::L2I8Mirror(row.I8(), scale, query.F32(), pd);
+				CHECK_MSG(l2Simd == l2Scalar, "L2I8 dims=%d: simd %.9g scalar %.9g",
+					dims, l2Simd, l2Scalar);
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 
 int main()
 {
+	TestSimdEqualsScalar();
 	TestKnownGeometry();
 	TestRandomizedAgainstReference();
 	TestTieBreak();
@@ -745,6 +804,7 @@ int main()
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
 		ActiveSimdPath() == SimdPath::Scalar ? "scalar"
-			: ActiveSimdPath() == SimdPath::SSE ? "sse" : "neon");
+			: ActiveSimdPath() == SimdPath::SSE ? "sse"
+			: ActiveSimdPath() == SimdPath::AVX2 ? "avx2" : "neon");
 	return GFailures == 0 ? 0 : 1;
 }

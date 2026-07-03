@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(superfaiss STATIC
 	src/kernels.cpp
+	src/kernels_avx2.cpp
 	src/alloc.cpp
 	src/validate.cpp
 	src/bake.cpp
@@ -13,10 +14,14 @@ add_library(superfaiss STATIC
 )
 target_include_directories(superfaiss PUBLIC include)
 
-# Determinism: forbid FP contraction (fused multiply-add would change rounding and
-# break scalar/SIMD bit-equality).
+# Determinism: forbid FP contraction (implicit fused multiply-add would change rounding
+# and break scalar/SIMD bit-equality; the AVX2 path uses FMA *explicitly*, mirrored by
+# std::fma).
 if(MSVC)
 	target_compile_options(superfaiss PRIVATE /W4 /fp:precise)
+	# VEX-encode the whole AVX2 TU so no SSE/AVX transition penalties occur. The
+	# functions are runtime-dispatched; the TU is never executed on non-AVX2 CPUs.
+	set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
 	target_compile_options(superfaiss PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()

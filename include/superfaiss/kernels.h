@@ -20,28 +20,46 @@ void ScoreChunk(
 	const uint32_t* excludeBits,
 	TopK& inout);
 
-// Kernel selected at compile time. Exposed for tests and diagnostics.
+// Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
+// upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
+// per-device determinism promise is unaffected. Exposed for tests and diagnostics.
 enum class SimdPath : uint8_t
 {
 	Scalar = 0,
 	SSE = 1,
 	NEON = 2,
+	AVX2 = 3,
 };
 SimdPath ActiveSimdPath();
 
 namespace detail
 {
-	// Scalar kernels mirror the SIMD paths' striped accumulation exactly (four partial
-	// sums combined as (s0+s1)+(s2+s3)), so scalar and SIMD results are bit-identical.
+	// Scalar kernels mirror the active SIMD path's accumulation exactly, so scalar and
+	// SIMD results are bit-identical on a device:
+	//   - SSE/NEON mirror: four 4-lane stripes, unfused multiply-then-add.
+	//   - AVX2 mirror: four 8-lane stripes accumulated with std::fma (hardware FMA and
+	//     std::fma round identically).
 	float DotF32Scalar(const float* row, const float* query, int32_t paddedDims);
 	float L2F32Scalar(const float* row, const float* query, int32_t paddedDims);
 	float DotI8Scalar(const int8_t* row, float scale, const float* query, int32_t paddedDims);
 	float L2I8Scalar(const int8_t* row, float scale, const float* query, int32_t paddedDims);
 
+	float DotF32ScalarAvx2(const float* row, const float* query, int32_t paddedDims);
+	float L2F32ScalarAvx2(const float* row, const float* query, int32_t paddedDims);
+	float DotI8ScalarAvx2(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+	float L2I8ScalarAvx2(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+
 	float DotF32(const float* row, const float* query, int32_t paddedDims);
 	float L2F32(const float* row, const float* query, int32_t paddedDims);
 	float DotI8(const int8_t* row, float scale, const float* query, int32_t paddedDims);
 	float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+
+	// The scalar mirror of whatever path ActiveSimdPath() reports — what the
+	// bit-equality tests compare against.
+	float DotF32Mirror(const float* row, const float* query, int32_t paddedDims);
+	float L2F32Mirror(const float* row, const float* query, int32_t paddedDims);
+	float DotI8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+	float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims);
 }
 
 } // namespace superfaiss

@@ -1,13 +1,72 @@
 #include "superfaiss/kernels.h"
 
+// Compile-time SIMD selection: NEON on ARM, SSE4.1 on x86/x64, scalar elsewhere.
+// Every path implements the same accumulation structure (see the comment on the scalar
+// kernels); results are bit-identical across paths on a given device.
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	#define SUPERFAISS_SIMD_NEON 1
+	#include <arm_neon.h>
+#elif defined(_M_X64) || defined(__x86_64__) || defined(__SSE4_1__) || \
+	(defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+	#define SUPERFAISS_SIMD_SSE 1
+	#include <smmintrin.h>
+	#if defined(_MSC_VER)
+		#include <intrin.h>
+	#endif
+#else
+	#define SUPERFAISS_SIMD_SCALAR 1
+#endif
+
 namespace superfaiss
 {
 
-// SIMD selection is compile-time. Day 0 ships the scalar path; SSE/NEON land next and
-// must preserve the exact accumulation structure below.
+#if defined(SUPERFAISS_SIMD_SSE)
+namespace detail
+{
+	// Defined in kernels_avx2.cpp.
+	float DotF32Avx2(const float* row, const float* query, int32_t paddedDims);
+	float L2F32Avx2(const float* row, const float* query, int32_t paddedDims);
+	float DotI8Avx2(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+	float L2I8Avx2(const int8_t* row, float scale, const float* query, int32_t paddedDims);
+
+	static bool DetectAvx2Fma()
+	{
+#if defined(__clang__) || defined(__GNUC__)
+		return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+		int32_t info1[4] = {};
+		__cpuidex(info1, 1, 0);
+		const bool osxsave = (info1[2] & (1 << 27)) != 0;
+		const bool avx = (info1[2] & (1 << 28)) != 0;
+		const bool fma = (info1[2] & (1 << 12)) != 0;
+		if (!osxsave || !avx || !fma)
+		{
+			return false;
+		}
+		// OS must preserve YMM state.
+		if ((_xgetbv(0) & 0x6) != 0x6)
+		{
+			return false;
+		}
+		int32_t info7[4] = {};
+		__cpuidex(info7, 7, 0);
+		return (info7[1] & (1 << 5)) != 0;
+#endif
+	}
+
+	static const bool GAvx2 = DetectAvx2Fma();
+}
+#endif // SUPERFAISS_SIMD_SSE
+
 SimdPath ActiveSimdPath()
 {
+#if defined(SUPERFAISS_SIMD_NEON)
+	return SimdPath::NEON;
+#elif defined(SUPERFAISS_SIMD_SSE)
+	return detail::GAvx2 ? SimdPath::AVX2 : SimdPath::SSE;
+#else
 	return SimdPath::Scalar;
+#endif
 }
 
 namespace detail
@@ -21,7 +80,8 @@ namespace detail
 //     feeds acc0, acc1, ... in order;
 //   - lanes combine as (l0+l1)+(l2+l3) per accumulator, then (a0+a1)+(a2+a3).
 // SIMD paths must reproduce this order exactly — that is what makes scalar and SIMD
-// results bit-identical on a device.
+// results bit-identical on a device. No FMA anywhere: multiply then add, so compilers
+// must not contract (the library is built with fp-contract off / float_control precise).
 
 namespace
 {
@@ -152,6 +212,373 @@ float L2I8Scalar(const int8_t* row, float scale, const float* query, int32_t pad
 	return Combine(acc[0], acc[1], acc[2], acc[3]);
 }
 
+#if defined(SUPERFAISS_SIMD_SSE)
+
+namespace
+{
+	// Lane combine identical to Acc4::Sum(): (l0+l1)+(l2+l3), computed in scalar floats
+	// so the ordering is exact.
+	inline float SumLanes(__m128 v)
+	{
+		alignas(16) float lanes[4];
+		_mm_store_ps(lanes, v);
+		return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+	}
+
+}
+
+static float DotF32Sse(const float* row, const float* query, int32_t paddedDims)
+{
+	__m128 acc0 = _mm_setzero_ps();
+	__m128 acc1 = _mm_setzero_ps();
+	__m128 acc2 = _mm_setzero_ps();
+	__m128 acc3 = _mm_setzero_ps();
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_load_ps(row + i), _mm_load_ps(query + i)));
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_load_ps(row + i + 4), _mm_load_ps(query + i + 4)));
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(_mm_load_ps(row + i + 8), _mm_load_ps(query + i + 8)));
+		acc3 = _mm_add_ps(acc3, _mm_mul_ps(_mm_load_ps(row + i + 12), _mm_load_ps(query + i + 12)));
+	}
+	// Tail: paddedDims % 16 is 0, 4, 8, or 12 — up to three 4-element groups feeding
+	// acc0..acc2 in order. Unrolled so no accumulator is address-taken (spill trap).
+	if (i + 4 <= paddedDims)
+	{
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_load_ps(row + i), _mm_load_ps(query + i)));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_load_ps(row + i), _mm_load_ps(query + i)));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(_mm_load_ps(row + i), _mm_load_ps(query + i)));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+static float L2F32Sse(const float* row, const float* query, int32_t paddedDims)
+{
+	__m128 acc0 = _mm_setzero_ps();
+	__m128 acc1 = _mm_setzero_ps();
+	__m128 acc2 = _mm_setzero_ps();
+	__m128 acc3 = _mm_setzero_ps();
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const __m128 d0 = _mm_sub_ps(_mm_load_ps(query + i), _mm_load_ps(row + i));
+		const __m128 d1 = _mm_sub_ps(_mm_load_ps(query + i + 4), _mm_load_ps(row + i + 4));
+		const __m128 d2 = _mm_sub_ps(_mm_load_ps(query + i + 8), _mm_load_ps(row + i + 8));
+		const __m128 d3 = _mm_sub_ps(_mm_load_ps(query + i + 12), _mm_load_ps(row + i + 12));
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(d0, d0));
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(d1, d1));
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(d2, d2));
+		acc3 = _mm_add_ps(acc3, _mm_mul_ps(d3, d3));
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const __m128 d = _mm_sub_ps(_mm_load_ps(query + i), _mm_load_ps(row + i));
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(d, d));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const __m128 d = _mm_sub_ps(_mm_load_ps(query + i), _mm_load_ps(row + i));
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(d, d));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const __m128 d = _mm_sub_ps(_mm_load_ps(query + i), _mm_load_ps(row + i));
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(d, d));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+static float DotI8Sse(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	__m128 acc0 = _mm_setzero_ps();
+	__m128 acc1 = _mm_setzero_ps();
+	__m128 acc2 = _mm_setzero_ps();
+	__m128 acc3 = _mm_setzero_ps();
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const __m128i v = _mm_load_si128(reinterpret_cast<const __m128i*>(row + i));
+		const __m128 f0 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(v));
+		const __m128 f1 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 4)));
+		const __m128 f2 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 8)));
+		const __m128 f3 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 12)));
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(f0, _mm_load_ps(query + i)));
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(f1, _mm_load_ps(query + i + 4)));
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(f2, _mm_load_ps(query + i + 8)));
+		acc3 = _mm_add_ps(acc3, _mm_mul_ps(f3, _mm_load_ps(query + i + 12)));
+	}
+	// Int8 paddedDims is always a multiple of 16, so there is no remainder loop.
+	return scale * ((SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3)));
+}
+
+static float L2I8Sse(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	const __m128 scaleV = _mm_set1_ps(scale);
+	__m128 acc0 = _mm_setzero_ps();
+	__m128 acc1 = _mm_setzero_ps();
+	__m128 acc2 = _mm_setzero_ps();
+	__m128 acc3 = _mm_setzero_ps();
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const __m128i v = _mm_load_si128(reinterpret_cast<const __m128i*>(row + i));
+		const __m128 f0 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(v));
+		const __m128 f1 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 4)));
+		const __m128 f2 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 8)));
+		const __m128 f3 = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(v, 12)));
+		const __m128 d0 = _mm_sub_ps(_mm_load_ps(query + i), _mm_mul_ps(scaleV, f0));
+		const __m128 d1 = _mm_sub_ps(_mm_load_ps(query + i + 4), _mm_mul_ps(scaleV, f1));
+		const __m128 d2 = _mm_sub_ps(_mm_load_ps(query + i + 8), _mm_mul_ps(scaleV, f2));
+		const __m128 d3 = _mm_sub_ps(_mm_load_ps(query + i + 12), _mm_mul_ps(scaleV, f3));
+		acc0 = _mm_add_ps(acc0, _mm_mul_ps(d0, d0));
+		acc1 = _mm_add_ps(acc1, _mm_mul_ps(d1, d1));
+		acc2 = _mm_add_ps(acc2, _mm_mul_ps(d2, d2));
+		acc3 = _mm_add_ps(acc3, _mm_mul_ps(d3, d3));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+// Dispatchers: AVX2+FMA when the CPU has it and the stride fits 8-lane blocks
+// (float32 strides are multiples of 4, not always 8; int8 strides are always multiples
+// of 16). The choice is a pure function of device and bank shape, so per-device
+// determinism is preserved.
+
+float DotF32(const float* row, const float* query, int32_t paddedDims)
+{
+	return (GAvx2 && (paddedDims % 8) == 0)
+		? DotF32Avx2(row, query, paddedDims)
+		: DotF32Sse(row, query, paddedDims);
+}
+
+float L2F32(const float* row, const float* query, int32_t paddedDims)
+{
+	return (GAvx2 && (paddedDims % 8) == 0)
+		? L2F32Avx2(row, query, paddedDims)
+		: L2F32Sse(row, query, paddedDims);
+}
+
+float DotI8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return GAvx2
+		? DotI8Avx2(row, scale, query, paddedDims)
+		: DotI8Sse(row, scale, query, paddedDims);
+}
+
+float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return GAvx2
+		? L2I8Avx2(row, scale, query, paddedDims)
+		: L2I8Sse(row, scale, query, paddedDims);
+}
+
+// Mirrors: the scalar twin of whatever the dispatcher above would pick.
+
+float DotF32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return (GAvx2 && (paddedDims % 8) == 0)
+		? DotF32ScalarAvx2(row, query, paddedDims)
+		: DotF32Scalar(row, query, paddedDims);
+}
+
+float L2F32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return (GAvx2 && (paddedDims % 8) == 0)
+		? L2F32ScalarAvx2(row, query, paddedDims)
+		: L2F32Scalar(row, query, paddedDims);
+}
+
+float DotI8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return GAvx2
+		? DotI8ScalarAvx2(row, scale, query, paddedDims)
+		: DotI8Scalar(row, scale, query, paddedDims);
+}
+
+float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return GAvx2
+		? L2I8ScalarAvx2(row, scale, query, paddedDims)
+		: L2I8Scalar(row, scale, query, paddedDims);
+}
+
+#elif defined(SUPERFAISS_SIMD_NEON)
+
+namespace
+{
+	inline float SumLanes(float32x4_t v)
+	{
+		alignas(16) float lanes[4];
+		vst1q_f32(lanes, v);
+		return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+	}
+
+	// Widen 16 int8 values into four float32x4 groups, in element order.
+	struct I8x16AsFloat
+	{
+		float32x4_t f0, f1, f2, f3;
+	};
+
+	inline I8x16AsFloat WidenI8x16(const int8_t* p)
+	{
+		const int8x16_t v = vld1q_s8(p);
+		const int16x8_t lo = vmovl_s8(vget_low_s8(v));
+		const int16x8_t hi = vmovl_s8(vget_high_s8(v));
+		I8x16AsFloat r;
+		r.f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+		r.f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+		r.f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+		r.f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+		return r;
+	}
+}
+
+// NOTE: vmulq/vaddq are used instead of vmlaq/vfmaq deliberately — fused multiply-add
+// would change rounding and break bit-equality with the scalar path.
+
+float DotF32(const float* row, const float* query, int32_t paddedDims)
+{
+	float32x4_t acc0 = vdupq_n_f32(0.0f);
+	float32x4_t acc1 = vdupq_n_f32(0.0f);
+	float32x4_t acc2 = vdupq_n_f32(0.0f);
+	float32x4_t acc3 = vdupq_n_f32(0.0f);
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(row + i), vld1q_f32(query + i)));
+		acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(row + i + 4), vld1q_f32(query + i + 4)));
+		acc2 = vaddq_f32(acc2, vmulq_f32(vld1q_f32(row + i + 8), vld1q_f32(query + i + 8)));
+		acc3 = vaddq_f32(acc3, vmulq_f32(vld1q_f32(row + i + 12), vld1q_f32(query + i + 12)));
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(row + i), vld1q_f32(query + i)));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(row + i), vld1q_f32(query + i)));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc2 = vaddq_f32(acc2, vmulq_f32(vld1q_f32(row + i), vld1q_f32(query + i)));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+float L2F32(const float* row, const float* query, int32_t paddedDims)
+{
+	float32x4_t acc0 = vdupq_n_f32(0.0f);
+	float32x4_t acc1 = vdupq_n_f32(0.0f);
+	float32x4_t acc2 = vdupq_n_f32(0.0f);
+	float32x4_t acc3 = vdupq_n_f32(0.0f);
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const float32x4_t d0 = vsubq_f32(vld1q_f32(query + i), vld1q_f32(row + i));
+		const float32x4_t d1 = vsubq_f32(vld1q_f32(query + i + 4), vld1q_f32(row + i + 4));
+		const float32x4_t d2 = vsubq_f32(vld1q_f32(query + i + 8), vld1q_f32(row + i + 8));
+		const float32x4_t d3 = vsubq_f32(vld1q_f32(query + i + 12), vld1q_f32(row + i + 12));
+		acc0 = vaddq_f32(acc0, vmulq_f32(d0, d0));
+		acc1 = vaddq_f32(acc1, vmulq_f32(d1, d1));
+		acc2 = vaddq_f32(acc2, vmulq_f32(d2, d2));
+		acc3 = vaddq_f32(acc3, vmulq_f32(d3, d3));
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const float32x4_t d = vsubq_f32(vld1q_f32(query + i), vld1q_f32(row + i));
+		acc0 = vaddq_f32(acc0, vmulq_f32(d, d));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const float32x4_t d = vsubq_f32(vld1q_f32(query + i), vld1q_f32(row + i));
+		acc1 = vaddq_f32(acc1, vmulq_f32(d, d));
+		i += 4;
+	}
+	if (i + 4 <= paddedDims)
+	{
+		const float32x4_t d = vsubq_f32(vld1q_f32(query + i), vld1q_f32(row + i));
+		acc2 = vaddq_f32(acc2, vmulq_f32(d, d));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+float DotI8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	float32x4_t acc0 = vdupq_n_f32(0.0f);
+	float32x4_t acc1 = vdupq_n_f32(0.0f);
+	float32x4_t acc2 = vdupq_n_f32(0.0f);
+	float32x4_t acc3 = vdupq_n_f32(0.0f);
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const I8x16AsFloat f = WidenI8x16(row + i);
+		acc0 = vaddq_f32(acc0, vmulq_f32(f.f0, vld1q_f32(query + i)));
+		acc1 = vaddq_f32(acc1, vmulq_f32(f.f1, vld1q_f32(query + i + 4)));
+		acc2 = vaddq_f32(acc2, vmulq_f32(f.f2, vld1q_f32(query + i + 8)));
+		acc3 = vaddq_f32(acc3, vmulq_f32(f.f3, vld1q_f32(query + i + 12)));
+	}
+	return scale * ((SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3)));
+}
+
+float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	const float32x4_t scaleV = vdupq_n_f32(scale);
+	float32x4_t acc0 = vdupq_n_f32(0.0f);
+	float32x4_t acc1 = vdupq_n_f32(0.0f);
+	float32x4_t acc2 = vdupq_n_f32(0.0f);
+	float32x4_t acc3 = vdupq_n_f32(0.0f);
+	int32_t i = 0;
+	for (; i + 16 <= paddedDims; i += 16)
+	{
+		const I8x16AsFloat f = WidenI8x16(row + i);
+		const float32x4_t d0 = vsubq_f32(vld1q_f32(query + i), vmulq_f32(scaleV, f.f0));
+		const float32x4_t d1 = vsubq_f32(vld1q_f32(query + i + 4), vmulq_f32(scaleV, f.f1));
+		const float32x4_t d2 = vsubq_f32(vld1q_f32(query + i + 8), vmulq_f32(scaleV, f.f2));
+		const float32x4_t d3 = vsubq_f32(vld1q_f32(query + i + 12), vmulq_f32(scaleV, f.f3));
+		acc0 = vaddq_f32(acc0, vmulq_f32(d0, d0));
+		acc1 = vaddq_f32(acc1, vmulq_f32(d1, d1));
+		acc2 = vaddq_f32(acc2, vmulq_f32(d2, d2));
+		acc3 = vaddq_f32(acc3, vmulq_f32(d3, d3));
+	}
+	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
+}
+
+// NEON path: the plain scalar kernels are the exact mirror.
+
+float DotF32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return DotF32Scalar(row, query, paddedDims);
+}
+
+float L2F32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return L2F32Scalar(row, query, paddedDims);
+}
+
+float DotI8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return DotI8Scalar(row, scale, query, paddedDims);
+}
+
+float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return L2I8Scalar(row, scale, query, paddedDims);
+}
+
+#else // scalar fallback
+
 float DotF32(const float* row, const float* query, int32_t paddedDims)
 {
 	return DotF32Scalar(row, query, paddedDims);
@@ -171,6 +598,28 @@ float L2I8(const int8_t* row, float scale, const float* query, int32_t paddedDim
 {
 	return L2I8Scalar(row, scale, query, paddedDims);
 }
+
+float DotF32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return DotF32Scalar(row, query, paddedDims);
+}
+
+float L2F32Mirror(const float* row, const float* query, int32_t paddedDims)
+{
+	return L2F32Scalar(row, query, paddedDims);
+}
+
+float DotI8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return DotI8Scalar(row, scale, query, paddedDims);
+}
+
+float L2I8Mirror(const int8_t* row, float scale, const float* query, int32_t paddedDims)
+{
+	return L2I8Scalar(row, scale, query, paddedDims);
+}
+
+#endif
 
 } // namespace detail
 
