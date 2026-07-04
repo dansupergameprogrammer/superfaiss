@@ -55,7 +55,8 @@ machine, same bank ⇒ same path, every time.
 | Same results across different SIMD paths (e.g. AVX2 desktop vs NEON phone) | **No.** Different accumulation widths round differently. Per-device determinism only. |
 
 If you need cross-device, replay-grade exactness (lockstep multiplayer), you need a
-pure-integer scoring path — a planned extension, not present in v1.0. Note that consoles
+pure-integer scoring path. This library does not have one, and none is scheduled — it
+would be built if and when a real consumer needs it, not before. Note that consoles
 are fixed hardware: "per device" is effectively "per SKU" there, which is the strong
 version of the promise.
 
