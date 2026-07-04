@@ -14,8 +14,12 @@ jobs:
           $out = & build/Release/superfaiss_tests.exe
           Write-Output $out
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          if ($out -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
-          if ($out -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
+          # $out is an ARRAY once the suite prints multiple lines; -notmatch on an
+          # array filters elements instead of returning a boolean. Match on the
+          # joined text.
+          $text = $out -join "`n"
+          if ($text -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
+          if ($text -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
 
   linux-x64:
     runs-on: ubuntu-latest
