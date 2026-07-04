@@ -48,6 +48,33 @@ Status ValidateBank(const BankView& bank)
 			return Status::BadFormat;
 		}
 	}
+	if (bank.channels != nullptr || bank.channelCount != 0)
+	{
+		if (bank.channels == nullptr || bank.channelCount <= 0 ||
+			bank.channelCount > kMaxChannels)
+		{
+			return Status::BadFormat;
+		}
+		const int32_t grid = kAlignment / ElementSize(bank.quant);
+		int32_t prevEnd = 0;
+		for (int32_t c = 0; c < bank.channelCount; ++c)
+		{
+			const ChannelInfo& channel = bank.channels[c];
+			if (channel.offset < 0 || channel.length <= 0 ||
+				channel.offset % grid != 0 || channel.length % grid != 0 ||
+				channel.offset < prevEnd ||
+				static_cast<int64_t>(channel.offset) + channel.length > bank.paddedDims)
+			{
+				return Status::BadFormat;
+			}
+			prevEnd = channel.offset + channel.length;
+		}
+		// Per-channel cosine requires the baked inverse sub-norms.
+		if (bank.metric == Metric::Cosine && bank.channelInvNorms == nullptr)
+		{
+			return Status::BadFormat;
+		}
+	}
 	return Status::Ok;
 }
 

@@ -42,6 +42,18 @@ inline constexpr int32_t kAlignment = 16;
 // scan at chunk granularity. ~64 KB of row data per chunk.
 inline constexpr int32_t kChunkBytes = 64 * 1024;
 
+// A named channel's range (names live host-side; the core is name-free): a
+// contiguous element run on the 16-byte element grid. Channels are ascending and
+// non-overlapping; kMaxChannels matches kMaxSegments (channels are the bank-side
+// twin of query segments).
+struct ChannelInfo
+{
+	int32_t offset = 0;
+	int32_t length = 0;
+};
+
+inline constexpr int32_t kMaxChannels = 8;
+
 // A non-owning view of a baked bank. The library never allocates or frees bank memory.
 struct BankView
 {
@@ -52,6 +64,14 @@ struct BankView
 	int32_t paddedDims = 0;        // stride in elements; pad lanes are zero
 	Quantization quant = Quantization::Float32;
 	Metric metric = Metric::Dot;
+	// Optional channel table (schemaVersion 2 banks). For Cosine banks with channels,
+	// channelInvNorms holds count x channelCount per-row inverse sub-norms baked from
+	// the QUANTIZED rows (the reported per-channel cosine is the cosine of what the
+	// kernel actually dots); a zero-norm row channel stores 0 and scores 0 for that
+	// segment - defined, never NaN.
+	const ChannelInfo* channels = nullptr;
+	int32_t channelCount = 0;
+	const float* channelInvNorms = nullptr;
 };
 
 struct Hit

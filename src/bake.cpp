@@ -133,4 +133,44 @@ Status ValidateSourceRows(const float* rows, int32_t count, int32_t dims, int32_
 	return Status::Ok;
 }
 
+Status ComputeChannelInverseNorms(const BankView& bank, float* outInvNorms)
+{
+	if (outInvNorms == nullptr || bank.channels == nullptr || bank.channelCount <= 0 ||
+		bank.channelCount > kMaxChannels || bank.rows == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t r = 0; r < bank.count; ++r)
+	{
+		for (int32_t c = 0; c < bank.channelCount; ++c)
+		{
+			const ChannelInfo& channel = bank.channels[c];
+			double norm = 0.0;
+			if (bank.quant == Quantization::Int8)
+			{
+				const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+					static_cast<int64_t>(r) * bank.paddedDims;
+				const double scale = bank.scales[r];
+				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
+				{
+					const double v = scale * row[j];
+					norm += v * v;
+				}
+			}
+			else
+			{
+				const float* row = static_cast<const float*>(bank.rows) +
+					static_cast<int64_t>(r) * bank.paddedDims;
+				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
+				{
+					norm += static_cast<double>(row[j]) * row[j];
+				}
+			}
+			outInvNorms[static_cast<int64_t>(r) * bank.channelCount + c] =
+				norm > 0.0 ? static_cast<float>(1.0 / std::sqrt(norm)) : 0.0f;
+		}
+	}
+	return Status::Ok;
+}
+
 } // namespace superfaiss
