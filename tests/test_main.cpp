@@ -2711,11 +2711,13 @@ static void TestPinDrainLitmus()
 
 	int guarded = 0; // deliberately non-atomic: the TSan tripwire
 	std::atomic<bool> done{false};
+	std::atomic<int32_t> readersReady{0};
 	std::atomic<int64_t> violations{0};
 	std::atomic<int64_t> pinsTaken{0};
 	std::atomic<int64_t> exclusivesRun{0};
 
 	auto readerFn = [&]() {
+		readersReady.fetch_add(1, std::memory_order_release);
 		while (!done.load(std::memory_order_acquire))
 		{
 			if (!bank.TryPinReader())
@@ -2735,6 +2737,15 @@ static void TestPinDrainLitmus()
 	std::thread readers[3] = {
 		std::thread(readerFn), std::thread(readerFn), std::thread(readerFn)};
 
+	// Start barrier + periodic yield: without them the writer can run all its
+	// iterations before the OS schedules a single reader (the same failure mode
+	// the storm test hit), and the liveness check below trips spuriously — seen
+	// once on the macos-arm64 runner. Correctness never depended on timing;
+	// liveness assertions must not either.
+	while (readersReady.load(std::memory_order_acquire) < 3)
+	{
+		std::this_thread::yield();
+	}
 	for (int i = 0; i < 20000; ++i)
 	{
 		if (!bank.BeginExclusive())
@@ -2746,6 +2757,10 @@ static void TestPinDrainLitmus()
 		guarded = 0;
 		bank.EndExclusive();
 		exclusivesRun.fetch_add(1, std::memory_order_relaxed);
+		if ((i & 63) == 0)
+		{
+			std::this_thread::yield(); // give readers pin windows on small runners
+		}
 	}
 	done.store(true, std::memory_order_release);
 	for (auto& t : readers)
