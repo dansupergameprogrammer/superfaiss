@@ -80,6 +80,18 @@ void ScoreChunkFusedSegmented(
 	int32_t segmentCount,
 	TopK& inout);
 
+// Per-row decomposition (V2 section 6): scores one row over the segment list and
+// surfaces the post-scale post-weight per-segment contributions; the returned total
+// is their ordered sum, bit-exact by construction. Per-hit cost, not per-row: call
+// it on hits, not banks. Callers validate segments first.
+float DecomposeRowScore(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t rowIndex,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	float* outContributions);
+
 // Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
 // upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
 // per-device determinism promise is unaffected. Exposed for tests and diagnostics.

@@ -889,21 +889,36 @@ namespace
 	}
 
 	// A range is a contiguous element run: a live segment (accIndex >= 0, weight
-	// applied at combine) or a gap (accIndex < 0, partial discarded).
+	// applied at combine) or a gap (accIndex < 0, partial discarded). channelIndex
+	// (>= 0 when the range exactly matches a bank channel) selects the per-row
+	// inverse sub-norm on per-channel-cosine banks.
 	struct FScanRange
 	{
 		int32_t offset;
 		int32_t length;
 		float weight;
-		int32_t accIndex; // -1 = discard
+		int32_t accIndex;     // -1 = discard
+		int32_t channelIndex; // -1 = no channel match
 	};
+
+	inline int32_t MatchChannel(const BankView& bank, int32_t offset, int32_t length)
+	{
+		for (int32_t c = 0; c < bank.channelCount; ++c)
+		{
+			if (bank.channels[c].offset == offset && bank.channels[c].length == length)
+			{
+				return c;
+			}
+		}
+		return -1;
+	}
 
 	// Builds the full-coverage range list: segments in order, gaps filled, trailing
 	// gap to paddedDims. Returns the range count (<= 2*kMaxSegments + 1).
 	inline int32_t BuildScanRanges(
+		const BankView& bank,
 		const QuerySegment* segments,
 		int32_t segmentCount,
-		int32_t paddedDims,
 		FScanRange* outRanges)
 	{
 		int32_t n = 0;
@@ -913,17 +928,18 @@ namespace
 			const QuerySegment& seg = segments[i];
 			if (seg.offset > cursor)
 			{
-				outRanges[n++] = {cursor, seg.offset - cursor, 0.0f, -1};
+				outRanges[n++] = {cursor, seg.offset - cursor, 0.0f, -1, -1};
 			}
 			// Weight-0 segments keep omission semantics: scanned for stride
 			// continuity, discarded like a gap.
 			outRanges[n++] = {seg.offset, seg.length, seg.weight,
-				seg.weight == 0.0f ? -1 : i};
+				seg.weight == 0.0f ? -1 : i,
+				MatchChannel(bank, seg.offset, seg.length)};
 			cursor = seg.offset + seg.length;
 		}
-		if (cursor < paddedDims)
+		if (cursor < bank.paddedDims)
 		{
-			outRanges[n++] = {cursor, paddedDims - cursor, 0.0f, -1};
+			outRanges[n++] = {cursor, bank.paddedDims - cursor, 0.0f, -1, -1};
 		}
 		return n;
 	}
@@ -931,6 +947,12 @@ namespace
 	// Scores one row over the range list. outPartials (kMaxSegments floats) receives
 	// unweighted per-segment partials when non-null (the decomposition surface);
 	// the return value is the weighted combine.
+	// rowInvNorms: per-channel-cosine banks pass the row's inverse sub-norm slice
+	// (channelCount floats); a channel-matched range's partial scales by its stored
+	// inverse sub-norm BEFORE the weight (D-V2-1: true per-channel cosine; a
+	// zero-norm row channel stored 0 and scores 0 - defined, never NaN).
+	// outPartials receives the post-scale, post-weight per-segment contributions
+	// (the decomposition surface: contributions sum bit-exactly to the total).
 	inline float DenseSegmentedRowScore(
 		const void* row,
 		float scale,
@@ -940,6 +962,7 @@ namespace
 		const FRowKernels& kernels,
 		bool isL2,
 		bool isInt8,
+		const float* rowInvNorms,
 		float* outPartials)
 	{
 		float total = 0.0f;
@@ -963,11 +986,16 @@ namespace
 			}
 			if (range.accIndex >= 0)
 			{
+				if (rowInvNorms != nullptr && range.channelIndex >= 0)
+				{
+					partial *= rowInvNorms[range.channelIndex];
+				}
+				const float contribution = range.weight * partial;
 				if (outPartials != nullptr)
 				{
-					outPartials[range.accIndex] = partial;
+					outPartials[range.accIndex] = contribution;
 				}
-				total += range.weight * partial;
+				total += contribution;
 			}
 			// Gap partials are computed for stride continuity and discarded; their
 			// products never touch a live score (T-050 W1 discard semantics).
@@ -995,10 +1023,11 @@ void ScoreChunkSegmented(
 
 	const bool isL2 = bank.metric == Metric::L2;
 	const bool isInt8 = bank.quant == Quantization::Int8;
+	const bool perChannelCosine =
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
 	const FRowKernels kernels = ResolveRowKernels();
 	FScanRange ranges[2 * kMaxSegments + 1];
-	const int32_t rangeCount =
-		BuildScanRanges(segments, segmentCount, bank.paddedDims, ranges);
+	const int32_t rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
 	const int64_t rowBytes = RowBytes(bank);
 
 	for (int32_t r = begin; r < end; ++r)
@@ -1010,8 +1039,11 @@ void ScoreChunkSegmented(
 		const void* row = static_cast<const uint8_t*>(bank.rows) +
 			static_cast<int64_t>(r) * rowBytes;
 		const float scale = isInt8 ? bank.scales[r] : 1.0f;
+		const float* rowInvNorms = perChannelCosine
+			? bank.channelInvNorms + static_cast<int64_t>(r) * bank.channelCount
+			: nullptr;
 		inout.Push(r, DenseSegmentedRowScore(row, scale, paddedQuery, ranges,
-			rangeCount, kernels, isL2, isInt8, nullptr));
+			rangeCount, kernels, isL2, isInt8, rowInvNorms, nullptr));
 	}
 }
 
@@ -1036,9 +1068,11 @@ void ScoreChunkFusedSegmented(
 	const int32_t pd = bank.paddedDims;
 	const bool isL2 = bank.metric == Metric::L2;
 	const bool isInt8 = bank.quant == Quantization::Int8;
+	const bool perChannelCosine =
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
 	const FRowKernels kernels = ResolveRowKernels();
 	FScanRange ranges[2 * kMaxSegments + 1];
-	const int32_t rangeCount = BuildScanRanges(segments, segmentCount, pd, ranges);
+	const int32_t rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
 	const int64_t rowBytes = RowBytes(bank);
 
 	for (int32_t r = begin; r < end; ++r)
@@ -1050,12 +1084,15 @@ void ScoreChunkFusedSegmented(
 		const void* row = static_cast<const uint8_t*>(bank.rows) +
 			static_cast<int64_t>(r) * rowBytes;
 		const float scale = isInt8 ? bank.scales[r] : 1.0f;
+		const float* rowInvNorms = perChannelCosine
+			? bank.channelInvNorms + static_cast<int64_t>(r) * bank.channelCount
+			: nullptr;
 		float fused = 0.0f;
 		for (int32_t m = 0; m < queryCount; ++m)
 		{
 			const float score = DenseSegmentedRowScore(row, scale,
 				paddedQueries + static_cast<int64_t>(m) * pd, ranges, rangeCount,
-				kernels, isL2, isInt8, nullptr);
+				kernels, isL2, isInt8, rowInvNorms, nullptr);
 			if (m == 0 || (isL2 ? score > fused : score < fused))
 			{
 				fused = score;
@@ -1063,6 +1100,38 @@ void ScoreChunkFusedSegmented(
 		}
 		inout.Push(r, fused);
 	}
+}
+
+// Per-row decomposition (V2 section 6): the dense row scorer with its partials
+// surfaced. outContributions receives segmentCount post-scale post-weight values;
+// the returned total is their ordered sum (bit-exact by construction).
+float DecomposeRowScore(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t rowIndex,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	float* outContributions)
+{
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool isInt8 = bank.quant == Quantization::Int8;
+	const bool perChannelCosine =
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
+	const FRowKernels kernels = ResolveRowKernels();
+	FScanRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
+	const void* row = static_cast<const uint8_t*>(bank.rows) +
+		static_cast<int64_t>(rowIndex) * RowBytes(bank);
+	const float scale = isInt8 ? bank.scales[rowIndex] : 1.0f;
+	const float* rowInvNorms = perChannelCosine
+		? bank.channelInvNorms + static_cast<int64_t>(rowIndex) * bank.channelCount
+		: nullptr;
+	for (int32_t i = 0; i < segmentCount; ++i)
+	{
+		outContributions[i] = 0.0f; // weight-0 segments contribute exactly 0
+	}
+	return DenseSegmentedRowScore(row, scale, paddedQuery, ranges, rangeCount,
+		kernels, isL2, isInt8, rowInvNorms, outContributions);
 }
 
 } // namespace superfaiss

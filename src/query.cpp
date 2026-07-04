@@ -82,8 +82,13 @@ Status Query(
 		return Status::OutOfMemory;
 	}
 
-	const bool bFoldable =
-		params.segments != nullptr && scoring.metric != Metric::L2;
+	// Per-channel-cosine banks score through the dense path (the inverse sub-norm
+	// is a row-side factor and cannot fold into the query); the metric override
+	// composes to raw-dot projection and folds (section 5).
+	const bool bPerChannelCosine = bank.metric == Metric::Cosine &&
+		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
+	const bool bFoldable = params.segments != nullptr &&
+		scoring.metric != Metric::L2 && !bPerChannelCosine;
 	const float* effectiveQuery = paddedQuery;
 	if (bFoldable)
 	{
@@ -229,7 +234,10 @@ Status QueryBatch(
 	// Segmented batches keep the chunk-outermost structure — the bank streams once
 	// per batch — with the single-query segmented kernel scoring each query inside
 	// the chunk (plan 18.7/W1 composition; pair-blocked variants stay V1-shaped).
-	if (params.segments != nullptr && scoring.metric != Metric::L2)
+	const bool bBatchPerChannelCosine = bank.metric == Metric::Cosine &&
+		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
+	if (params.segments != nullptr && scoring.metric != Metric::L2 &&
+		!bBatchPerChannelCosine)
 	{
 		// Dot-family segmented batch: fold each query once, then the batch IS the
 		// plain V1 batch (pair kernels included) over the folded queries.
@@ -380,8 +388,10 @@ Status QueryIntersect(
 	TopK topk;
 	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
 
-	const bool bFoldable =
-		params.segments != nullptr && scoring.metric != Metric::L2;
+	const bool bIntersectPerChannelCosine = bank.metric == Metric::Cosine &&
+		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
+	const bool bFoldable = params.segments != nullptr &&
+		scoring.metric != Metric::L2 && !bIntersectPerChannelCosine;
 	const float* effectiveQueries = paddedQueries;
 	if (bFoldable)
 	{

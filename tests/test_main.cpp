@@ -1922,6 +1922,221 @@ static void TestSegmentedScan()
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T21 — per-channel cosine (V2 plan section 5, D-V2-1; slot 2):
+//   channel-matched segments on a channel-carrying Cosine bank score as TRUE
+//   per-channel cosines via inverse sub-norms baked from the QUANTIZED rows;
+//   zero-norm row channels score 0 (never NaN); decomposition contributions
+//   sum bit-exactly to the query total; the metric override composes to raw
+//   projection; bad channel tables are rejected.
+
+static void TestPerChannelCosine()
+{
+	Rng rng(0xC4A22E1ull);
+	const int32_t dims = 32;
+	const int32_t count = 200;
+	const int32_t k = 8;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		TestBank bank(rng, count, dims, quant, Metric::Cosine);
+		const int32_t pd = bank.view.paddedDims;
+		const int32_t grid = kAlignment / ElementSize(quant);
+		const int32_t half = (dims / 2 / grid) * grid;
+
+		// Two channels covering the row.
+		const ChannelInfo channels[2] = {{0, half}, {half, pd - half}};
+		std::vector<float> invNorms(static_cast<size_t>(count) * 2);
+		BankView view = bank.view;
+		view.channels = channels;
+		view.channelCount = 2;
+		CHECK(ComputeChannelInverseNorms(view, invNorms.data()) == Status::Ok);
+		view.channelInvNorms = invNorms.data();
+		CHECK(ValidateBank(view) == Status::Ok);
+
+		// Query with per-channel-renormalized sub-vectors (the D-V2-1 build rule).
+		AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+		std::vector<float> qv(static_cast<size_t>(dims));
+		for (auto& x : qv)
+		{
+			x = rng.NextFloat();
+		}
+		PadQuery(qv, pd, q.F32());
+		for (const ChannelInfo& ch : channels)
+		{
+			double norm = 0.0;
+			for (int32_t j = ch.offset; j < ch.offset + ch.length; ++j)
+			{
+				norm += static_cast<double>(q.F32()[j]) * q.F32()[j];
+			}
+			const double inv = norm > 0.0 ? 1.0 / std::sqrt(norm) : 0.0;
+			for (int32_t j = ch.offset; j < ch.offset + ch.length; ++j)
+			{
+				q.F32()[j] = static_cast<float>(q.F32()[j] * inv);
+			}
+		}
+
+		const QuerySegment segs[2] = {
+			{0, half, 1.0f},
+			{half, pd - half, 0.5f},
+		};
+		QueryParams sp;
+		sp.k = k;
+		sp.segments = segs;
+		sp.segmentCount = 2;
+
+		Workspace ws;
+		std::vector<Hit> got(static_cast<size_t>(k));
+		int32_t gotCount = 0;
+		CHECK(Query(view, q.F32(), sp, ws, got.data(), &gotCount) == Status::Ok);
+
+		// Double reference: true per-channel cosines of the QUANTIZED rows.
+		std::vector<RefHit> ref;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			const double* row = bank.refRows.data() + static_cast<size_t>(r) * dims;
+			double total = 0.0;
+			for (int32_t sIdx = 0; sIdx < 2; ++sIdx)
+			{
+				const QuerySegment& sg = segs[sIdx];
+				double dot = 0.0, rowNorm = 0.0;
+				for (int32_t j = sg.offset; j < sg.offset + sg.length && j < dims; ++j)
+				{
+					dot += static_cast<double>(q.F32()[j]) * row[j];
+					rowNorm += row[j] * row[j];
+				}
+				const double cosine =
+					rowNorm > 0.0 ? dot / std::sqrt(rowNorm) : 0.0;
+				total += static_cast<double>(sg.weight) * cosine;
+			}
+			ref.push_back({r, total});
+		}
+		std::sort(ref.begin(), ref.end(), [&](const RefHit& a, const RefHit& b) {
+			return RefBetter(a, b, Metric::Cosine);
+		});
+		CheckTopK(bank, ref, got.data(), gotCount, k);
+
+		// Per-channel cosines are true cosines: score of a single unit-weight
+		// channel segment lies in [-1, 1] (+ float slack).
+		{
+			const QuerySegment one[1] = {{0, half, 1.0f}};
+			QueryParams op;
+			op.k = count;
+			op.segments = one;
+			op.segmentCount = 1;
+			Workspace wsAll;
+			std::vector<Hit> all(static_cast<size_t>(count));
+			int32_t n = 0;
+			CHECK(Query(view, q.F32(), op, wsAll, all.data(), &n) == Status::Ok);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				CHECK_MSG(all[i].score >= -1.001f && all[i].score <= 1.001f,
+					"channel cosine out of range: %g", all[i].score);
+			}
+		}
+
+		// Decomposition: contributions sum bit-exactly to the same total the scan
+		// produced for that row (same machinery, same order).
+		{
+			float contributions[2] = {0.0f, 0.0f};
+			const int32_t hitRow = got[0].index;
+			const float total = DecomposeRowScore(view, q.F32(), hitRow, segs, 2,
+				contributions);
+			CHECK(total == got[0].score);
+			CHECK((contributions[0] + contributions[1]) == total);
+		}
+
+		// Metric override composes: ScoreAs::Dot on the channel bank folds to raw
+		// projection - a different, valid ranking (bit-identical to a channel-less
+		// view scored the same way).
+		{
+			QueryParams po = sp;
+			po.scoreAs = ScoreAs::Dot;
+			Workspace wsO;
+			std::vector<Hit> proj(static_cast<size_t>(k));
+			int32_t nProj = 0;
+			CHECK(Query(view, q.F32(), po, wsO, proj.data(), &nProj) == Status::Ok);
+			BankView bare = view;
+			bare.channels = nullptr;
+			bare.channelCount = 0;
+			bare.channelInvNorms = nullptr;
+			Workspace wsB;
+			std::vector<Hit> bareHits(static_cast<size_t>(k));
+			int32_t nBare = 0;
+			QueryParams pb = sp;
+			pb.scoreAs = ScoreAs::Dot;
+			CHECK(Query(bare, q.F32(), pb, wsB, bareHits.data(), &nBare) == Status::Ok);
+			CHECK(nProj == nBare);
+			for (int32_t i = 0; i < nProj && i < nBare; ++i)
+			{
+				CHECK(proj[i].index == bareHits[i].index &&
+					proj[i].score == bareHits[i].score);
+			}
+		}
+	}
+
+	// Zero-norm row channel scores 0, never NaN: hand bank, row 1's first channel
+	// all zeros.
+	{
+		const int32_t d = 8;
+		AlignedBuf rows(2 * d * sizeof(float));
+		rows.F32()[0] = 1.0f;               // row 0: energy in ch0
+		rows.F32()[d + 4] = 1.0f;           // row 1: ch0 all-zero, energy in ch1
+		const ChannelInfo channels[2] = {{0, 4}, {4, 4}};
+		std::vector<float> invNorms(4);
+		BankView v;
+		v.rows = rows.ptr;
+		v.count = 2;
+		v.dims = d;
+		v.paddedDims = d;
+		v.quant = Quantization::Float32;
+		v.metric = Metric::Cosine;
+		v.channels = channels;
+		v.channelCount = 2;
+		CHECK(ComputeChannelInverseNorms(v, invNorms.data()) == Status::Ok);
+		CHECK(invNorms[2] == 0.0f); // row 1, channel 0
+		v.channelInvNorms = invNorms.data();
+
+		alignas(16) float q[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+		const QuerySegment one[1] = {{0, 4, 1.0f}};
+		QueryParams p;
+		p.k = 2;
+		p.segments = one;
+		p.segmentCount = 1;
+		Workspace ws;
+		Hit h[2];
+		int32_t n = 0;
+		CHECK(Query(v, q, p, ws, h, &n) == Status::Ok);
+		for (int32_t i = 0; i < n; ++i)
+		{
+			CHECK(h[i].score == h[i].score); // not NaN
+			if (h[i].index == 1)
+			{
+				CHECK(h[i].score == 0.0f); // zero-norm channel scores 0
+			}
+		}
+	}
+
+	// Rejections: overlapping channels; cosine channels without norms.
+	{
+		TestBank bank(rng, 8, dims, Quantization::Float32, Metric::Cosine);
+		const ChannelInfo bad[2] = {{0, 8}, {4, 8}};
+		BankView v = bank.view;
+		v.channels = bad;
+		v.channelCount = 2;
+		std::vector<float> dummy(16, 1.0f);
+		v.channelInvNorms = dummy.data();
+		CHECK(ValidateBank(v) == Status::BadFormat);
+
+		const ChannelInfo good[1] = {{0, 8}};
+		v.channels = good;
+		v.channelCount = 1;
+		v.channelInvNorms = nullptr;
+		CHECK(ValidateBank(v) == Status::BadFormat);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -1944,6 +2159,7 @@ int main()
 	TestIntersect();
 	TestPca();
 	TestSegmentedScan();
+	TestPerChannelCosine();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
