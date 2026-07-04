@@ -49,6 +49,8 @@ machine, same bank ⇒ same path, every time.
 | Serial scan ≡ parallel chunked scan | Yes (total order; test-pinned) |
 | Batch ≡ equivalent single queries | Yes (pair kernels bit-equal singles; test-pinned) |
 | Same results across thread counts / schedulers | Yes |
+| Segmented queries (v2.0): same segments + weights => bit-identical; degenerate one-segment list == whole-row scan | Yes (segments process in ascending offset order, always; the segment list is part of the query, not a source of nondeterminism) |
+| Decomposition (v2.0): contributions sum bit-exactly to the scan's own score | Yes (the partials ARE the scan's accumulators; no second code path exists to drift) |
 | Same results across devices with the same active SIMD path | Yes in practice for int8 (integer→float conversion + pinned float ops are IEEE-determined), but **not contractually claimed** |
 | Same results across different SIMD paths (e.g. AVX2 desktop vs NEON phone) | **No.** Different accumulation widths round differently. Per-device determinism only. |
 

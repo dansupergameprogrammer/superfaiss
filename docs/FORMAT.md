@@ -128,4 +128,4 @@ cross-endian interchange format (the `.wvbank` sidecar is the interchange).
 Consumers embedding this format in their own asset containers should reserve a
 versioned, skippable block for future index structures (approximate-search
 acceleration), so adding them later is additive rather than format-breaking. The
-reference UE plugin does exactly this.
+[reference UE plugin](https://github.com/dansupergameprogrammer/superfaiss-unreal) does exactly this.

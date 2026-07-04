@@ -28,6 +28,22 @@ thread, deterministically, on every platform your game ships on — that is what
   the chunks. Determinism does not depend on who schedules what.
 - **Batch queries.** M queries scored in one bank pass amortize the memory traffic — the
   economics that make per-tick entity queries cheap.
+- **Segmented queries and named channels (v2.0).** Score a weighted combination of
+  contiguous sub-ranges of the vector — "identity 1.0, appearance 0.2" — with exact
+  per-segment decomposition of every hit ("appearance matched, identity didn't"), and
+  true per-channel cosines on cosine banks. **Segments are a semantics feature, not a
+  speed feature**: a segmented scan is priced at approximately one full scan (for
+  dot-family scoring the weights fold into the query exactly, so it runs the plain V1
+  kernels at V1 speed; masking a range does not make the scan faster on this
+  row-interleaved layout — measured, not assumed). A degenerate one-segment query is
+  bit-identical to the whole-row scan.
+- **Scratch banks (v2.0).** A fixed-capacity mutable bank for runtime-accumulated
+  vectors (NPC memory, session embeddings): single writer, lock-free wait-free readers,
+  atomic tombstone removal (deletion is exclusion), index-preserving `Grow`, `Freeze`
+  into a standard immutable bank (bit-identical, with an old-to-new index map), and
+  save/load through a caller-owned archive seam. Determinism extends to it as
+  determinism-given-history. A snapshot IS a `BankView`, so every query feature above
+  works on scratch content unchanged.
 
 ## What it deliberately is not
 
@@ -43,6 +59,15 @@ Cosine banks are pre-normalized at bake (query-time cosine is then a plain dot p
 zero-norm row is a bake-time error, not a runtime branch). Interchange is a two-file
 sidecar: `<name>.wvbank.json` (header) + `<name>.wvbank.bin` (raw float32 rows) — trivial
 to emit from any pipeline in a few lines.
+
+## Reference integration
+
+[**SuperFAISS For Unreal Engine**](https://github.com/dansupergameprogrammer/superfaiss-unreal)
+is the canonical engine integration: banks as assets with import-time validation and
+recall measurement, sync/async/batch queries on the task graph, named channels with
+decomposition, scratch banks, an in-editor inspector, and the full automation-test
+suite. It exercises every seam [INTEGRATION.md](docs/INTEGRATION.md) describes — if
+you are embedding this library anywhere, it is the worked example.
 
 ## Documentation
 

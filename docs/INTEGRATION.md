@@ -4,8 +4,8 @@ The library is deliberately incomplete: it has **no threads, no I/O, no JSON par
 and no allocator opinions**. Those seams are where your engine plugs in. This guide
 covers each seam, the build flags that keep the determinism promise intact, and the
 performance model that should shape your integration. The reference integration is the
-SuperFAISS For Unreal Engine plugin (SuperFAISSUnreal), which exercises every seam
-described here.
+[SuperFAISS For Unreal Engine plugin](https://github.com/dansupergameprogrammer/superfaiss-unreal)
+(SuperFAISSUnreal), which exercises every seam described here.
 
 ## 1. Build
 
@@ -40,6 +40,12 @@ if your platform has a C++17 toolchain, the library compiles.
   time; pool one per concurrent query site. Route the `Allocator` seam to your
   engine's allocator if you track memory. `AllocationCount()` + `Workspace::GrowthCount()`
   let your tests assert zero steady-state allocation — a warm pool never allocates.
+- **Scratch banks (v2.0) are the one owning type.** `ScratchBank` allocates its
+  fixed-capacity arena once through the same `Allocator` seam and never again
+  (append/remove/snapshot/query are allocation-free; `Grow` is an explicit,
+  caller-initiated reallocation). Persistence goes through the caller-owned
+  `ScratchArchive` seam — your save system provides the read/write callbacks, the
+  bank owns the format.
 
 ## 3. Threading seam
 
@@ -57,6 +63,12 @@ levels:
    score each chunk against all queries with `ScoreChunkPair` while its rows are
    cache-resident. Per-query results stay bit-identical to singles.
 
+Scratch banks (v2.0) add one rule to this model: one logical writer, lock-free
+readers. Gate queries with `TryPinReader`/`UnpinReader` and run Grow/Load inside
+`BeginExclusive`/`EndExclusive` — the shipped protocol's seq_cst orderings are what
+make it correct on weakly-ordered ISAs (ARM); do not substitute your own flag/counter
+pair (see the pin/drain commentary in `scratch.h`).
+
 Lifetime rule for async integrations: whatever owns the bank must outlive the scan.
 If your object system can destroy assets at shutdown while workers run (Unreal's exit
 purge does), **drain in-flight queries before object teardown** — count dispatches and
@@ -68,9 +80,13 @@ Producers emit the two-file sidecar (trivial from Python — `tools/wvbank.py`;
 `tools/glove_to_wvbank.cpp` converts GloVe text). Your importer parses the JSON header
 with whatever JSON library you already have (the core deliberately has none), then
 runs the bake: `ValidateSourceRows → NormalizeRows (cosine) → QuantizeRowsInt8` or
-`PadRowsFloat32`, and validates the result with `ValidateBankData` at every load.
+`PadRowsFloat32` (plus `ComputeChannelInverseNorms` for Cosine channel banks), and
+validates the result with `ValidateBankData` at every load. Channel banks declare
+`"schemaVersion": 2` with a `channels` array in the sidecar (FORMAT.md section 1);
+v1-only importers hard-reject them by the format's own unknown-version rule.
 
-Import-time practices worth copying from the reference plugin: quantize to int8 by
+Import-time practices worth copying from the
+[reference plugin](https://github.com/dansupergameprogrammer/superfaiss-unreal): quantize to int8 by
 default; measure recall@10 of the quantized bank against its float32 source with a
 **seeded** sample and store the number on the asset; hash the sidecar pair so unchanged
 re-imports are no-ops; reject malformed input with a specific diagnostic and no partial
@@ -96,5 +112,6 @@ much larger. Measure on your targets; the ranking never changes, only the time.
 Minimum honest suite: a golden query on a real shipped bank; mirror equality (§1);
 serial-vs-parallel bit-equality if you built level 2; batch-vs-singles bit-equality if
 you built level 3; allocation-flatness across warm queries; and your shutdown drain
-under in-flight load. The reference plugin ships all of these as engine automation
-tests if you want the shapes.
+under in-flight load. The
+[reference plugin](https://github.com/dansupergameprogrammer/superfaiss-unreal) ships
+all of these as engine automation tests if you want the shapes.
