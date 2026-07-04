@@ -22,10 +22,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build
+      # Output prints even when the suite fails (a $(...) capture under bash -e
+      # dies before its echo, swallowing the FAIL lines).
       - run: |
-          out=$(./build/superfaiss_tests)
-          echo "$out"
-          echo "$out" | grep -E "simd path: (sse|avx2)" > /dev/null
+          set +e
+          ./build/superfaiss_tests | tee test_output.txt
+          status=${PIPESTATUS[0]}
+          grep -E "simd path: (sse|avx2)" test_output.txt > /dev/null || exit 1
+          exit $status
 
   # ThreadSanitizer over the whole suite — the scratch-bank storm test (T-V2-C1)
   # is the target: single-writer/lock-free-reader races surface here, not on
@@ -46,6 +50,8 @@ jobs:
       - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build
       - run: |
-          out=$(./build/superfaiss_tests)
-          echo "$out"
-          echo "$out" | grep "simd path: neon" > /dev/null
+          set +e
+          ./build/superfaiss_tests | tee test_output.txt
+          status=${PIPESTATUS[0]}
+          grep "simd path: neon" test_output.txt > /dev/null || exit 1
+          exit $status
