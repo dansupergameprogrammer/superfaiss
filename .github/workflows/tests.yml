@@ -15,6 +15,7 @@ jobs:
           Write-Output $out
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if ($out -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
+          if ($out -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
 
   linux-x64:
     runs-on: ubuntu-latest
@@ -29,6 +30,7 @@ jobs:
           ./build/superfaiss_tests | tee test_output.txt
           status=${PIPESTATUS[0]}
           grep -E "simd path: (sse|avx2)" test_output.txt > /dev/null || exit 1
+          grep "cross-device hash:" test_output.txt > /dev/null || exit 1
           exit $status
 
   # ThreadSanitizer over the whole suite — the scratch-bank storm test (T-V2-C1)
@@ -43,6 +45,15 @@ jobs:
       - run: ./build/superfaiss_tests
 
   # GitHub macOS runners are Apple Silicon: this executes the NEON path on real ARM.
+  #
+  # Cross-device proof (v2.2, plan 19.4): the suite computes the hit-list hash over
+  # the COMMITTED fixture banks under every kernel path the hardware can force
+  # (scalar/SSE4.1/AVX2 on x86, scalar/NEON here) and asserts it equals the pinned
+  # golden in tests/xd_fixtures.h — so all runners agreeing with the pin proves any
+  # two runners agree with each other, and a divergent machine fails its own job.
+  # This job additionally publishes the full selection recording as a per-commit
+  # artifact: the consumer-facing "ghost from another machine" that SuperMotion's
+  # Station 2 replays against a live local simulation.
   macos-arm64:
     runs-on: macos-latest
     steps:
@@ -51,7 +62,13 @@ jobs:
       - run: cmake --build build
       - run: |
           set +e
-          ./build/superfaiss_tests | tee test_output.txt
+          SUPERFAISS_XD_SELECTION_OUT=xd_selection_arm64.txt ./build/superfaiss_tests | tee test_output.txt
           status=${PIPESTATUS[0]}
           grep "simd path: neon" test_output.txt > /dev/null || exit 1
+          grep "cross-device hash:" test_output.txt > /dev/null || exit 1
           exit $status
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crossdevice-selection-arm64
+          path: xd_selection_arm64.txt
+          if-no-files-found: error

@@ -46,6 +46,24 @@ thread, deterministically, on every platform your game ships on — that is what
   measured +0.4% single / ~0% batch; the dense form measures +3.5% f32 / +1.9% int8).
   Finite values only — `-inf` is not a mask; exclusion is a mask, bias is arithmetic.
   Bias adds in the scored metric's own direction (a reward is negative on L2).
+- **Cross-device bit-exactness (v2.2).** An opt-in query mode
+  (`Exactness::CrossDevice`, int8 banks) promising bit-identical scores AND hit order
+  across DIFFERENT machines — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
+  property lockstep and rollback multiplayer, networked motion matching, and
+  server-side validation actually require. Scoring accumulates in integers
+  (associative, so reduction width cannot matter); the per-row epilogue is a
+  fixed-order double expression with an explicit subnormal floor (|score| < FLT_MIN
+  is exactly 0.0f on every machine — the FTZ/DAZ hole closed by contract, not by
+  hoping fixtures never hit it). **The claim runs as a test**: CI computes the
+  hit-list hash over committed fixture banks — including adversarial tiny-scale
+  banks aimed at the subnormal window — on Windows, Linux, and macOS-ARM, across
+  every kernel path each runner can force, and asserts them all equal a golden
+  pinned in the repo. Stated plainly: f32 banks stay per-device; query quantization
+  adds recall cost beyond row quantization (measured and reported per bank, suite
+  and importer both); cross-device scores are not equal to default-mode scores. The
+  integer path measures FASTER than the default int8 path (−18.5% single / −14.6%
+  batch at 100k×256), and Epic's PoseSearch offers no determinism contract of any
+  kind — this is the differentiating sell, and it re-earns itself on every commit.
 - **Scratch banks (v2.0).** A fixed-capacity mutable bank for runtime-accumulated
   vectors (NPC memory, session embeddings): single writer, lock-free wait-free readers,
   atomic tombstone removal (deletion is exclusion), index-preserving `Grow`, `Freeze`

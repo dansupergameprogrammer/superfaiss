@@ -509,6 +509,111 @@ namespace
 	};
 }
 
+namespace
+{
+	// V2.2 calibration (cross-device kernel; plan section 19.5 predictions):
+	// integer path predicted FASTER than dequant-float on int8 (no dequant
+	// multiplies in the hot loop); the double epilogue is one convert per row,
+	// predicted noise. Both calibrated here, never claimed.
+	struct XdBench
+	{
+		Allocator alloc = DefaultAllocator();
+
+		void Run(int32_t count, int32_t dims, int32_t batch)
+		{
+			Rng rng;
+			std::vector<float> src(static_cast<size_t>(count) * dims);
+			for (auto& v : src)
+			{
+				v = rng.NextFloat();
+			}
+			const int32_t pd = PaddedDims(dims, Quantization::Int8);
+			void* payload = alloc.alloc(static_cast<size_t>(count) * pd, kAlignment, alloc.user);
+			std::vector<float> scales(static_cast<size_t>(count));
+			QuantizeRowsInt8(src.data(), count, dims, pd, static_cast<int8_t*>(payload),
+				scales.data());
+			BankView bank;
+			bank.rows = payload;
+			bank.scales = scales.data();
+			bank.count = count;
+			bank.dims = dims;
+			bank.paddedDims = pd;
+			bank.quant = Quantization::Int8;
+			bank.metric = Metric::Dot;
+
+			void* qmem = alloc.alloc(static_cast<size_t>(batch) * pd * sizeof(float),
+				kAlignment, alloc.user);
+			float* queries = static_cast<float*>(qmem);
+			for (int32_t m = 0; m < batch; ++m)
+			{
+				float* q = queries + static_cast<size_t>(m) * pd;
+				for (int32_t i = 0; i < pd; ++i)
+				{
+					q[i] = i < dims ? rng.NextFloat() : 0.0f;
+				}
+			}
+
+			QueryParams standard;
+			standard.k = 10;
+			QueryParams xd = standard;
+			xd.exactness = Exactness::CrossDevice;
+			Workspace ws;
+			std::vector<Hit> hits(static_cast<size_t>(batch) * 10);
+			std::vector<int32_t> counts(static_cast<size_t>(batch));
+			int32_t n = 0;
+			Query(bank, queries, standard, ws, hits.data(), &n);
+			Query(bank, queries, xd, ws, hits.data(), &n);
+
+			auto timeSingle = [&](const QueryParams& p)
+			{
+				const int32_t reps = count >= 100000 ? 20 : 100;
+				double best = 1e300;
+				for (int32_t run = 0; run < 5; ++run)
+				{
+					const double t0 = Now();
+					for (int32_t r = 0; r < reps; ++r)
+					{
+						Query(bank, queries, p, ws, hits.data(), &n);
+					}
+					const double per = (Now() - t0) / reps;
+					best = per < best ? per : best;
+				}
+				return best;
+			};
+			auto timeBatch = [&](const QueryParams& p)
+			{
+				double best = 1e300;
+				for (int32_t run = 0; run < 5; ++run)
+				{
+					const double t0 = Now();
+					for (int32_t r = 0; r < 5; ++r)
+					{
+						QueryBatch(bank, queries, batch, p, ws, hits.data(), counts.data());
+					}
+					const double per = (Now() - t0) / 5;
+					best = per < best ? per : best;
+				}
+				return best;
+			};
+
+			const double stdSingle = timeSingle(standard);
+			const double xdSingle = timeSingle(xd);
+			const double stdBatch = timeBatch(standard);
+			const double xdBatch = timeBatch(xd);
+			std::printf(
+				"xd %7d x %4d int8 | single std %8.3f ms xd %8.3f ms (%+.1f%%) | "
+				"batch%-3d std %8.3f ms xd %8.3f ms (%+.1f%%)\n",
+				count, dims, stdSingle * 1e3, xdSingle * 1e3,
+				(xdSingle / stdSingle - 1.0) * 100.0,
+				batch, stdBatch * 1e3, xdBatch * 1e3,
+				(xdBatch / stdBatch - 1.0) * 100.0);
+
+			alloc.free(qmem, alloc.user);
+			alloc.free(payload, alloc.user);
+		}
+	};
+}
+
 int main()
 {
 	std::printf("superfaiss bench (single thread, simd path: %s)\n",
@@ -535,5 +640,10 @@ int main()
 	BiasBench biasBench;
 	biasBench.Run(100000, 256, Quantization::Float32);
 	biasBench.Run(100000, 256, Quantization::Int8);
+
+	// V2.2 calibration (cross-device kernel; plan section 19.5 predictions).
+	XdBench xdBench;
+	xdBench.Run(10000, 128, 64);
+	xdBench.Run(100000, 256, 64);
 	return 0;
 }

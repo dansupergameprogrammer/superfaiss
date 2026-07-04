@@ -52,14 +52,68 @@ machine, same bank ⇒ same path, every time.
 | Segmented queries (v2.0): same segments + weights => bit-identical; degenerate one-segment list == whole-row scan | Yes (segments process in ascending offset order, always; the segment list is part of the query, not a source of nondeterminism) |
 | Decomposition (v2.0): contributions sum bit-exactly to the scan's own score | Yes (the partials ARE the scan's accumulators; no second code path exists to drift) |
 | Per-row bias (v2.1): same bias => bit-identical composed ranking; null bias == unbiased bitwise | Yes (one fused add in fixed row order; the bias is part of the query). All-zeros bias is compare-equal, NOT bitwise: IEEE -0.0 + 0.0 == +0.0 |
-| Same results across devices with the same active SIMD path | Yes in practice for int8 (integer→float conversion + pinned float ops are IEEE-determined), but **not contractually claimed** |
-| Same results across different SIMD paths (e.g. AVX2 desktop vs NEON phone) | **No.** Different accumulation widths round differently. Per-device determinism only. |
+| Same results across devices with the same active SIMD path | Yes in practice for int8 (integer→float conversion + pinned float ops are IEEE-determined), but **not contractually claimed** in the default mode |
+| Same results across different SIMD paths (e.g. AVX2 desktop vs NEON phone) | Default mode: **no** (different accumulation widths round differently; per-device only). `Exactness::CrossDevice` (v2.2, int8 banks): **yes — contractual**; see section 2c. |
 
-If you need cross-device, replay-grade exactness (lockstep multiplayer), you need a
-pure-integer scoring path. This library does not have one, and none is scheduled — it
-would be built if and when a real consumer needs it, not before. Note that consoles
-are fixed hardware: "per device" is effectively "per SKU" there, which is the strong
-version of the promise.
+Consoles are fixed hardware: "per device" is effectively "per SKU" there, which is the
+strong version of the default promise.
+
+## 2c. CrossDevice mode (v2.2): bit-exactness across machines
+
+`QueryParams::exactness = Exactness::CrossDevice` opts a query into a stronger
+contract: **identical bank bytes + identical query bytes ⇒ bit-identical scores and
+bit-identical hit order on any machine at any SIMD width** — x86 and ARM, Windows,
+Linux, and macOS, scalar through AVX2 and NEON. This is the property lockstep and
+rollback multiplayer, networked motion matching, and server-side validation require.
+
+Why it holds:
+
+- **Integer accumulation.** The float kernels' one cross-device hazard is reduction
+  shape (8-lane AVX2 vs 4-lane NEON vs scalar sum different rounding orders). In
+  CrossDevice mode the query is quantized to int8 (symmetric per-query scale — the
+  row-bake math) and scoring accumulates int8×int8 products in int32. Integer
+  addition is associative: every width produces the same sums. L2 uses the expanded
+  three-sum form (`qs²·Σq² + rs²·Σr² − 2·qs·rs·Σq·r`), because query and rows carry
+  different scales; all three sums are exact integers.
+- **Fixed-order double epilogue.** Everything after the integer sums — dequant
+  scales, per-channel inverse sub-norms, segment weights (applied at combine;
+  CrossDevice never folds weights into the query), bias — is one fixed-order
+  double-precision expression per row. Every intermediate double is provably a
+  normal value, so per-thread FTZ state can never flush one.
+- **The subnormal floor, by contract.** FTZ/DAZ (flush-to-zero / denormals-are-zero)
+  is per-thread hardware state this library neither controls nor observes, and
+  platform defaults differ. The contract closes the hole: **any final score with
+  magnitude below `FLT_MIN` is exactly `0.0f`, on every machine.** At or above
+  `FLT_MIN` the single double→float conversion produces a normal float, untouched
+  by FTZ. Float inputs (bank scales, inverse sub-norms, weights, biases) are decoded
+  from their IEEE bit patterns, so DAZ cannot flush a subnormal input either.
+- **Round-half-even in integer math.** The query quantizer's rounding is implemented
+  on the bit pattern — no FP rounding-mode dependence, no library rounding call.
+- **Proof in CI.** The test suite computes a hash over full hit lists (order
+  included) from committed fixture banks — including adversarial tiny-scale banks
+  whose scale products straddle the subnormal window — under every kernel path the
+  hardware can force, and asserts it equals a golden pinned in the repo. Windows,
+  Linux, and macOS-ARM runners all assert the same pin on every push.
+
+Scope and cost, stated plainly:
+
+- **Int8 banks only.** f32 banks stay per-device (`InvalidArgument` in this mode).
+- **Query quantization adds error beyond row quantization.** Measure recall in this
+  mode per bank before adopting; the suite and the UE importer report it beside
+  standard recall.
+- **CrossDevice scores differ from default-mode scores** (different math). The
+  contract is cross-device identity within the mode, not equality with the default.
+- **L2 scores can round to tiny negative values** where the true distance is ~0
+  (the expanded form's cancellation). They are bit-identical everywhere; the floor
+  maps (−FLT_MIN, FLT_MIN) to exactly 0.0f.
+- **`paddedDims` is capped at 131072** in this mode, which keeps every int32
+  accumulator overflow-free (`InvalidArgument` beyond it).
+- **Identity is over bank bytes.** Bake once and ship the bytes (the interchange
+  posture the format already takes); the mode does not promise that two machines
+  BAKING the same floats produce identical banks — runtime bake still runs in the
+  platform's FP environment.
+- **The default FP rounding mode (round-to-nearest-even) is assumed**, as it is for
+  the entire library; FTZ/DAZ are the states this mode is explicitly immune to.
 
 ## 2b. Scratch banks: determinism given history
 

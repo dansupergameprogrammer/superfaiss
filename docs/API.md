@@ -39,7 +39,10 @@ struct QueryParams {
     const QuerySegment* segments;  // v2.0: null = whole row (the V1 path, bit-identical)
     int32_t segmentCount;          // <= kMaxSegments (8)
     const RowBias* bias;           // v2.1: per-row score bias; null = none
+    Exactness exactness;           // v2.2: PerDevice (default) | CrossDevice
 };
+
+enum class Exactness : uint8_t { PerDevice, CrossDevice };  // v2.2
 
 struct BiasPair { int32_t index; float bias; };
 struct RowBias {                   // exactly ONE form; both empty = unbiased
@@ -61,6 +64,20 @@ bitwise (IEEE `-0.0 + 0.0 == +0.0`). Costs (measured, reference workload): dense
 form; a dense per-query view in batch streams M x count x 4 bias bytes beside the
 bank, stated not hidden.
 
+**Cross-device exactness (v2.2):** `Exactness::CrossDevice` opts a query into
+bit-identical scores and hit ORDER across machines and SIMD widths — the lockstep /
+rollback / networked-motion-matching contract. Int8 banks only (f32 stays
+per-device; `InvalidArgument`); all metrics; composes with segments, channels, bias,
+exclusion, batch, intersection, and scratch snapshots. The query is quantized to
+int8 (round-half-even in integer math), scoring accumulates in integers
+(associative — width-independent), and the per-row epilogue is one fixed-order
+double expression ending in the subnormal-floor contract: |score| < FLT_MIN is
+exactly 0.0f on every machine (the FTZ/DAZ hole, closed by specification). Query
+quantization adds error beyond row quantization — measure cross-device recall per
+bank before adopting. `paddedDims <= kMaxCrossDeviceDims` (131072). Costs
+(measured, reference workload): the integer path is FASTER than dequant-float —
+single −18.5%, batch −14.6% (100k × 256 int8). Full contract: DETERMINISM.md §2c.
+
 **Segmented queries (v2.0):** a segment is a contiguous element range with a scalar
 weight; scores combine additively (`total = sum(weight_s * partial_s)`). A mask is a
 range simply omitted; a weight-0 segment equals omission. Ranges lie on the 16-byte
@@ -74,7 +91,7 @@ Helpers: `PaddedDims(dims, quant)`, `ElementSize(quant)`, `RowBytes(bank)`,
 `BankBytes(bank)`, `ChunkRows(bank)`, `ChunkCount(bank)`, `IsExcluded(bits, index)`,
 `ScoringMetric(bank, params)` (the metric hits are actually ordered by).
 Constants: `kAlignment` (16), `kChunkBytes` (64 KiB), `kMaxSegments` / `kMaxChannels`
-(8), `kSchemaVersion` (version.h).
+(8), `kMaxCrossDeviceDims` (131072, v2.2), `kSchemaVersion` (version.h).
 
 ## validate.h — the gates
 
@@ -161,6 +178,16 @@ void  ScoreChunkSegmented(...);       // one query, segment list
 void  ScoreChunkFusedSegmented(...);  // intersection fusion, segment list
 float DecomposeRowScore(const BankView&, const float* paddedQuery, int32_t rowIndex,
                         const QuerySegment*, int32_t count, float* outContributions);
+
+// v2.2 cross-device kernel entries (integer accumulation + double epilogue):
+struct XdQuery { const int8_t* q8; double scale; int64_t sqSum; };
+void  QuantizeQueryXd(const float* paddedQuery, int32_t paddedDims,
+                      int8_t* outQ8, double* outScale, int64_t* outSqSum);
+void  ScoreChunkXd(...);              // whole-row CrossDevice chunk scorer
+void  ScoreChunkSegmentedXd(...);     // segment list, weights-at-combine in double
+void  ScoreChunkFusedXd(...);         // intersection fusion
+float DecomposeRowScoreXd(...);       // contributions floored; total == scan score
+float ScoreRowXd(const BankView&, const XdQuery&, int32_t rowIndex);
 ```
 
 Pattern: one `TopK` per chunk (storage from your own pool), `ScoreChunk` chunks in
