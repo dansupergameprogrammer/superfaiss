@@ -10,6 +10,14 @@ must hard-reject versions they do not know. Current version: **1**.
 Two files, deliberately primitive so any pipeline can emit them in a few lines
 (reference implementation: [`tools/wvbank.py`](../tools/wvbank.py)):
 
+**This sidecar pair is the encoder contract.** SuperFAISS ships no encoders and never
+will — anything that turns domain data (text, images, gameplay state) into vectors is
+an encoder, and any pipeline that emits this pair *is* one. `tools/wvbank.py` (GloVe
+text vectors) is the reference implementation of the contract, not a privileged path.
+Everything domain-specific lives on the producer's side of this boundary; the library
+and its engine integrations consume banks and query vectors, and never know or care
+where the vectors came from.
+
 ### `<name>.wvbank.json` — the header
 
 ```json
