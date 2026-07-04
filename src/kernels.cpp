@@ -778,4 +778,75 @@ void ScoreChunk(
 	}
 }
 
+void ScoreChunkFused(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	TopK& inout)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+
+	const int32_t pd = bank.paddedDims;
+	const bool isL2 = bank.metric == Metric::L2;
+
+	if (bank.quant == Quantization::Float32)
+	{
+		const float* rows = static_cast<const float*>(bank.rows);
+		for (int32_t r = begin; r < end; ++r)
+		{
+			if (IsExcluded(excludeBits, r))
+			{
+				continue;
+			}
+			const float* row = rows + static_cast<int64_t>(r) * pd;
+			float fused = 0.0f;
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				const float* q = paddedQueries + static_cast<int64_t>(m) * pd;
+				const float score = isL2 ? detail::L2F32(row, q, pd)
+				                         : detail::DotF32(row, q, pd);
+				// Worst-of in the better-direction: max distance / min similarity.
+				if (m == 0 || (isL2 ? score > fused : score < fused))
+				{
+					fused = score;
+				}
+			}
+			inout.Push(r, fused);
+		}
+	}
+	else
+	{
+		const int8_t* rows = static_cast<const int8_t*>(bank.rows);
+		for (int32_t r = begin; r < end; ++r)
+		{
+			if (IsExcluded(excludeBits, r))
+			{
+				continue;
+			}
+			const int8_t* row = rows + static_cast<int64_t>(r) * pd;
+			const float scale = bank.scales[r];
+			float fused = 0.0f;
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				const float* q = paddedQueries + static_cast<int64_t>(m) * pd;
+				const float score = isL2 ? detail::L2I8(row, scale, q, pd)
+				                         : detail::DotI8(row, scale, q, pd);
+				if (m == 0 || (isL2 ? score > fused : score < fused))
+				{
+					fused = score;
+				}
+			}
+			inout.Push(r, fused);
+		}
+	}
+}
+
 } // namespace superfaiss

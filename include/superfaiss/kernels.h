@@ -33,6 +33,20 @@ void ScoreChunkPair(
 	TopK& inoutA,
 	TopK& inoutB);
 
+// Scores every non-excluded row of one chunk against M queries and pushes the FUSED
+// score — the worst per-query score in the metric's better-direction (min for
+// Dot/Cosine, max for L2) — into `inout`. The intersection primitive (plan 18.7):
+// per-query scores come from the same per-row kernels as ScoreChunk, so fused scores
+// are bit-identical to the corresponding single-query scores; worst-of selection is
+// rounding-free. Queries are contiguous, stride bank.paddedDims.
+void ScoreChunkFused(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	TopK& inout);
+
 // Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
 // upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
 // per-device determinism promise is unaffected. Exposed for tests and diagnostics.

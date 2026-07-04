@@ -1208,6 +1208,225 @@ static void TestMargin()
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T18 — intersection combinator (plan 18.7): QueryIntersect equals a full-scan
+// double reference (per-row worst-of fusion, total-order sorted) across the
+// metric x quantization matrix; M=1 degenerates to Query bit-identically;
+// exclusion respected; externally-merged chunks bit-identical to the single pass.
+
+static void TestIntersect()
+{
+	Rng rng(0x1472E5EC7ull);
+	const int32_t dims = 20;
+	const int32_t count = 400;
+	const int32_t k = 10;
+	const int32_t m = 3;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, count, dims, quant, metric);
+			const int32_t pd = bank.view.paddedDims;
+
+			AlignedBuf queries(static_cast<size_t>(m) * pd * sizeof(float));
+			for (int32_t qi = 0; qi < m; ++qi)
+			{
+				std::vector<float> qv(static_cast<size_t>(dims));
+				for (auto& x : qv)
+				{
+					x = rng.NextFloat();
+				}
+				PadQuery(qv, pd, queries.F32() + static_cast<int64_t>(qi) * pd);
+			}
+
+			QueryParams params;
+			params.k = k;
+
+			Workspace ws;
+			std::vector<Hit> got(static_cast<size_t>(k));
+			int32_t gotCount = 0;
+			CHECK(QueryIntersect(bank.view, queries.F32(), m, params, ws, got.data(),
+				&gotCount) == Status::Ok);
+
+			// Double reference: per-row worst-of over per-query double scores.
+			std::vector<RefHit> ref;
+			for (int32_t r = 0; r < count; ++r)
+			{
+				const double* row = bank.refRows.data() + static_cast<size_t>(r) * dims;
+				double fused = 0.0;
+				for (int32_t qi = 0; qi < m; ++qi)
+				{
+					const float* q = queries.F32() + static_cast<int64_t>(qi) * pd;
+					double score = 0.0;
+					if (metric == Metric::L2)
+					{
+						for (int32_t i = 0; i < dims; ++i)
+						{
+							const double d = static_cast<double>(q[i]) - row[i];
+							score += d * d;
+						}
+					}
+					else
+					{
+						for (int32_t i = 0; i < dims; ++i)
+						{
+							score += static_cast<double>(q[i]) * row[i];
+						}
+					}
+					if (qi == 0 || (metric == Metric::L2 ? score > fused : score < fused))
+					{
+						fused = score;
+					}
+				}
+				ref.push_back({r, fused});
+			}
+			std::sort(ref.begin(), ref.end(), [&](const RefHit& a, const RefHit& b) {
+				return RefBetter(a, b, metric);
+			});
+			CheckTopK(bank, ref, got.data(), gotCount, k);
+
+			// AND guarantee spot-check: the top fused hit scores at-or-better than its
+			// fused score against EVERY member query (by construction of worst-of).
+			if (gotCount > 0)
+			{
+				const double fusedTop = ref[0].score;
+				const double* row =
+					bank.refRows.data() + static_cast<size_t>(ref[0].index) * dims;
+				for (int32_t qi = 0; qi < m; ++qi)
+				{
+					const float* q = queries.F32() + static_cast<int64_t>(qi) * pd;
+					double score = 0.0;
+					if (metric == Metric::L2)
+					{
+						for (int32_t i = 0; i < dims; ++i)
+						{
+							const double d = static_cast<double>(q[i]) - row[i];
+							score += d * d;
+						}
+					}
+					else
+					{
+						for (int32_t i = 0; i < dims; ++i)
+						{
+							score += static_cast<double>(q[i]) * row[i];
+						}
+					}
+					const bool holds = metric == Metric::L2 ? score <= fusedTop + 1e-9
+					                                        : score >= fusedTop - 1e-9;
+					CHECK_MSG(holds, "AND guarantee: q%d score %.9g fused %.9g",
+						qi, score, fusedTop);
+				}
+			}
+
+			// M=1 degeneracy: bit-identical to Query.
+			Workspace ws1;
+			std::vector<Hit> single(static_cast<size_t>(k));
+			int32_t singleCount = 0;
+			CHECK(Query(bank.view, queries.F32(), params, ws1, single.data(),
+				&singleCount) == Status::Ok);
+			Workspace ws2;
+			std::vector<Hit> degen(static_cast<size_t>(k));
+			int32_t degenCount = 0;
+			CHECK(QueryIntersect(bank.view, queries.F32(), 1, params, ws2, degen.data(),
+				&degenCount) == Status::Ok);
+			CHECK(degenCount == singleCount);
+			for (int32_t i = 0; i < degenCount && i < singleCount; ++i)
+			{
+				CHECK(degen[i].index == single[i].index && degen[i].score == single[i].score);
+			}
+
+			// Exclusion: excluded rows never appear in fused results.
+			std::vector<uint32_t> exclude(static_cast<size_t>((count + 31) / 32), 0u);
+			if (gotCount > 0)
+			{
+				const int32_t banned = got[0].index;
+				exclude[banned >> 5] |= 1u << (banned & 31);
+				QueryParams px = params;
+				px.excludeBits = exclude.data();
+				Workspace ws3;
+				std::vector<Hit> ex(static_cast<size_t>(k));
+				int32_t exCount = 0;
+				CHECK(QueryIntersect(bank.view, queries.F32(), m, px, ws3, ex.data(),
+					&exCount) == Status::Ok);
+				for (int32_t i = 0; i < exCount; ++i)
+				{
+					CHECK(ex[i].index != banned);
+				}
+			}
+
+			// External per-chunk fusion + merge is bit-identical to the single pass
+			// (the parallel path's shape; mirrors T12).
+			{
+				const int32_t chunks = ChunkCount(bank.view);
+				std::vector<Hit> heap(static_cast<size_t>(chunks) * k);
+				std::vector<Hit> sorted(static_cast<size_t>(chunks) * k);
+				std::vector<const Hit*> lists(static_cast<size_t>(chunks));
+				std::vector<int32_t> counts(static_cast<size_t>(chunks));
+				for (int32_t c = 0; c < chunks; ++c)
+				{
+					TopK chunkTop;
+					chunkTop.Init(heap.data() + static_cast<size_t>(c) * k, k, bank.view.metric);
+					ScoreChunkFused(bank.view, queries.F32(), m, c, nullptr, chunkTop);
+					lists[c] = sorted.data() + static_cast<size_t>(c) * k;
+					counts[c] = chunkTop.Finalize(sorted.data() + static_cast<size_t>(c) * k);
+				}
+				std::vector<Hit> mergeHeap(static_cast<size_t>(k));
+				std::vector<Hit> merged(static_cast<size_t>(k));
+				const int32_t mergedCount = MergeTopK(lists.data(), counts.data(), chunks,
+					bank.view.metric, k, mergeHeap.data(), merged.data());
+				CHECK(mergedCount == gotCount);
+				for (int32_t i = 0; i < mergedCount && i < gotCount; ++i)
+				{
+					CHECK(merged[i].index == got[i].index && merged[i].score == got[i].score);
+				}
+			}
+		}
+	}
+
+	// Override interplay: intersect on an L2 bank under ScoreAs::Dot equals intersect
+	// on the same payload viewed as a Dot bank.
+	{
+		TestBank bank(rng, 200, dims, Quantization::Float32, Metric::L2);
+		const int32_t pd = bank.view.paddedDims;
+		AlignedBuf queries(static_cast<size_t>(2) * pd * sizeof(float));
+		for (int32_t qi = 0; qi < 2; ++qi)
+		{
+			std::vector<float> qv(static_cast<size_t>(dims));
+			for (auto& x : qv)
+			{
+				x = rng.NextFloat();
+			}
+			PadQuery(qv, pd, queries.F32() + static_cast<int64_t>(qi) * pd);
+		}
+		QueryParams po;
+		po.k = k;
+		po.scoreAs = ScoreAs::Dot;
+		Workspace wsA;
+		std::vector<Hit> viaOverride(static_cast<size_t>(k));
+		int32_t nOverride = 0;
+		CHECK(QueryIntersect(bank.view, queries.F32(), 2, po, wsA, viaOverride.data(),
+			&nOverride) == Status::Ok);
+
+		BankView dotView = bank.view;
+		dotView.metric = Metric::Dot;
+		QueryParams plain;
+		plain.k = k;
+		Workspace wsB;
+		std::vector<Hit> viaDotView(static_cast<size_t>(k));
+		int32_t nDotView = 0;
+		CHECK(QueryIntersect(dotView, queries.F32(), 2, plain, wsB, viaDotView.data(),
+			&nDotView) == Status::Ok);
+		CHECK(nOverride == nDotView);
+		for (int32_t i = 0; i < nOverride && i < nDotView; ++i)
+		{
+			CHECK(viaOverride[i].index == viaDotView[i].index &&
+				viaOverride[i].score == viaDotView[i].score);
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -1227,6 +1446,7 @@ int main()
 	TestDirection();
 	TestScoreAsOverride();
 	TestMargin();
+	TestIntersect();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

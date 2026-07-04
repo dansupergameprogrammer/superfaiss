@@ -172,4 +172,56 @@ Status QueryBatch(
 	return Status::Ok;
 }
 
+Status QueryIntersect(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCount)
+{
+	if (outHits == nullptr || outCount == nullptr || params.k < 0 || queryCount <= 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outCount = 0;
+	if (params.k == 0 || bank.count == 0)
+	{
+		return Status::Ok;
+	}
+
+	// Bank-rule validation for every member query; the effective override-resolved
+	// view for scoring — the same split as Query/QueryBatch.
+	for (int32_t m = 0; m < queryCount; ++m)
+	{
+		const Status queryStatus =
+			ValidateQuery(bank, paddedQueries + static_cast<int64_t>(m) * bank.paddedDims);
+		if (queryStatus != Status::Ok)
+		{
+			return queryStatus;
+		}
+	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
+
+	if (!workspace.Reserve(params.k, 1))
+	{
+		return Status::OutOfMemory;
+	}
+
+	TopK topk;
+	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
+
+	const int32_t chunks = ChunkCount(scoring);
+	for (int32_t c = 0; c < chunks; ++c)
+	{
+		ScoreChunkFused(scoring, paddedQueries, queryCount, c, params.excludeBits, topk);
+	}
+
+	*outCount = topk.Finalize(outHits);
+	return Status::Ok;
+}
+
 } // namespace superfaiss

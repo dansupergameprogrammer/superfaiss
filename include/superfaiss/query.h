@@ -31,4 +31,19 @@ Status QueryBatch(
 	Hit* outHits,
 	int32_t* outCounts);
 
+// Intersection (set-op combinator, plan 18.7): exact top-k over the FUSED score —
+// each row's worst per-query score in the metric's better-direction — in one bank
+// pass. True AND semantics: every returned row scores at least the fused score
+// against every query. All queries score under one metric (the bank's, or the
+// params.scoreAs override); queryCount == 1 degenerates to Query() bit-identically.
+// Queries are contiguous, stride bank.paddedDims; outHits holds up to params.k hits.
+Status QueryIntersect(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCount);
+
 } // namespace superfaiss
