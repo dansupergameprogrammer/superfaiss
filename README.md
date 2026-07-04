@@ -37,6 +37,15 @@ thread, deterministically, on every platform your game ships on — that is what
   kernels at V1 speed; masking a range does not make the scan faster on this
   row-interleaved layout — measured, not assumed). A degenerate one-segment query is
   bit-identical to the whole-row scan.
+- **Per-row score bias (v2.1).** An optional caller-provided bias added to each row's
+  score IN-SCAN, before top-k selection — so the composed ranking is exact (a row
+  outside the similarity top-k that wins the composed score is unrecoverable after the
+  scan; post-weighting the returned top-k is approximate ranking). Two forms: a dense
+  count-length view (memory salience) and sparse `(index, bias)` pairs (motion
+  matching's continuing-pose reward — one biased row per query, effectively free:
+  measured +0.4% single / ~0% batch; the dense form measures +3.5% f32 / +1.9% int8).
+  Finite values only — `-inf` is not a mask; exclusion is a mask, bias is arithmetic.
+  Bias adds in the scored metric's own direction (a reward is negative on L2).
 - **Scratch banks (v2.0).** A fixed-capacity mutable bank for runtime-accumulated
   vectors (NPC memory, session embeddings): single writer, lock-free wait-free readers,
   atomic tombstone removal (deletion is exclusion), index-preserving `Grow`, `Freeze`

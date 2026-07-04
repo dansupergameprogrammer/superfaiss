@@ -38,8 +38,28 @@ struct QueryParams {
     ScoreAs scoreAs;               // Dot forces dot scoring (axis projection on L2 banks)
     const QuerySegment* segments;  // v2.0: null = whole row (the V1 path, bit-identical)
     int32_t segmentCount;          // <= kMaxSegments (8)
+    const RowBias* bias;           // v2.1: per-row score bias; null = none
+};
+
+struct BiasPair { int32_t index; float bias; };
+struct RowBias {                   // exactly ONE form; both empty = unbiased
+    const float* dense;            // count-length view; validated FUSED into the scan
+    const BiasPair* pairs;         // unique in-range indices, finite values,
+    int32_t pairCount;             //   O(pairCount) validation at query build
 };
 ```
+
+**Per-row bias (v2.1):** the composed score (similarity + bias) ranks in-scan —
+exact by construction. One fused add per biased row, after dequantized scoring;
+Query/QueryIntersect read one `RowBias` (intersection applies it once, to the fused
+score); QueryBatch reads queryCount entries, one per query. Bias adds in the scored
+metric's own direction (a reward is NEGATIVE on L2). Non-finite bias is illegal
+input (`NonFiniteQuery`) — exclusion is a mask, bias is arithmetic, orthogonal.
+Null/empty is the bit-identical unbiased path; all-zeros is compare-equal, not
+bitwise (IEEE `-0.0 + 0.0 == +0.0`). Costs (measured, reference workload): dense
++3.5% f32 / +1.9% int8, sparse +0.4% single and ~0% batch — sparse is the batch
+form; a dense per-query view in batch streams M x count x 4 bias bytes beside the
+bank, stated not hidden.
 
 **Segmented queries (v2.0):** a segment is a contiguous element range with a scalar
 weight; scores combine additively (`total = sum(weight_s * partial_s)`). A mask is a

@@ -51,6 +51,7 @@ machine, same bank ⇒ same path, every time.
 | Same results across thread counts / schedulers | Yes |
 | Segmented queries (v2.0): same segments + weights => bit-identical; degenerate one-segment list == whole-row scan | Yes (segments process in ascending offset order, always; the segment list is part of the query, not a source of nondeterminism) |
 | Decomposition (v2.0): contributions sum bit-exactly to the scan's own score | Yes (the partials ARE the scan's accumulators; no second code path exists to drift) |
+| Per-row bias (v2.1): same bias => bit-identical composed ranking; null bias == unbiased bitwise | Yes (one fused add in fixed row order; the bias is part of the query). All-zeros bias is compare-equal, NOT bitwise: IEEE -0.0 + 0.0 == +0.0 |
 | Same results across devices with the same active SIMD path | Yes in practice for int8 (integer→float conversion + pinned float ops are IEEE-determined), but **not contractually claimed** |
 | Same results across different SIMD paths (e.g. AVX2 desktop vs NEON phone) | **No.** Different accumulation widths round differently. Per-device determinism only. |
 
