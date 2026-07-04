@@ -59,6 +59,12 @@ public:
 	bool ReserveQueryScratch(int32_t paddedDims, int32_t count);
 	float* QueryScratch(int32_t queryIndex);
 
+	// Zeroed uint32 bit-scratch over `count` rows (v2.1 sparse bias: pair-uniqueness
+	// validation + pair-row marking). Zeroing is O(count/8) bytes per call - noise
+	// against the scan itself. Same growth accounting as Reserve().
+	bool ReserveBiasBits(int32_t count);
+	uint32_t* BiasBits();
+
 	// Number of times Reserve() actually grew the buffer. Flat across warm queries.
 	uint64_t GrowthCount() const { return GrowthCount_; }
 
@@ -70,6 +76,8 @@ private:
 	float* QueryScratch_ = nullptr;
 	int32_t ScratchDims_ = 0;
 	int32_t ScratchCount_ = 0;
+	uint32_t* BiasBits_ = nullptr;
+	int32_t BiasBitWords_ = 0;
 	uint64_t GrowthCount_ = 0;
 };
 

@@ -353,6 +353,162 @@ namespace
 	};
 }
 
+namespace
+{
+	// V2.1 calibration (plan section 18.3): dense and sparse bias vs the unbiased
+	// scan, single and batch. Quiet-machine medians, same harness discipline as
+	// SegBench.
+	struct BiasBench
+	{
+		Allocator alloc = DefaultAllocator();
+
+		static double Median(std::vector<double>& v)
+		{
+			std::sort(v.begin(), v.end());
+			return v[v.size() / 2];
+		}
+
+		double MedianQuery(const BankView& view, const float* q, const QueryParams& p,
+			Workspace& ws, Hit* hits)
+		{
+			int32_t n = 0;
+			std::vector<double> samples;
+			Query(view, q, p, ws, hits, &n); // warm
+			for (int32_t rep = 0; rep < 9; ++rep)
+			{
+				const double t0 = Now();
+				for (int32_t r = 0; r < 3; ++r)
+				{
+					Query(view, q, p, ws, hits, &n);
+				}
+				samples.push_back((Now() - t0) / 3);
+			}
+			return Median(samples);
+		}
+
+		void Run(int32_t count, int32_t dims, Quantization quant)
+		{
+			Rng rng;
+			std::vector<float> src(static_cast<size_t>(count) * dims);
+			for (auto& v : src)
+			{
+				v = rng.NextFloat();
+			}
+			const int32_t pd = PaddedDims(dims, quant);
+			const int64_t payloadBytes =
+				static_cast<int64_t>(count) * pd * ElementSize(quant);
+			void* payload =
+				alloc.alloc(static_cast<size_t>(payloadBytes), kAlignment, alloc.user);
+			std::vector<float> scales(static_cast<size_t>(count));
+			BankView view;
+			view.rows = payload;
+			view.count = count;
+			view.dims = dims;
+			view.paddedDims = pd;
+			view.quant = quant;
+			view.metric = Metric::Dot;
+			if (quant == Quantization::Float32)
+			{
+				PadRowsFloat32(src.data(), count, dims, pd, static_cast<float*>(payload));
+			}
+			else
+			{
+				QuantizeRowsInt8(src.data(), count, dims, pd,
+					static_cast<int8_t*>(payload), scales.data());
+				view.scales = scales.data();
+			}
+
+			void* qmem = alloc.alloc(static_cast<size_t>(pd) * sizeof(float),
+				kAlignment, alloc.user);
+			float* q = static_cast<float*>(qmem);
+			for (int32_t j = 0; j < pd; ++j)
+			{
+				q[j] = j < dims ? rng.NextFloat() : 0.0f;
+			}
+
+			std::vector<float> dense(static_cast<size_t>(count));
+			for (auto& b : dense)
+			{
+				b = rng.NextFloat() * 0.25f;
+			}
+			BiasPair pair[1] = {{count / 2, 10.0f}};
+
+			Workspace ws;
+			std::vector<Hit> hits(16);
+			QueryParams p;
+			p.k = 10;
+			const double v1 = MedianQuery(view, q, p, ws, hits.data());
+			RowBias rbDense;
+			rbDense.dense = dense.data();
+			p.bias = &rbDense;
+			const double dbias = MedianQuery(view, q, p, ws, hits.data());
+			RowBias rbSparse;
+			rbSparse.pairs = pair;
+			rbSparse.pairCount = 1;
+			p.bias = &rbSparse;
+			const double sbias = MedianQuery(view, q, p, ws, hits.data());
+
+			// Batch: 64 queries, per-query bias (dense-shared / one sparse pair each).
+			const int32_t batch = 64;
+			void* qsmem = alloc.alloc(static_cast<size_t>(batch) * pd * sizeof(float),
+				kAlignment, alloc.user);
+			float* qs = static_cast<float*>(qsmem);
+			for (int32_t m = 0; m < batch; ++m)
+			{
+				for (int32_t j = 0; j < pd; ++j)
+				{
+					qs[static_cast<int64_t>(m) * pd + j] = j < dims ? rng.NextFloat() : 0.0f;
+				}
+			}
+			std::vector<Hit> bh(static_cast<size_t>(batch) * 10);
+			std::vector<int32_t> counts(batch);
+			QueryParams bp;
+			bp.k = 10;
+			auto medianBatch = [&](const QueryParams& qp) {
+				std::vector<double> samples;
+				QueryBatch(view, qs, batch, qp, ws, bh.data(), counts.data());
+				for (int32_t rep = 0; rep < 7; ++rep)
+				{
+					const double t0 = Now();
+					QueryBatch(view, qs, batch, qp, ws, bh.data(), counts.data());
+					samples.push_back(Now() - t0);
+				}
+				return Median(samples);
+			};
+			const double vb = medianBatch(bp);
+			std::vector<RowBias> denseForms(batch);
+			for (auto& f : denseForms)
+			{
+				f.dense = dense.data();
+			}
+			bp.bias = denseForms.data();
+			const double db = medianBatch(bp);
+			std::vector<BiasPair> pairsPerQ(batch);
+			std::vector<RowBias> sparseForms(batch);
+			for (int32_t m = 0; m < batch; ++m)
+			{
+				pairsPerQ[m] = {m * (count / batch), 10.0f};
+				sparseForms[m].pairs = &pairsPerQ[m];
+				sparseForms[m].pairCount = 1;
+			}
+			bp.bias = sparseForms.data();
+			const double sb = medianBatch(bp);
+
+			std::printf(
+				"BiasBench %6d x %3d %-7s | v1 %7.3f ms | dense %7.3f (%+5.1f%%) | sparse %7.3f (%+5.1f%%) | batch v1 %8.3f dense %8.3f (%+5.1f%%) sparse %8.3f (%+5.1f%%)\n",
+				count, dims, quant == Quantization::Float32 ? "float32" : "int8",
+				v1 * 1e3, dbias * 1e3, (dbias / v1 - 1.0) * 100.0,
+				sbias * 1e3, (sbias / v1 - 1.0) * 100.0,
+				vb * 1e3, db * 1e3, (db / vb - 1.0) * 100.0,
+				sb * 1e3, (sb / vb - 1.0) * 100.0);
+
+			alloc.free(qsmem, alloc.user);
+			alloc.free(qmem, alloc.user);
+			alloc.free(payload, alloc.user);
+		}
+	};
+}
+
 int main()
 {
 	std::printf("superfaiss bench (single thread, simd path: %s)\n",
@@ -374,5 +530,10 @@ int main()
 	segBench.Run(100000, 256, Quantization::Float32);
 	segBench.Run(100000, 256, Quantization::Int8);
 	segBench.BreakEven(100000, 256);
+
+	// V2.1 calibration (per-row bias; plan section 18.3 predictions).
+	BiasBench biasBench;
+	biasBench.Run(100000, 256, Quantization::Float32);
+	biasBench.Run(100000, 256, Quantization::Int8);
 	return 0;
 }

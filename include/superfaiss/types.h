@@ -108,6 +108,35 @@ struct QuerySegment
 // result-buffer sizing, keeps per-row loop overhead predictable. Raising is additive.
 inline constexpr int32_t kMaxSegments = 8;
 
+// One sparse bias entry (v2.1): a row index and the bias added to that row's score.
+struct BiasPair
+{
+	int32_t index = 0;
+	float bias = 0.0f;
+};
+
+// Per-query row bias (v2.1, plan section 18): an optional caller-provided score bias
+// applied in-scan, after dequantized scoring, before top-k selection - the composed
+// score ranks exactly or the top-k is not the true top-k. Exactly one form per query:
+//   dense - count-length float view (the memory-salience shape); validated FUSED into
+//           the scan (a non-finite value anywhere returns NonFiniteQuery at completion;
+//           a pre-pass would re-read count x 4 bytes for nothing).
+//   pairs - (index, bias) entries (the motion-matching shape: one biased row per
+//           query); O(pairCount) validation at query build - indices unique and in
+//           range, values finite.
+// Both forms set is InvalidArgument. Both empty (all null/0) is the unbiased path -
+// no add executed, bit-identical to no bias at all. All-zeros bias is compare-equal,
+// ranking-identical, NOT claimed bitwise (IEEE -0.0 + 0.0 == +0.0). Bias adds in the
+// scored metric's own direction: a reward is positive on Dot/Cosine, NEGATIVE on L2
+// (lower is better). Non-finite bias is illegal input - exclusion is a mask, bias is
+// arithmetic, orthogonal; -inf is not a mask.
+struct RowBias
+{
+	const float* dense = nullptr; // bank.count floats
+	const BiasPair* pairs = nullptr;
+	int32_t pairCount = 0;
+};
+
 struct QueryParams
 {
 	int32_t k = 0;
@@ -120,6 +149,12 @@ struct QueryParams
 	// bit-identical to the V1 path by construction.
 	const QuerySegment* segments = nullptr;
 	int32_t segmentCount = 0;
+	// Optional per-row bias (v2.1): Query/QueryIntersect read ONE RowBias (for
+	// QueryIntersect it applies once, to the fused score, in the fused metric's
+	// direction); QueryBatch reads queryCount entries, one per query (a shared view
+	// is the degenerate case - point every entry's dense at the same array). Null
+	// means no bias anywhere.
+	const RowBias* bias = nullptr;
 };
 
 // The metric a query with these params is actually scored (and its hits ordered) by.

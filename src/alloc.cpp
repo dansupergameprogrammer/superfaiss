@@ -66,6 +66,7 @@ Workspace::~Workspace()
 {
 	detail::SeamFree(Allocator_, Storage_);
 	detail::SeamFree(Allocator_, QueryScratch_);
+	detail::SeamFree(Allocator_, BiasBits_);
 }
 
 bool Workspace::ReserveQueryScratch(int32_t paddedDims, int32_t count)
@@ -92,6 +93,38 @@ bool Workspace::ReserveQueryScratch(int32_t paddedDims, int32_t count)
 	ScratchCount_ = newCount;
 	++GrowthCount_;
 	return true;
+}
+
+bool Workspace::ReserveBiasBits(int32_t count)
+{
+	if (count < 0)
+	{
+		return false;
+	}
+	const int32_t words = (count + 31) / 32;
+	if (words > BiasBitWords_)
+	{
+		uint32_t* grown = static_cast<uint32_t*>(
+			detail::SeamAlloc(Allocator_, static_cast<size_t>(words) * sizeof(uint32_t), 16));
+		if (grown == nullptr)
+		{
+			return false;
+		}
+		detail::SeamFree(Allocator_, BiasBits_);
+		BiasBits_ = grown;
+		BiasBitWords_ = words;
+		++GrowthCount_;
+	}
+	for (int32_t w = 0; w < words; ++w)
+	{
+		BiasBits_[w] = 0u;
+	}
+	return true;
+}
+
+uint32_t* Workspace::BiasBits()
+{
+	return BiasBits_;
 }
 
 float* Workspace::QueryScratch(int32_t queryIndex)

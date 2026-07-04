@@ -35,6 +35,135 @@ namespace
 			}
 		}
 	}
+
+	// --- v2.1 per-row bias (plan section 18) ---
+
+	// One query's bias, form-resolved. Exactly one form; empty = unbiased.
+	struct FBiasForm
+	{
+		const float* dense = nullptr;
+		const BiasPair* pairs = nullptr;
+		int32_t pairCount = 0;
+	};
+
+	// Form law: dense XOR pairs (both set is ambiguous composition); a pair count
+	// without a pair pointer is malformed. Range/uniqueness/finiteness of sparse
+	// entries is ValidateBiasPairs (needs scratch bits; runs at the call sites).
+	Status ResolveBiasForm(const RowBias* bias, FBiasForm& out)
+	{
+		out = FBiasForm{};
+		if (bias == nullptr)
+		{
+			return Status::Ok;
+		}
+		const bool hasDense = bias->dense != nullptr;
+		const bool hasPairs = bias->pairs != nullptr || bias->pairCount != 0;
+		if ((hasDense && hasPairs) || bias->pairCount < 0 ||
+			(bias->pairCount > 0 && bias->pairs == nullptr))
+		{
+			return Status::InvalidArgument;
+		}
+		out.dense = bias->dense;
+		out.pairs = bias->pairs;
+		out.pairCount = bias->pairs != nullptr ? bias->pairCount : 0;
+		return Status::Ok;
+	}
+
+	// Scores one row exactly as the surrounding scan scored it - the same kernel
+	// entry points on the same effective query - so a sparse-bias pair row outside
+	// the candidate set composes against a bit-identical similarity term.
+	float RescoreRow(
+		const BankView& scoring,
+		const float* effectiveQuery,
+		const float* originalQuery,
+		const QueryParams& params,
+		bool bFoldable,
+		int32_t r)
+	{
+		if (params.segments != nullptr && !bFoldable)
+		{
+			float contributions[kMaxSegments];
+			return DecomposeRowScore(scoring, originalQuery, r, params.segments,
+				params.segmentCount, contributions);
+		}
+		const int32_t pd = scoring.paddedDims;
+		const bool isL2 = scoring.metric == Metric::L2;
+		if (scoring.quant == Quantization::Float32)
+		{
+			const float* row =
+				static_cast<const float*>(scoring.rows) + static_cast<int64_t>(r) * pd;
+			return isL2 ? detail::L2F32(row, effectiveQuery, pd)
+			            : detail::DotF32(row, effectiveQuery, pd);
+		}
+		const int8_t* row =
+			static_cast<const int8_t*>(scoring.rows) + static_cast<int64_t>(r) * pd;
+		const float scale = scoring.scales[r];
+		return isL2 ? detail::L2I8(row, scale, effectiveQuery, pd)
+		            : detail::DotI8(row, scale, effectiveQuery, pd);
+	}
+
+	// Sparse-bias selection (the k+P construction): the scan ran UNBIASED at
+	// capacity k+P, so its candidate list is guaranteed to contain the true
+	// composed top-k's non-pair rows (at most P slots are pair rows), and every
+	// pair row is evaluated explicitly - rewards can lift a rank-anything row in,
+	// penalties can evict, and the result is exact either way. Candidates that are
+	// pair rows are skipped here (their composed entry comes from the pair pass);
+	// caller-excluded pair rows stay excluded - exclusion is a mask, bias is
+	// arithmetic, orthogonal, and the mask wins.
+	int32_t SelectWithSparseBias(
+		const BankView& scoring,
+		const Hit* candidates,
+		int32_t candidateCount,
+		const FBiasForm& bias,
+		const uint32_t* pairBits,
+		const float* effectiveQuery,
+		const float* originalQuery,
+		const QueryParams& params,
+		bool bFoldable,
+		Hit* selectionStorage,
+		Hit* outHits)
+	{
+		TopK selection;
+		selection.Init(selectionStorage, params.k, scoring.metric);
+		for (int32_t i = 0; i < candidateCount; ++i)
+		{
+			if (!IsExcluded(pairBits, candidates[i].index))
+			{
+				selection.Push(candidates[i].index, candidates[i].score);
+			}
+		}
+		for (int32_t p = 0; p < bias.pairCount; ++p)
+		{
+			const int32_t row = bias.pairs[p].index;
+			if (IsExcluded(params.excludeBits, row))
+			{
+				continue;
+			}
+			// The candidate list already carries the row's unbiased score if the
+			// row ranked; reuse it (bit-identical by the one-path argument), else
+			// rescore through the same kernels. Linear probe: P is small at every
+			// named scale (motion matching: one pair) - a caller with huge P wants
+			// the dense form.
+			float s = 0.0f;
+			bool found = false;
+			for (int32_t i = 0; i < candidateCount; ++i)
+			{
+				if (candidates[i].index == row)
+				{
+					s = candidates[i].score;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				s = RescoreRow(scoring, effectiveQuery, originalQuery, params,
+					bFoldable, row);
+			}
+			selection.Push(row, s + bias.pairs[p].bias);
+		}
+		return selection.Finalize(outHits);
+	}
 }
 
 Status Query(
@@ -74,10 +203,34 @@ Status Query(
 		}
 	}
 
+	FBiasForm bias;
+	const Status biasStatus = ResolveBiasForm(params.bias, bias);
+	if (biasStatus != Status::Ok)
+	{
+		return biasStatus;
+	}
+	if (bias.pairCount > 0)
+	{
+		if (static_cast<int64_t>(params.k) + bias.pairCount > INT32_MAX ||
+			!workspace.ReserveBiasBits(bank.count))
+		{
+			return Status::OutOfMemory;
+		}
+		const Status pairStatus =
+			ValidateBiasPairs(bank, bias.pairs, bias.pairCount, workspace.BiasBits());
+		if (pairStatus != Status::Ok)
+		{
+			return pairStatus;
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
-	if (!workspace.Reserve(params.k, 1))
+	// Sparse bias scans at capacity k+P (see SelectWithSparseBias); three slots:
+	// scan heap, finalized candidates, final-selection heap.
+	const int32_t scanK = params.k + bias.pairCount;
+	if (!workspace.Reserve(scanK, bias.pairCount > 0 ? 3 : 1))
 	{
 		return Status::OutOfMemory;
 	}
@@ -102,20 +255,35 @@ Status Query(
 	}
 
 	TopK topk;
-	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
+	topk.Init(workspace.HeapStorage(0), scanK, scoring.metric);
 
+	bool nonFiniteBias = false;
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
 		if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkSegmented(scoring, paddedQuery, c, params.excludeBits,
-				params.segments, params.segmentCount, topk);
+				params.segments, params.segmentCount, topk, bias.dense, &nonFiniteBias);
 		}
 		else
 		{
-			ScoreChunk(scoring, effectiveQuery, c, params.excludeBits, topk);
+			ScoreChunk(scoring, effectiveQuery, c, params.excludeBits, topk,
+				bias.dense, &nonFiniteBias);
 		}
+	}
+	if (nonFiniteBias)
+	{
+		return Status::NonFiniteQuery; // the finite-only bias law (fused check)
+	}
+
+	if (bias.pairCount > 0)
+	{
+		const int32_t candidateCount = topk.Finalize(workspace.HeapStorage(1));
+		*outCount = SelectWithSparseBias(scoring, workspace.HeapStorage(1),
+			candidateCount, bias, workspace.BiasBits(), effectiveQuery, paddedQuery,
+			params, bFoldable, workspace.HeapStorage(2), outHits);
+		return Status::Ok;
 	}
 
 	*outCount = topk.Finalize(outHits);
@@ -129,19 +297,28 @@ static constexpr int32_t kSubBatchWidth = 64;
 
 namespace
 {
+	// One sub-batch over the chunk-outer loop. `biases` (nullable, width entries,
+	// form-resolved) rides the pair kernels: dense views pass straight into
+	// ScoreChunkPair/ScoreChunk (per-query bias params - the row pass stays shared),
+	// sparse queries scan unbiased at capacity k + P_m into workspace-side storage
+	// and compose afterwards in QueryBatch. The bank still streams once (W1).
 	void QuerySubBatch(
 		const BankView& bank,
 		const float* paddedQueries,
 		int32_t queryCount,
 		const QueryParams& params,
+		const FBiasForm* biases,
 		Workspace& workspace,
 		Hit* outHits,
-		int32_t* outCounts)
+		int32_t* outCounts,
+		bool* outNonFiniteBias,
+		int32_t* outCandidateCounts)
 	{
 		TopK topks[kSubBatchWidth];
 		for (int32_t m = 0; m < queryCount; ++m)
 		{
-			topks[m].Init(workspace.HeapStorage(m), params.k, bank.metric);
+			const int32_t pairs = biases != nullptr ? biases[m].pairCount : 0;
+			topks[m].Init(workspace.HeapStorage(m), params.k + pairs, bank.metric);
 		}
 		// Callers pass the effective (already override-resolved) view; see QueryBatch.
 
@@ -160,7 +337,10 @@ namespace
 					c,
 					params.excludeBits,
 					topks[m],
-					topks[m + 1]);
+					topks[m + 1],
+					biases != nullptr ? biases[m].dense : nullptr,
+					biases != nullptr ? biases[m + 1].dense : nullptr,
+					outNonFiniteBias);
 			}
 			if (m < queryCount)
 			{
@@ -169,13 +349,26 @@ namespace
 					paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
 					c,
 					params.excludeBits,
-					topks[m]);
+					topks[m],
+					biases != nullptr ? biases[m].dense : nullptr,
+					outNonFiniteBias);
 			}
 		}
 
 		for (int32_t m = 0; m < queryCount; ++m)
 		{
-			outCounts[m] = topks[m].Finalize(outHits + static_cast<int64_t>(m) * params.k);
+			const bool bSparse = biases != nullptr && biases[m].pairCount > 0;
+			if (bSparse)
+			{
+				// Finalize into the second storage bank; QueryBatch composes.
+				outCandidateCounts[m] =
+					topks[m].Finalize(workspace.HeapStorage(queryCount + m));
+				outCounts[m] = 0;
+			}
+			else
+			{
+				outCounts[m] = topks[m].Finalize(outHits + static_cast<int64_t>(m) * params.k);
+			}
 		}
 	}
 }
@@ -228,19 +421,56 @@ Status QueryBatch(
 		}
 	}
 
+	// Bias forms per query (v2.1): params.bias carries queryCount entries. Sparse
+	// entries pre-validate here - before any scan work - reusing one bits buffer
+	// serially; the bits are rebuilt per query at composition time.
+	FBiasForm biasStack[kSubBatchWidth];
+	FBiasForm* biasForms = nullptr; // per sub-batch slice, resolved below
+	int32_t maxPairs = 0;
+	if (params.bias != nullptr)
+	{
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			FBiasForm form;
+			const Status biasStatus = ResolveBiasForm(&params.bias[m], form);
+			if (biasStatus != Status::Ok)
+			{
+				return biasStatus;
+			}
+			if (form.pairCount > 0)
+			{
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				const Status pairStatus = ValidateBiasPairs(bank, form.pairs,
+					form.pairCount, workspace.BiasBits());
+				if (pairStatus != Status::Ok)
+				{
+					return pairStatus;
+				}
+				maxPairs = form.pairCount > maxPairs ? form.pairCount : maxPairs;
+			}
+		}
+		if (static_cast<int64_t>(params.k) + maxPairs > INT32_MAX)
+		{
+			return Status::OutOfMemory;
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
-	// Segmented batches keep the chunk-outermost structure — the bank streams once
-	// per batch — with the single-query segmented kernel scoring each query inside
-	// the chunk (plan 18.7/W1 composition; pair-blocked variants stay V1-shaped).
 	const bool bBatchPerChannelCosine = bank.metric == Metric::Cosine &&
 		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
-	if (params.segments != nullptr && scoring.metric != Metric::L2 &&
-		!bBatchPerChannelCosine)
+	const bool bFoldable = params.segments != nullptr &&
+		scoring.metric != Metric::L2 && !bBatchPerChannelCosine;
+
+	// Dot-family segmented batch: fold each query once, then the batch IS the
+	// plain V1 batch (pair kernels included) over the folded queries.
+	const float* effectiveQueries = paddedQueries;
+	if (bFoldable)
 	{
-		// Dot-family segmented batch: fold each query once, then the batch IS the
-		// plain V1 batch (pair kernels included) over the folded queries.
 		if (!workspace.ReserveQueryScratch(bank.paddedDims, queryCount))
 		{
 			return Status::OutOfMemory;
@@ -252,43 +482,46 @@ Status QueryBatch(
 				bank.paddedDims, params.segments, params.segmentCount,
 				workspace.QueryScratch(m));
 		}
-		const float* folded = workspace.QueryScratch(0);
-		const int32_t maxW = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
-		if (!workspace.Reserve(params.k, maxW))
-		{
-			return Status::OutOfMemory;
-		}
-		for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
-		{
-			const int32_t width =
-				(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
-			QuerySubBatch(
-				scoring,
-				folded + static_cast<int64_t>(base) * bank.paddedDims,
-				width,
-				params,
-				workspace,
-				outHits + static_cast<int64_t>(base) * params.k,
-				outCounts + base);
-		}
-		return Status::Ok;
+		effectiveQueries = workspace.QueryScratch(0);
 	}
 
-	if (params.segments != nullptr)
+	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
+	// Sparse-bias queries finalize into a second storage bank (slots width..2*width)
+	// before composition; every slot is sized for the widest k+P.
+	if (!workspace.Reserve(params.k + maxPairs, maxPairs > 0 ? 2 * maxWidth + 1 : maxWidth))
 	{
-		const int32_t segWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
-		if (!workspace.Reserve(params.k, segWidth))
+		return Status::OutOfMemory;
+	}
+
+	const bool bNonFoldSegmented = params.segments != nullptr && !bFoldable;
+	bool nonFiniteBias = false;
+	int32_t candidateCounts[kSubBatchWidth];
+
+	for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+	{
+		const int32_t width =
+			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+		if (params.bias != nullptr)
 		{
-			return Status::OutOfMemory;
+			for (int32_t m = 0; m < width; ++m)
+			{
+				FBiasForm form;
+				(void)ResolveBiasForm(&params.bias[base + m], form); // validated above
+				biasStack[m] = form;
+			}
+			biasForms = biasStack;
 		}
-		for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+
+		if (bNonFoldSegmented)
 		{
-			const int32_t width =
-				(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+			// Segmented batches keep the chunk-outermost structure — the bank
+			// streams once per batch — with the single-query segmented kernel
+			// scoring each query inside the chunk (plan 18.7/W1 composition).
 			TopK topks[kSubBatchWidth];
 			for (int32_t m = 0; m < width; ++m)
 			{
-				topks[m].Init(workspace.HeapStorage(m), params.k, scoring.metric);
+				const int32_t pairs = biasForms != nullptr ? biasForms[m].pairCount : 0;
+				topks[m].Init(workspace.HeapStorage(m), params.k + pairs, scoring.metric);
 			}
 			const int32_t chunks = ChunkCount(scoring);
 			for (int32_t c = 0; c < chunks; ++c)
@@ -298,36 +531,76 @@ Status QueryBatch(
 					ScoreChunkSegmented(scoring,
 						paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims,
 						c, params.excludeBits, params.segments, params.segmentCount,
-						topks[m]);
+						topks[m],
+						biasForms != nullptr ? biasForms[m].dense : nullptr,
+						&nonFiniteBias);
 				}
 			}
 			for (int32_t m = 0; m < width; ++m)
 			{
-				outCounts[base + m] = topks[m].Finalize(
+				const bool bSparse = biasForms != nullptr && biasForms[m].pairCount > 0;
+				if (bSparse)
+				{
+					candidateCounts[m] =
+						topks[m].Finalize(workspace.HeapStorage(width + m));
+				}
+				else
+				{
+					outCounts[base + m] = topks[m].Finalize(
+						outHits + static_cast<int64_t>(base + m) * params.k);
+				}
+			}
+		}
+		else
+		{
+			QuerySubBatch(
+				scoring,
+				effectiveQueries + static_cast<int64_t>(base) * bank.paddedDims,
+				width,
+				params,
+				biasForms,
+				workspace,
+				outHits + static_cast<int64_t>(base) * params.k,
+				outCounts + base,
+				&nonFiniteBias,
+				candidateCounts);
+		}
+		if (nonFiniteBias)
+		{
+			return Status::NonFiniteQuery;
+		}
+
+		// Sparse composition per query (bits rebuilt per query; the pairs were
+		// validated before any scanning).
+		if (biasForms != nullptr)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				if (biasForms[m].pairCount == 0)
+				{
+					continue;
+				}
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				uint32_t* bits = workspace.BiasBits();
+				for (int32_t p = 0; p < biasForms[m].pairCount; ++p)
+				{
+					const int32_t row = biasForms[m].pairs[p].index;
+					bits[row >> 5] |= 1u << (row & 31);
+				}
+				const float* effective =
+					effectiveQueries + static_cast<int64_t>(base + m) * bank.paddedDims;
+				const float* original =
+					paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims;
+				outCounts[base + m] = SelectWithSparseBias(scoring,
+					workspace.HeapStorage(width + m), candidateCounts[m], biasForms[m],
+					bits, effective, original, params, bFoldable,
+					workspace.HeapStorage(2 * maxWidth), // shared selection slot
 					outHits + static_cast<int64_t>(base + m) * params.k);
 			}
 		}
-		return Status::Ok;
-	}
-
-	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
-	if (!workspace.Reserve(params.k, maxWidth))
-	{
-		return Status::OutOfMemory;
-	}
-
-	for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
-	{
-		const int32_t width =
-			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
-		QuerySubBatch(
-			scoring,
-			paddedQueries + static_cast<int64_t>(base) * bank.paddedDims,
-			width,
-			params,
-			workspace,
-			outHits + static_cast<int64_t>(base) * params.k,
-			outCounts + base);
 	}
 	return Status::Ok;
 }
@@ -377,16 +650,40 @@ Status QueryIntersect(
 		}
 	}
 
+	// Intersection bias (v2.1): ONE RowBias, applied once to the fused score in the
+	// fused metric's direction.
+	FBiasForm bias;
+	const Status biasStatus = ResolveBiasForm(params.bias, bias);
+	if (biasStatus != Status::Ok)
+	{
+		return biasStatus;
+	}
+	if (bias.pairCount > 0)
+	{
+		if (static_cast<int64_t>(params.k) + bias.pairCount > INT32_MAX ||
+			!workspace.ReserveBiasBits(bank.count))
+		{
+			return Status::OutOfMemory;
+		}
+		const Status pairStatus =
+			ValidateBiasPairs(bank, bias.pairs, bias.pairCount, workspace.BiasBits());
+		if (pairStatus != Status::Ok)
+		{
+			return pairStatus;
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
-	if (!workspace.Reserve(params.k, 1))
+	const int32_t scanK = params.k + bias.pairCount;
+	if (!workspace.Reserve(scanK, bias.pairCount > 0 ? 3 : 1))
 	{
 		return Status::OutOfMemory;
 	}
 
 	TopK topk;
-	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
+	topk.Init(workspace.HeapStorage(0), scanK, scoring.metric);
 
 	const bool bIntersectPerChannelCosine = bank.metric == Metric::Cosine &&
 		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
@@ -409,19 +706,81 @@ Status QueryIntersect(
 		effectiveQueries = workspace.QueryScratch(0);
 	}
 
+	bool nonFiniteBias = false;
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
 		if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkFusedSegmented(scoring, paddedQueries, queryCount, c,
-				params.excludeBits, params.segments, params.segmentCount, topk);
+				params.excludeBits, params.segments, params.segmentCount, topk,
+				bias.dense, &nonFiniteBias);
 		}
 		else
 		{
 			ScoreChunkFused(scoring, effectiveQueries, queryCount, c,
-				params.excludeBits, topk);
+				params.excludeBits, topk, bias.dense, &nonFiniteBias);
 		}
+	}
+	if (nonFiniteBias)
+	{
+		return Status::NonFiniteQuery;
+	}
+
+	if (bias.pairCount > 0)
+	{
+		const int32_t candidateCount = topk.Finalize(workspace.HeapStorage(1));
+
+		// Fused rescore for pair rows outside the candidate set: worst-of over the
+		// member queries' per-row scores, the same selection the fused kernels run.
+		TopK selection;
+		selection.Init(workspace.HeapStorage(2), params.k, scoring.metric);
+		const Hit* candidates = workspace.HeapStorage(1);
+		const uint32_t* pairBits = workspace.BiasBits();
+		const bool isL2 = scoring.metric == Metric::L2;
+		for (int32_t i = 0; i < candidateCount; ++i)
+		{
+			if (!IsExcluded(pairBits, candidates[i].index))
+			{
+				selection.Push(candidates[i].index, candidates[i].score);
+			}
+		}
+		for (int32_t p = 0; p < bias.pairCount; ++p)
+		{
+			const int32_t row = bias.pairs[p].index;
+			if (IsExcluded(params.excludeBits, row))
+			{
+				continue;
+			}
+			float fused = 0.0f;
+			bool found = false;
+			for (int32_t i = 0; i < candidateCount; ++i)
+			{
+				if (candidates[i].index == row)
+				{
+					fused = candidates[i].score;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				for (int32_t m = 0; m < queryCount; ++m)
+				{
+					const float score = RescoreRow(scoring,
+						effectiveQueries + static_cast<int64_t>(m) * bank.paddedDims,
+						paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+						params, bFoldable, row);
+					if (m == 0 || (isL2 ? score > fused : score < fused))
+					{
+						fused = score;
+					}
+				}
+			}
+			selection.Push(row, fused + bias.pairs[p].bias);
+		}
+		*outCount = selection.Finalize(outHits);
+		return Status::Ok;
 	}
 
 	*outCount = topk.Finalize(outHits);

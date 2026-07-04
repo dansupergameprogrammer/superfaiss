@@ -13,12 +13,22 @@ namespace superfaiss
 // `paddedQuery` must have bank.paddedDims elements, zero-filled pad lanes, and
 // kAlignment-byte alignment. Callers are expected to have validated the bank and query
 // (see validate.h); kernels do not re-validate.
+//
+// v2.1 dense row bias: when `rowBias` is non-null (bank.count floats), each row's
+// composed score is score + rowBias[r] - ONE fused add after dequantized scoring,
+// before top-k insertion; a non-finite bias value sets *outNonFiniteBias (callers
+// return NonFiniteQuery at completion - the fused-validation law, T-055 W2). Null
+// rowBias executes no add: the bit-identical unbiased path. Same trailing pair on
+// every chunk kernel below (ScoreChunkPair takes one per query; the fused kernels
+// apply bias once, to the fused score).
 void ScoreChunk(
 	const BankView& bank,
 	const float* paddedQuery,
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
-	TopK& inout);
+	TopK& inout,
+	const float* rowBias = nullptr,
+	bool* outNonFiniteBias = nullptr);
 
 // Scores one chunk against TWO queries in a single row pass: row loads (and int8
 // widening) are shared while each query keeps the exact single-query accumulation
@@ -31,7 +41,10 @@ void ScoreChunkPair(
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
 	TopK& inoutA,
-	TopK& inoutB);
+	TopK& inoutB,
+	const float* rowBiasA = nullptr,
+	const float* rowBiasB = nullptr,
+	bool* outNonFiniteBias = nullptr);
 
 // Scores every non-excluded row of one chunk against M queries and pushes the FUSED
 // score — the worst per-query score in the metric's better-direction (min for
@@ -45,7 +58,9 @@ void ScoreChunkFused(
 	int32_t queryCount,
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
-	TopK& inout);
+	TopK& inout,
+	const float* rowBias = nullptr,
+	bool* outNonFiniteBias = nullptr);
 
 // Segmented scan, dense form (V2 §10 decision). NOTE the shipped split: dot-family
 // segmented scans FOLD segment weights into the query (see query.cpp) and run the
@@ -65,7 +80,9 @@ void ScoreChunkSegmented(
 	const uint32_t* excludeBits,
 	const QuerySegment* segments,
 	int32_t segmentCount,
-	TopK& inout);
+	TopK& inout,
+	const float* rowBias = nullptr,
+	bool* outNonFiniteBias = nullptr);
 
 // Segmented intersection: the fused worst-of law over segmented totals — each member
 // query scores through the same segmented per-row path, then worst-of in the metric's
@@ -78,7 +95,9 @@ void ScoreChunkFusedSegmented(
 	const uint32_t* excludeBits,
 	const QuerySegment* segments,
 	int32_t segmentCount,
-	TopK& inout);
+	TopK& inout,
+	const float* rowBias = nullptr,
+	bool* outNonFiniteBias = nullptr);
 
 // Per-row decomposition (V2 section 6): scores one row over the segment list and
 // surfaces the post-scale post-weight per-segment contributions; the returned total

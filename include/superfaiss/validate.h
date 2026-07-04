@@ -29,6 +29,18 @@ Status ValidateSegments(
 	const QuerySegment* segments,
 	int32_t segmentCount);
 
+// Sparse-bias validation (v2.1): pairCount in [0, bank.count]; every index unique
+// and in [0, count); every bias value finite (the finite-only law - NonFiniteQuery).
+// seenBits is caller scratch, ceil(count/32) zeroed uint32 words; on return the pair
+// rows' bits are set (callers reuse them to detect pair rows among scan candidates).
+// Dense bias is NOT pre-validated - its non-finite check fuses into the scan
+// (T-055 W2; a pre-pass would re-read count x 4 bytes and eat the int8 budget).
+Status ValidateBiasPairs(
+	const BankView& bank,
+	const BiasPair* pairs,
+	int32_t pairCount,
+	uint32_t* seenBits);
+
 // Full bank-content validation — O(count x paddedDims); intended for load time, not
 // per query. Rejects what the kernels cannot tolerate: non-finite float32 lanes (a NaN
 // score breaks the top-k total order), non-zero pad lanes (silently wrong L2), and

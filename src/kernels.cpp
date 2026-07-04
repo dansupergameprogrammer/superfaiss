@@ -1,5 +1,8 @@
 #include "superfaiss/kernels.h"
 
+#include <cmath>
+#include <cstring>
+
 // Compile-time SIMD selection: NEON on ARM, SSE4.1 on x86/x64, scalar elsewhere.
 // Every path implements the same accumulation structure (see the comment on the scalar
 // kernels); results are bit-identical across paths on a given device.
@@ -643,6 +646,32 @@ namespace detail
 }
 #endif
 
+namespace
+{
+	// v2.1 dense bias composition: ONE fused add after dequantized scoring, before
+	// top-k insertion; a non-finite bias value raises the caller's flag (fused
+	// validation, T-055 W2) - the scan completes and the caller returns
+	// NonFiniteQuery. Null bias executes no add: the bit-identical unbiased path.
+	inline float ComposeBias(float score, const float* rowBias, int32_t r, bool* flag)
+	{
+		if (rowBias == nullptr)
+		{
+			return score;
+		}
+		const float b = rowBias[r];
+		// Integer exponent test (all-ones = Inf/NaN): std::isfinite lowers to a
+		// classify call under /fp:precise and costs double digits of scan time;
+		// this is two ALU ops.
+		uint32_t bits;
+		std::memcpy(&bits, &b, sizeof(bits));
+		if ((bits & 0x7f800000u) == 0x7f800000u && flag != nullptr)
+		{
+			*flag = true;
+		}
+		return score + b;
+	}
+}
+
 void ScoreChunkPair(
 	const BankView& bank,
 	const float* paddedQueryA,
@@ -650,7 +679,10 @@ void ScoreChunkPair(
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
 	TopK& inoutA,
-	TopK& inoutB)
+	TopK& inoutB,
+	const float* rowBiasA,
+	const float* rowBiasB,
+	bool* outNonFiniteBias)
 {
 #if defined(SUPERFAISS_SIMD_SSE)
 	// AVX2 pair kernels share the row pass; identical per-query accumulation keeps
@@ -689,8 +721,8 @@ void ScoreChunkPair(
 				{
 					detail::DotF32PairAvx2(row, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
 				}
-				inoutA.Push(r, scoreA);
-				inoutB.Push(r, scoreB);
+				inoutA.Push(r, ComposeBias(scoreA, rowBiasA, r, outNonFiniteBias));
+				inoutB.Push(r, ComposeBias(scoreB, rowBiasB, r, outNonFiniteBias));
 			}
 		}
 		else
@@ -712,8 +744,8 @@ void ScoreChunkPair(
 				{
 					detail::DotI8PairAvx2(row, scale, paddedQueryA, paddedQueryB, pd, &scoreA, &scoreB);
 				}
-				inoutA.Push(r, scoreA);
-				inoutB.Push(r, scoreB);
+				inoutA.Push(r, ComposeBias(scoreA, rowBiasA, r, outNonFiniteBias));
+				inoutB.Push(r, ComposeBias(scoreB, rowBiasB, r, outNonFiniteBias));
 			}
 		}
 		return;
@@ -721,8 +753,8 @@ void ScoreChunkPair(
 #endif
 	// Fallback: two single passes (bit-identical by definition; SSE/NEON pair kernels
 	// are a recorded follow-up).
-	ScoreChunk(bank, paddedQueryA, chunkIndex, excludeBits, inoutA);
-	ScoreChunk(bank, paddedQueryB, chunkIndex, excludeBits, inoutB);
+	ScoreChunk(bank, paddedQueryA, chunkIndex, excludeBits, inoutA, rowBiasA, outNonFiniteBias);
+	ScoreChunk(bank, paddedQueryB, chunkIndex, excludeBits, inoutB, rowBiasB, outNonFiniteBias);
 }
 
 void ScoreChunk(
@@ -730,7 +762,9 @@ void ScoreChunk(
 	const float* paddedQuery,
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
-	TopK& inout)
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
 {
 	const int32_t chunkRows = ChunkRows(bank);
 	const int32_t begin = chunkIndex * chunkRows;
@@ -756,7 +790,7 @@ void ScoreChunk(
 			const float score = isL2
 				? detail::L2F32(row, paddedQuery, pd)
 				: detail::DotF32(row, paddedQuery, pd);
-			inout.Push(r, score);
+			inout.Push(r, ComposeBias(score, rowBias, r, outNonFiniteBias));
 		}
 	}
 	else
@@ -773,7 +807,7 @@ void ScoreChunk(
 			const float score = isL2
 				? detail::L2I8(row, scale, paddedQuery, pd)
 				: detail::DotI8(row, scale, paddedQuery, pd);
-			inout.Push(r, score);
+			inout.Push(r, ComposeBias(score, rowBias, r, outNonFiniteBias));
 		}
 	}
 }
@@ -784,7 +818,9 @@ void ScoreChunkFused(
 	int32_t queryCount,
 	int32_t chunkIndex,
 	const uint32_t* excludeBits,
-	TopK& inout)
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
 {
 	const int32_t chunkRows = ChunkRows(bank);
 	const int32_t begin = chunkIndex * chunkRows;
@@ -819,7 +855,8 @@ void ScoreChunkFused(
 					fused = score;
 				}
 			}
-			inout.Push(r, fused);
+			// Bias applies once, to the fused score (plan 18.2).
+			inout.Push(r, ComposeBias(fused, rowBias, r, outNonFiniteBias));
 		}
 	}
 	else
@@ -844,7 +881,7 @@ void ScoreChunkFused(
 					fused = score;
 				}
 			}
-			inout.Push(r, fused);
+			inout.Push(r, ComposeBias(fused, rowBias, r, outNonFiniteBias));
 		}
 	}
 }
@@ -1011,7 +1048,9 @@ void ScoreChunkSegmented(
 	const uint32_t* excludeBits,
 	const QuerySegment* segments,
 	int32_t segmentCount,
-	TopK& inout)
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
 {
 	const int32_t chunkRows = ChunkRows(bank);
 	const int32_t begin = chunkIndex * chunkRows;
@@ -1042,8 +1081,9 @@ void ScoreChunkSegmented(
 		const float* rowInvNorms = perChannelCosine
 			? bank.channelInvNorms + static_cast<int64_t>(r) * bank.channelCount
 			: nullptr;
-		inout.Push(r, DenseSegmentedRowScore(row, scale, paddedQuery, ranges,
-			rangeCount, kernels, isL2, isInt8, rowInvNorms, nullptr));
+		const float total = DenseSegmentedRowScore(row, scale, paddedQuery, ranges,
+			rangeCount, kernels, isL2, isInt8, rowInvNorms, nullptr);
+		inout.Push(r, ComposeBias(total, rowBias, r, outNonFiniteBias));
 	}
 }
 
@@ -1055,7 +1095,9 @@ void ScoreChunkFusedSegmented(
 	const uint32_t* excludeBits,
 	const QuerySegment* segments,
 	int32_t segmentCount,
-	TopK& inout)
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
 {
 	const int32_t chunkRows = ChunkRows(bank);
 	const int32_t begin = chunkIndex * chunkRows;
@@ -1098,7 +1140,7 @@ void ScoreChunkFusedSegmented(
 				fused = score;
 			}
 		}
-		inout.Push(r, fused);
+		inout.Push(r, ComposeBias(fused, rowBias, r, outNonFiniteBias));
 	}
 }
 

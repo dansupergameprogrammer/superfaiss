@@ -2773,6 +2773,425 @@ static void TestPinDrainLitmus()
 	CHECK_MSG(pinsTaken.load() > 0, "litmus readers never pinned");
 }
 
+// ---------------------------------------------------------------------------
+// T24 — per-row bias (v2.1, plan section 18): both forms against a float64
+// composed reference, null bitwise identity, all-zeros compare-equal, sparse ==
+// dense-equivalent, eviction and lift exactness (the k+P construction), metric
+// direction, the one-add contract, rejections, batch ≡ singles, intersection,
+// segment composition, exclusion-wins, allocation flatness.
+
+static void TestPerRowBias()
+{
+	Rng rng(0xB1A5ull);
+	const int32_t dims = 24;
+	const int32_t count = 500;
+	const int32_t k = 10;
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			TestBank bank(rng, count, dims, quant, metric);
+			std::vector<float> queryRaw(dims);
+			for (auto& v : queryRaw)
+			{
+				v = rng.NextFloat();
+			}
+			AlignedBuf qbuf(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+			PadQuery(queryRaw, bank.view.paddedDims, qbuf.F32());
+
+			std::vector<float> dense(count);
+			for (auto& b : dense)
+			{
+				b = rng.NextFloat() * 0.25f;
+			}
+
+			Workspace ws;
+			Hit plain[k], hits[k];
+			int32_t nPlain = 0, n = 0;
+			QueryParams params;
+			params.k = k;
+			CHECK(Query(bank.view, qbuf.F32(), params, ws, plain, &nPlain) == Status::Ok);
+
+			// Null / empty RowBias: the bit-identical unbiased path.
+			{
+				RowBias empty;
+				params.bias = &empty;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+				CHECK(n == nPlain);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(hits[i].index == plain[i].index && hits[i].score == plain[i].score);
+				}
+				params.bias = nullptr;
+			}
+
+			// Dense against the float64 composed reference.
+			{
+				RowBias rb;
+				rb.dense = dense.data();
+				params.bias = &rb;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+				std::vector<RefHit> ref = ReferenceScan(bank, qbuf.F32(), nullptr);
+				for (RefHit& h : ref)
+				{
+					h.score += static_cast<double>(dense[h.index]);
+				}
+				std::sort(ref.begin(), ref.end(), [&](const RefHit& a, const RefHit& b) {
+					return RefBetter(a, b, metric);
+				});
+				CheckTopK(bank, ref, hits, n, k);
+
+				// The one-add contract: composed == unbiased + bias, bitwise, for
+				// every returned hit (the unbiased term from an exhaustive scan).
+				std::vector<Hit> all(count);
+				std::vector<int32_t> nAll(1);
+				QueryParams full;
+				full.k = count;
+				Workspace wsFull;
+				int32_t fullN = 0;
+				CHECK(Query(bank.view, qbuf.F32(), full, wsFull, all.data(), &fullN)
+					== Status::Ok);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					float unbiased = 0.0f;
+					for (int32_t j = 0; j < fullN; ++j)
+					{
+						if (all[j].index == hits[i].index)
+						{
+							unbiased = all[j].score;
+							break;
+						}
+					}
+					CHECK(hits[i].score == unbiased + dense[hits[i].index]);
+				}
+				(void)nAll;
+				params.bias = nullptr;
+			}
+
+			// All-zeros dense: compare-equal ranking identity (NOT claimed bitwise:
+			// IEEE -0.0 + 0.0 == +0.0).
+			{
+				std::vector<float> zeros(count, 0.0f);
+				RowBias rb;
+				rb.dense = zeros.data();
+				params.bias = &rb;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+				CHECK(n == nPlain);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(hits[i].index == plain[i].index);
+					CHECK(hits[i].score == plain[i].score); // value equality
+				}
+				params.bias = nullptr;
+			}
+
+			// Sparse: lift a bottom row in, evict the top row, and match the
+			// dense-equivalent expression compare-equal.
+			{
+				// The unbiased worst-ranked live row (from an exhaustive scan).
+				Workspace wsFull;
+				std::vector<Hit> all(count);
+				QueryParams full;
+				full.k = count;
+				int32_t fullN = 0;
+				CHECK(Query(bank.view, qbuf.F32(), full, wsFull, all.data(), &fullN)
+					== Status::Ok);
+				const int32_t bottomRow = all[fullN - 1].index;
+				const int32_t topRow = all[0].index;
+				// Rewards improve in the metric's own direction: negative on L2.
+				const float lift = metric == Metric::L2 ? -1000.0f : 1000.0f;
+				const float evict = metric == Metric::L2 ? 1000.0f : -1000.0f;
+				BiasPair pairs[2] = {{bottomRow, lift}, {topRow, evict}};
+				RowBias rb;
+				rb.pairs = pairs;
+				rb.pairCount = 2;
+				params.bias = &rb;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+				CHECK(n == k);
+				CHECK(hits[0].index == bottomRow); // lifted from rank-last to rank-1
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(hits[i].index != topRow); // evicted despite rank-1 similarity
+				}
+
+				// Dense-equivalent: zeros everywhere except the pair rows.
+				std::vector<float> equivalent(count, 0.0f);
+				equivalent[bottomRow] = lift;
+				equivalent[topRow] = evict;
+				RowBias rbDense;
+				rbDense.dense = equivalent.data();
+				params.bias = &rbDense;
+				Hit denseHits[k];
+				int32_t dn = 0;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, denseHits, &dn) == Status::Ok);
+				CHECK(dn == n);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(denseHits[i].index == hits[i].index);
+					CHECK(denseHits[i].score == hits[i].score); // value equality
+				}
+
+				// Exclusion wins over bias: the lifted row, excluded, never returns.
+				std::vector<uint32_t> exclude((count + 31) / 32, 0u);
+				exclude[bottomRow >> 5] |= 1u << (bottomRow & 31);
+				params.bias = &rb;
+				params.excludeBits = exclude.data();
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(hits[i].index != bottomRow);
+				}
+				params.excludeBits = nullptr;
+				params.bias = nullptr;
+			}
+
+			// Rejections.
+			{
+				std::vector<float> bad(dense);
+				bad[count / 2] = std::numeric_limits<float>::quiet_NaN();
+				RowBias rb;
+				rb.dense = bad.data();
+				params.bias = &rb;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::NonFiniteQuery);
+
+				BiasPair nanPair[1] = {{0, std::numeric_limits<float>::infinity()}};
+				RowBias rbNan;
+				rbNan.pairs = nanPair;
+				rbNan.pairCount = 1;
+				params.bias = &rbNan;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::NonFiniteQuery);
+
+				BiasPair oor[1] = {{count, 1.0f}};
+				RowBias rbOor;
+				rbOor.pairs = oor;
+				rbOor.pairCount = 1;
+				params.bias = &rbOor;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::InvalidArgument);
+
+				BiasPair dup[2] = {{3, 1.0f}, {3, 2.0f}};
+				RowBias rbDup;
+				rbDup.pairs = dup;
+				rbDup.pairCount = 2;
+				params.bias = &rbDup;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::InvalidArgument);
+
+				BiasPair one[1] = {{0, 1.0f}};
+				RowBias rbBoth;
+				rbBoth.dense = dense.data();
+				rbBoth.pairs = one;
+				rbBoth.pairCount = 1;
+				params.bias = &rbBoth;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::InvalidArgument);
+
+				RowBias rbNull;
+				rbNull.pairCount = 1;
+				params.bias = &rbNull;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n)
+					== Status::InvalidArgument);
+				params.bias = nullptr;
+			}
+
+			// Batch ≡ singles, per-query forms mixed (none / dense / sparse).
+			{
+				const int32_t m = 6;
+				std::vector<float> queries(static_cast<size_t>(m) * bank.view.paddedDims, 0.0f);
+				AlignedBuf qsBuf(queries.size() * sizeof(float));
+				for (int32_t q = 0; q < m; ++q)
+				{
+					std::vector<float> raw(dims);
+					for (auto& v : raw)
+					{
+						v = rng.NextFloat();
+					}
+					PadQuery(raw, bank.view.paddedDims,
+						qsBuf.F32() + static_cast<int64_t>(q) * bank.view.paddedDims);
+				}
+				BiasPair pair1[1] = {{7, metric == Metric::L2 ? -50.0f : 50.0f}};
+				BiasPair pair2[2] = {{11, 2.0f}, {200, metric == Metric::L2 ? -75.0f : 75.0f}};
+				RowBias forms[m];
+				forms[1].dense = dense.data();
+				forms[2].pairs = pair1;
+				forms[2].pairCount = 1;
+				forms[3].dense = dense.data();
+				forms[4].pairs = pair2;
+				forms[4].pairCount = 2;
+				QueryParams bp;
+				bp.k = k;
+				bp.bias = forms;
+				std::vector<Hit> batchHits(static_cast<size_t>(m) * k);
+				std::vector<int32_t> counts(m);
+				Workspace wsB;
+				CHECK(QueryBatch(bank.view, qsBuf.F32(), m, bp, wsB, batchHits.data(),
+						counts.data()) == Status::Ok);
+				for (int32_t q = 0; q < m; ++q)
+				{
+					QueryParams sp;
+					sp.k = k;
+					sp.bias = &forms[q];
+					Hit single[k];
+					int32_t sn = 0;
+					Workspace wsS;
+					CHECK(Query(bank.view,
+							qsBuf.F32() + static_cast<int64_t>(q) * bank.view.paddedDims,
+							sp, wsS, single, &sn) == Status::Ok);
+					CHECK(sn == counts[q]);
+					for (int32_t i = 0; i < sn; ++i)
+					{
+						const Hit& b = batchHits[static_cast<size_t>(q) * k + i];
+						CHECK(b.index == single[i].index && b.score == single[i].score);
+					}
+				}
+			}
+		}
+	}
+
+	// Intersection: bias applies once, to the fused score. Sparse reward lifts a
+	// row into the fused top-k; the composed score equals fused + bias bitwise.
+	{
+		TestBank bank(rng, 300, dims, Quantization::Float32, Metric::Cosine);
+		const int32_t m = 2;
+		AlignedBuf qsBuf(static_cast<size_t>(m) * bank.view.paddedDims * sizeof(float));
+		for (int32_t q = 0; q < m; ++q)
+		{
+			std::vector<float> raw(dims);
+			for (auto& v : raw)
+			{
+				v = rng.NextFloat();
+			}
+			PadQuery(raw, bank.view.paddedDims,
+				qsBuf.F32() + static_cast<int64_t>(q) * bank.view.paddedDims);
+		}
+		QueryParams params;
+		params.k = 8;
+		Workspace ws;
+		Hit plain[8], hits[8];
+		int32_t nPlain = 0, n = 0;
+		CHECK(QueryIntersect(bank.view, qsBuf.F32(), m, params, ws, plain, &nPlain)
+			== Status::Ok);
+
+		// Fused scan at k=count to find the fused-worst row and its fused score.
+		std::vector<Hit> all(300);
+		QueryParams full;
+		full.k = 300;
+		int32_t fullN = 0;
+		Workspace wsF;
+		CHECK(QueryIntersect(bank.view, qsBuf.F32(), m, full, wsF, all.data(), &fullN)
+			== Status::Ok);
+		const Hit worst = all[fullN - 1];
+
+		BiasPair pair[1] = {{worst.index, 100.0f}};
+		RowBias rb;
+		rb.pairs = pair;
+		rb.pairCount = 1;
+		params.bias = &rb;
+		CHECK(QueryIntersect(bank.view, qsBuf.F32(), m, params, ws, hits, &n) == Status::Ok);
+		CHECK(n == 8 && hits[0].index == worst.index);
+		CHECK(hits[0].score == worst.score + 100.0f); // once, to the fused score
+
+		// Dense on intersect: composed reference over the exhaustive fused scan.
+		std::vector<float> dense(300);
+		Rng biasRng(0xB1A5B1A5ull);
+		for (auto& b : dense)
+		{
+			b = biasRng.NextFloat() * 0.25f;
+		}
+		RowBias rbDense;
+		rbDense.dense = dense.data();
+		params.bias = &rbDense;
+		CHECK(QueryIntersect(bank.view, qsBuf.F32(), m, params, ws, hits, &n) == Status::Ok);
+		for (int32_t i = 0; i < n; ++i)
+		{
+			float fused = 0.0f;
+			for (int32_t j = 0; j < fullN; ++j)
+			{
+				if (all[j].index == hits[i].index)
+				{
+					fused = all[j].score;
+					break;
+				}
+			}
+			CHECK(hits[i].score == fused + dense[hits[i].index]);
+		}
+	}
+
+	// Segments x bias compose: on an L2 bank (the dense segmented path) a sparse
+	// reward returns the pair row with score == DecomposeRowScore total + bias,
+	// bitwise - the decomposition-term contract (partials + bias = total).
+	{
+		TestBank bank(rng, 200, 32, Quantization::Float32, Metric::L2);
+		std::vector<float> raw(32);
+		for (auto& v : raw)
+		{
+			v = rng.NextFloat();
+		}
+		AlignedBuf qbuf(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+		PadQuery(raw, bank.view.paddedDims, qbuf.F32());
+		const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 0.5f}};
+		BiasPair pair[1] = {{123, -500.0f}}; // L2 reward is negative
+		RowBias rb;
+		rb.pairs = pair;
+		rb.pairCount = 1;
+		QueryParams params;
+		params.k = 5;
+		params.segments = segs;
+		params.segmentCount = 2;
+		params.bias = &rb;
+		Workspace ws;
+		Hit hits[5];
+		int32_t n = 0;
+		CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		CHECK(n == 5 && hits[0].index == 123);
+		float contributions[2] = {0.0f, 0.0f};
+		const float total = DecomposeRowScore(bank.view, qbuf.F32(), 123, segs, 2,
+			contributions);
+		CHECK(hits[0].score == total + (-500.0f));
+	}
+
+	// Allocation flatness: warm one biased query of each form, then repeats
+	// allocate nothing.
+	{
+		TestBank bank(rng, 400, dims, Quantization::Int8, Metric::Cosine);
+		std::vector<float> raw(dims);
+		for (auto& v : raw)
+		{
+			v = rng.NextFloat();
+		}
+		AlignedBuf qbuf(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+		PadQuery(raw, bank.view.paddedDims, qbuf.F32());
+		std::vector<float> dense(400, 0.125f);
+		BiasPair pair[1] = {{42, 0.5f}};
+		Workspace ws;
+		Hit hits[8];
+		int32_t n = 0;
+		QueryParams params;
+		params.k = 8;
+		RowBias rbDense;
+		rbDense.dense = dense.data();
+		RowBias rbSparse;
+		rbSparse.pairs = pair;
+		rbSparse.pairCount = 1;
+		params.bias = &rbDense;
+		CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		params.bias = &rbSparse;
+		CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		const uint64_t allocs = AllocationCount();
+		const uint64_t growth = ws.GrowthCount();
+		for (int32_t i = 0; i < 32; ++i)
+		{
+			params.bias = (i & 1) ? &rbDense : &rbSparse;
+			CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		}
+		CHECK(AllocationCount() == allocs);
+		CHECK(ws.GrowthCount() == growth);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -2798,6 +3217,7 @@ int main()
 	TestPerChannelCosine();
 	TestScratchBanks();
 	TestPinDrainLitmus();
+	TestPerRowBias();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

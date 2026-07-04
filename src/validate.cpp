@@ -154,6 +154,38 @@ Status ValidateSegments(
 	return Status::Ok;
 }
 
+Status ValidateBiasPairs(
+	const BankView& bank,
+	const BiasPair* pairs,
+	int32_t pairCount,
+	uint32_t* seenBits)
+{
+	if (pairCount < 0 || (pairCount > 0 && (pairs == nullptr || seenBits == nullptr)) ||
+		pairCount > bank.count)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t i = 0; i < pairCount; ++i)
+	{
+		const int32_t row = pairs[i].index;
+		if (row < 0 || row >= bank.count)
+		{
+			return Status::InvalidArgument;
+		}
+		const uint32_t bit = 1u << (row & 31);
+		if ((seenBits[row >> 5] & bit) != 0)
+		{
+			return Status::InvalidArgument; // duplicate index: ambiguous composition
+		}
+		seenBits[row >> 5] |= bit;
+		if (!std::isfinite(pairs[i].bias))
+		{
+			return Status::NonFiniteQuery;
+		}
+	}
+	return Status::Ok;
+}
+
 Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 {
 	const Status structural = ValidateBank(bank);
