@@ -3,7 +3,8 @@
 A **bank** is an immutable set of embedding vectors prepared for scanning. This document
 specifies both the interchange format (what pipelines produce) and the baked in-memory
 layout (what the kernels scan). The format is versioned by `schemaVersion`; consumers
-must hard-reject versions they do not know. Current version: **1**.
+must hard-reject versions they do not know. Current versions: **1** (channel-less)
+and **2** (named channels).
 
 ## 1. Interchange: the `.wvbank` sidecar pair
 
@@ -28,18 +29,21 @@ where the vectors came from.
   "metric": "cosine",
   "dtype": "float32",
   "description": "optional free text",
-  "ids": ["optional", "one", "string", "per", "row"]
+  "ids": ["optional", "one", "string", "per", "row"],
+  "channels": [{"name": "identity", "offset": 0, "dims": 64},
+               {"name": "appearance", "offset": 64, "dims": 36}]
 }
 ```
 
 | Field | Type | Rules |
 |---|---|---|
-| `schemaVersion` | int | Must equal 1. Unknown versions are rejected, never guessed at. |
+| `schemaVersion` | int | 1 (channel-less) or 2 (carries `channels`). Unknown versions are rejected, never guessed at; a v1-only reader hard-rejects 2 by this same rule. Writers emit 1 unless channels are present. |
 | `dims` | int | > 0. Logical dimensions per vector. |
 | `count` | int | >= 0. Number of vectors. |
 | `metric` | string | `"dot"`, `"cosine"`, or `"l2"` — the metric the bank is intended for. |
 | `dtype` | string | `"float32"` (the interchange payload is always float32; quantization happens at bake). |
 | `ids` | string[] | Optional. Exactly `count` entries, all unique. Absent means IDs are row indices. |
+| `channels` | object[] | schemaVersion 2 only (and required by it). Named contiguous element ranges `{name, offset, dims}`: non-overlapping, ascending, at most 8, names unique, boundaries on the baked layout's 16-byte element grid (section 2). Full coverage is not required — unnamed gaps are simply unaddressable by name. |
 
 ### `<name>.wvbank.bin` — the payload
 
@@ -51,7 +55,9 @@ padding, no compression.
 An importer must reject, with a specific diagnostic and no partial output:
 payload size disagreeing with the header; any non-finite value; duplicate or
 wrongly-counted ids; a zero-norm row when `metric` is `cosine`; unknown
-`schemaVersion`, `metric`, or `dtype`.
+`schemaVersion`, `metric`, or `dtype`; a malformed `channels` table (overlap,
+off-grid boundary, duplicate or empty name, out-of-bounds range, more than 8
+entries, or schemaVersion 2 without one).
 
 ## 2. Baked layout: what the kernels scan
 

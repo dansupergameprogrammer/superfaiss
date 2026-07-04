@@ -19,12 +19,41 @@ import json
 import struct
 import sys
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 1        # emitted for channel-less banks
+SCHEMA_VERSION_CHANNELS = 2  # emitted when a channels table is present
+KNOWN_SCHEMA_VERSIONS = (1, 2)
 METRICS = ("dot", "cosine", "l2")
+MAX_CHANNELS = 8
 
 
-def write_bank(name, rows, dims, metric="cosine", ids=None, description=""):
-    """rows: iterable of iterables of float, all length dims. ids: optional list of str."""
+def _validate_channels(channels, dims):
+    if not channels:
+        raise ValueError("schemaVersion 2 requires a non-empty channels table")
+    if len(channels) > MAX_CHANNELS:
+        raise ValueError(f"{len(channels)} channels, max {MAX_CHANNELS}")
+    names = set()
+    prev_end = 0
+    for i, ch in enumerate(channels):
+        name = ch.get("name")
+        offset = ch.get("offset")
+        length = ch.get("dims")
+        if not name or not isinstance(offset, int) or not isinstance(length, int):
+            raise ValueError(f"channel {i} needs name, offset, dims")
+        if name in names:
+            raise ValueError(f"duplicate channel name {name!r}")
+        if offset < prev_end or length <= 0 or offset + length > dims:
+            raise ValueError(f"channel {name!r} violates ascending/bounds rules")
+        # Grid alignment (16-byte element grid) is quantization-dependent and is
+        # enforced by the importer at bake; the interchange rule checked here is
+        # structural (ascending, non-overlapping, in bounds, unique names).
+        names.add(name)
+        prev_end = offset + length
+    return channels
+
+
+def write_bank(name, rows, dims, metric="cosine", ids=None, description="", channels=None):
+    """rows: iterable of iterables of float, all length dims. ids: optional list of str.
+    channels: optional list of {"name", "offset", "dims"} dicts -> schemaVersion 2."""
     count = 0
     with open(name + ".wvbank.bin", "wb") as f:
         for row in rows:
@@ -37,7 +66,7 @@ def write_bank(name, rows, dims, metric="cosine", ids=None, description=""):
     if ids is not None and len(ids) != count:
         raise ValueError(f"{len(ids)} ids for {count} rows")
     header = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": SCHEMA_VERSION_CHANNELS if channels else SCHEMA_VERSION,
         "dims": dims,
         "count": count,
         "metric": metric,
@@ -46,6 +75,8 @@ def write_bank(name, rows, dims, metric="cosine", ids=None, description=""):
     }
     if ids is not None:
         header["ids"] = list(ids)
+    if channels:
+        header["channels"] = _validate_channels(list(channels), dims)
     with open(name + ".wvbank.json", "w", encoding="utf-8") as f:
         json.dump(header, f, indent=1)
     return count
@@ -55,11 +86,15 @@ def read_bank(json_path):
     """Returns (header, rows) where rows is a list of float lists."""
     with open(json_path, "r", encoding="utf-8") as f:
         header = json.load(f)
-    if header.get("schemaVersion") != SCHEMA_VERSION:
+    if header.get("schemaVersion") not in KNOWN_SCHEMA_VERSIONS:
         raise ValueError(f"unknown schemaVersion {header.get('schemaVersion')}")
     if header.get("dtype") != "float32":
         raise ValueError(f"unknown dtype {header.get('dtype')}")
     dims = int(header["dims"])
+    if header.get("schemaVersion") == SCHEMA_VERSION_CHANNELS:
+        _validate_channels(header.get("channels"), dims)
+    elif header.get("channels"):
+        raise ValueError("channels table requires schemaVersion 2")
     count = int(header["count"])
     if header.get("metric") not in METRICS:
         raise ValueError(f"unknown metric {header.get('metric')}")

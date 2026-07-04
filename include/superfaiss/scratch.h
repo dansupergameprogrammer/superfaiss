@@ -82,6 +82,31 @@ public:
 	// exceed the current capacity.
 	Status Grow(int32_t newCapacity);
 
+	// --- Reader-pin / exclusive-drain protocol (Poirot F4) ---
+	//
+	// The dispatch gate hosts put in front of Grow/Load (T-044 N4): readers pin
+	// for a query flight; an exclusive operation raises the drain flag (new pins
+	// refused), waits the pins out, runs, releases. The critical pairs - the
+	// exclusive side's flag-store + pin-count-load, and the reader side's
+	// pin-increment + flag-re-load - are seq_cst BY DESIGN: with acquire/release
+	// alone this is a store-buffering shape, and the interleaving "writer sees
+	// pins==0, reader sees flag==false" is permitted on weakly-ordered ISAs
+	// (ARM64) even though x86's lock-prefixed RMWs happen to forbid it. The
+	// protocol's safety must be legible in its own orderings, not borrowed from
+	// an ISA. Exclusive ops are rare (Grow/Freeze/Load); the seq_cst cost is
+	// noise. The T22 litmus test drives this protocol under ThreadSanitizer in CI.
+
+	// Pins the bank for one reader flight. Fails while an exclusive operation is
+	// waiting or running. Any thread.
+	bool TryPinReader();
+	void UnpinReader();
+
+	// Raises the drain flag and waits out in-flight reader pins. Fails if another
+	// exclusive operation holds the flag (writer coordination is the caller's
+	// job). After it returns true, run the exclusive work, then EndExclusive().
+	bool BeginExclusive();
+	void EndExclusive();
+
 	// --- Reader side (lock-free) ---
 
 	// Published row count (acquire). Rows below this are immutable.
@@ -156,6 +181,8 @@ private:
 	Metric Metric_ = Metric::Dot;
 	Quantization Quant_ = Quantization::Float32;
 	std::atomic<int32_t> PublishedCount_{0};
+	std::atomic<int32_t> ReaderPins_{0};
+	std::atomic<bool> ExclusiveWaiting_{false};
 	std::atomic<int32_t> TombstonedCount_{0};
 	// Debug-build owner guard: asserts the single-writer contract, costs nothing on
 	// the reader side.

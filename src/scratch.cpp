@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstring>
 #include <new>
+#include <thread>
 
 #include "superfaiss/bake.h"
 #include "superfaiss/validate.h"
@@ -149,6 +150,52 @@ void ScratchBank::Destroy()
 	Capacity_ = 0;
 	PublishedCount_.store(0, std::memory_order_relaxed);
 	TombstonedCount_.store(0, std::memory_order_relaxed);
+}
+
+bool ScratchBank::TryPinReader()
+{
+	if (ExclusiveWaiting_.load(std::memory_order_seq_cst))
+	{
+		return false;
+	}
+	ReaderPins_.fetch_add(1, std::memory_order_seq_cst);
+	// Re-check after the increment. seq_cst makes the argument airtight: in the
+	// single total order S, if the exclusive side's flag-store preceded this
+	// load, we see it and back out; otherwise this load precedes the store in S,
+	// so our increment does too, and the exclusive side's pin-count load (after
+	// its store) observes us and keeps waiting. Acquire/release cannot order
+	// this store-buffering pair (Poirot F4).
+	if (ExclusiveWaiting_.load(std::memory_order_seq_cst))
+	{
+		ReaderPins_.fetch_sub(1, std::memory_order_seq_cst);
+		return false;
+	}
+	return true;
+}
+
+void ScratchBank::UnpinReader()
+{
+	ReaderPins_.fetch_sub(1, std::memory_order_release);
+}
+
+bool ScratchBank::BeginExclusive()
+{
+	bool expected = false;
+	if (!ExclusiveWaiting_.compare_exchange_strong(
+			expected, true, std::memory_order_seq_cst))
+	{
+		return false;
+	}
+	while (ReaderPins_.load(std::memory_order_seq_cst) > 0)
+	{
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+void ScratchBank::EndExclusive()
+{
+	ExclusiveWaiting_.store(false, std::memory_order_release);
 }
 
 Status ScratchBank::Append(const float* row, int32_t dims, int32_t* outIndex)
@@ -387,6 +434,10 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	{
 		return Status::InvalidArgument;
 	}
+	// Load's contract is stronger than single-writer (fully exclusive), so the
+	// debug owner guard covers it too (Poirot F3) - a writer overlapping a Load
+	// asserts in dev builds instead of racing the arena swap silently.
+	WriterGuard guard(WriterBusy_);
 
 	ScratchHeader header;
 	if (!archive.read(archive.user, &header, sizeof(header)))

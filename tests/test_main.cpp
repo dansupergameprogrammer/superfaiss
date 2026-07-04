@@ -2695,6 +2695,69 @@ static void TestScratchBanks()
 	}
 }
 
+// F4 litmus — the pin/drain protocol's store-buffering shape, driven hard under
+// ThreadSanitizer in CI (the x86 suite cannot distinguish the declared orderings
+// from the ISA's incidental fences; TSan reasons about the C++ model). A shared
+// NON-atomic variable is the tripwire: readers touch it only while pinned, the
+// exclusive side only inside Begin/EndExclusive — if the protocol admitted the
+// bad interleaving, that is a data race TSan reports even when the timing never
+// bites, and the invariant counters catch actual overlap on any host.
+static void TestPinDrainLitmus()
+{
+	ScratchBank bank;
+	CHECK(bank.Create(8, 16, Metric::Dot, Quantization::Float32) == Status::Ok);
+	alignas(16) float row[16] = {1.0f};
+	CHECK(bank.Append(row, 16, nullptr) == Status::Ok);
+
+	int guarded = 0; // deliberately non-atomic: the TSan tripwire
+	std::atomic<bool> done{false};
+	std::atomic<int64_t> violations{0};
+	std::atomic<int64_t> pinsTaken{0};
+	std::atomic<int64_t> exclusivesRun{0};
+
+	auto readerFn = [&]() {
+		while (!done.load(std::memory_order_acquire))
+		{
+			if (!bank.TryPinReader())
+			{
+				continue;
+			}
+			// Pinned: the exclusive side must not be inside its critical section.
+			const int seen = guarded;
+			if (seen != 0)
+			{
+				violations.fetch_add(1, std::memory_order_relaxed);
+			}
+			pinsTaken.fetch_add(1, std::memory_order_relaxed);
+			bank.UnpinReader();
+		}
+	};
+	std::thread readers[3] = {
+		std::thread(readerFn), std::thread(readerFn), std::thread(readerFn)};
+
+	for (int i = 0; i < 20000; ++i)
+	{
+		if (!bank.BeginExclusive())
+		{
+			violations.fetch_add(1, std::memory_order_relaxed);
+			break;
+		}
+		guarded = 1;
+		guarded = 0;
+		bank.EndExclusive();
+		exclusivesRun.fetch_add(1, std::memory_order_relaxed);
+	}
+	done.store(true, std::memory_order_release);
+	for (auto& t : readers)
+	{
+		t.join();
+	}
+	CHECK_MSG(violations.load() == 0, "pin/drain litmus violations: %lld",
+		static_cast<long long>(violations.load()));
+	CHECK(exclusivesRun.load() == 20000);
+	CHECK_MSG(pinsTaken.load() > 0, "litmus readers never pinned");
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -2719,6 +2782,7 @@ int main()
 	TestSegmentedScan();
 	TestPerChannelCosine();
 	TestScratchBanks();
+	TestPinDrainLitmus();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
