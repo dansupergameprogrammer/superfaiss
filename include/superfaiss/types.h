@@ -60,13 +60,31 @@ struct Hit
 	float score = 0.0f;
 };
 
+// Per-query scoring-metric override. BankMetric scores with the bank's own metric.
+// Dot scores with the dot kernel regardless of bank family: on Dot and Cosine banks it
+// is the identity (their scoring is already a dot product); on L2 banks it enables
+// direction/axis-projection queries without re-baking. Query validation always applies
+// the BANK's rules (a Cosine bank rejects zero-norm queries under any override).
+enum class ScoreAs : uint8_t
+{
+	BankMetric = 0,
+	Dot = 1,
+};
+
 struct QueryParams
 {
 	int32_t k = 0;
 	// Optional exclusion bitset, ceil(count/32) uint32 words, bit set = skip that row index.
 	// Null means no exclusions.
 	const uint32_t* excludeBits = nullptr;
+	ScoreAs scoreAs = ScoreAs::BankMetric;
 };
+
+// The metric a query with these params is actually scored (and its hits ordered) by.
+inline constexpr Metric ScoringMetric(const BankView& bank, const QueryParams& params)
+{
+	return params.scoreAs == ScoreAs::Dot ? Metric::Dot : bank.metric;
+}
 
 // Element size of one stored value for a quantization mode.
 inline constexpr int32_t ElementSize(Quantization q)

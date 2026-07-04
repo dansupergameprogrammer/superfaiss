@@ -933,6 +933,281 @@ static void TestValidateBankData()
 
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// T14 — centroid helper (plan 18.1): MakeCentroid equals a double reference across
+// the metric x quantization matrix; Cosine renormalizes; zero-norm mean rejected.
+
+static void TestCentroid()
+{
+	Rng rng(0xCE47401Dull);
+	const int32_t dims = 24;
+	const int32_t indices[3] = {3, 7, 19};
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, 40, dims, quant, metric);
+			AlignedBuf out(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+			CHECK(MakeCentroid(bank.view, indices, 3, out.F32()) == Status::Ok);
+
+			std::vector<double> ref(static_cast<size_t>(dims), 0.0);
+			for (int32_t i = 0; i < 3; ++i)
+			{
+				for (int32_t j = 0; j < dims; ++j)
+				{
+					ref[j] += bank.refRows[static_cast<size_t>(indices[i]) * dims + j];
+				}
+			}
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				ref[j] /= 3.0;
+			}
+			if (metric == Metric::Cosine)
+			{
+				double norm = 0.0;
+				for (int32_t j = 0; j < dims; ++j)
+				{
+					norm += ref[j] * ref[j];
+				}
+				const double inv = 1.0 / std::sqrt(norm);
+				for (int32_t j = 0; j < dims; ++j)
+				{
+					ref[j] *= inv;
+				}
+			}
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				CHECK_MSG(std::fabs(out.F32()[j] - ref[j]) <= 1e-5 * (1.0 + std::fabs(ref[j])),
+					"centroid dim %d: got %.9g ref %.9g", j, out.F32()[j], ref[j]);
+			}
+			for (int32_t j = dims; j < bank.view.paddedDims; ++j)
+			{
+				CHECK(out.F32()[j] == 0.0f);
+			}
+
+			// The centroid is a valid query against its own bank.
+			CHECK(ValidateQuery(bank.view, out.F32()) == Status::Ok);
+
+			// Rejections: empty set, out-of-range index, misaligned output.
+			CHECK(MakeCentroid(bank.view, indices, 0, out.F32()) == Status::InvalidArgument);
+			const int32_t bad = bank.view.count;
+			CHECK(MakeCentroid(bank.view, &bad, 1, out.F32()) == Status::InvalidArgument);
+			CHECK(MakeCentroid(bank.view, indices, 3, out.F32() + 1) == Status::BadAlignment);
+		}
+	}
+
+	// Zero-norm mean on a Cosine bank: antipodal members cancel; rejected, not
+	// renormalized into noise.
+	{
+		const int32_t d = 4;
+		AlignedBuf rows(2 * d * sizeof(float));
+		rows.F32()[0] = 1.0f;
+		rows.F32()[d] = -1.0f;
+		BankView v;
+		v.rows = rows.ptr;
+		v.count = 2;
+		v.dims = d;
+		v.paddedDims = d;
+		v.quant = Quantization::Float32;
+		v.metric = Metric::Cosine;
+		AlignedBuf out(d * sizeof(float));
+		const int32_t both[2] = {0, 1};
+		CHECK(MakeCentroid(v, both, 2, out.F32()) == Status::ZeroNormQuery);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T15 — direction helper (plan 18.1): normalize(a - b), hand-checked; a == b rejected.
+
+static void TestDirection()
+{
+	const int32_t d = 4;
+	alignas(16) float a[4] = {1.0f, 2.0f, 2.0f, 0.0f};
+	alignas(16) float b[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	alignas(16) float out[4];
+
+	CHECK(MakeDirection(a, b, d, d, out) == Status::Ok);
+	const float inv = 1.0f / std::sqrt(8.0f);
+	CHECK(std::fabs(out[0] - 0.0f) <= 1e-7f);
+	CHECK(std::fabs(out[1] - 2.0f * inv) <= 1e-6f);
+	CHECK(std::fabs(out[2] - 2.0f * inv) <= 1e-6f);
+	CHECK(std::fabs(out[3] - 0.0f) <= 1e-7f);
+
+	double norm = 0.0;
+	for (int32_t j = 0; j < d; ++j)
+	{
+		norm += static_cast<double>(out[j]) * out[j];
+	}
+	CHECK(std::fabs(norm - 1.0) <= 1e-6);
+
+	CHECK(MakeDirection(a, a, d, d, out) == Status::ZeroNormQuery);
+	CHECK(MakeDirection(a, b, d, d, nullptr) == Status::InvalidArgument);
+	CHECK(MakeDirection(a, b, 0, d, out) == Status::InvalidArgument);
+}
+
+// ---------------------------------------------------------------------------
+// T16 — per-query metric override (plan 18.1): ScoreAs::Dot on an L2 bank is
+// bit-identical to scoring the same data through a Dot-metric view; identity on
+// Dot/Cosine banks; batch equals singles under the override; bank rules hold.
+
+static void TestScoreAsOverride()
+{
+	Rng rng(0x5C04EA50ull);
+	const int32_t dims = 20;
+	const int32_t count = 300;
+	const int32_t k = 12;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, count, dims, quant, metric);
+			const int32_t pd = bank.view.paddedDims;
+			AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+			std::vector<float> qv(static_cast<size_t>(dims));
+			for (auto& x : qv)
+			{
+				x = rng.NextFloat();
+			}
+			PadQuery(qv, pd, q.F32());
+
+			QueryParams overrideParams;
+			overrideParams.k = k;
+			overrideParams.scoreAs = ScoreAs::Dot;
+
+			Workspace ws;
+			std::vector<Hit> got(static_cast<size_t>(k));
+			int32_t gotCount = 0;
+			CHECK(Query(bank.view, q.F32(), overrideParams, ws, got.data(), &gotCount) ==
+				Status::Ok);
+
+			// Reference: the same payload viewed as a Dot bank, default params.
+			BankView dotView = bank.view;
+			dotView.metric = Metric::Dot;
+			QueryParams plain;
+			plain.k = k;
+			Workspace ws2;
+			std::vector<Hit> ref(static_cast<size_t>(k));
+			int32_t refCount = 0;
+			CHECK(Query(dotView, q.F32(), plain, ws2, ref.data(), &refCount) == Status::Ok);
+
+			CHECK(gotCount == refCount);
+			for (int32_t i = 0; i < gotCount && i < refCount; ++i)
+			{
+				CHECK(got[i].index == ref[i].index && got[i].score == ref[i].score);
+			}
+
+			// Identity on Dot/Cosine banks: override equals default, bit-identical.
+			if (metric != Metric::L2)
+			{
+				Workspace ws3;
+				std::vector<Hit> plainHits(static_cast<size_t>(k));
+				int32_t plainCount = 0;
+				CHECK(Query(bank.view, q.F32(), plain, ws3, plainHits.data(), &plainCount) ==
+					Status::Ok);
+				CHECK(plainCount == gotCount);
+				for (int32_t i = 0; i < gotCount && i < plainCount; ++i)
+				{
+					CHECK(got[i].index == plainHits[i].index &&
+						got[i].score == plainHits[i].score);
+				}
+			}
+
+			// Batch under the override equals singles under the override, bit-identical.
+			const int32_t m = 5;
+			AlignedBuf batch(static_cast<size_t>(m) * pd * sizeof(float));
+			for (int32_t qi = 0; qi < m; ++qi)
+			{
+				std::vector<float> row(static_cast<size_t>(dims));
+				for (auto& x : row)
+				{
+					x = rng.NextFloat();
+				}
+				PadQuery(row, pd, batch.F32() + static_cast<int64_t>(qi) * pd);
+			}
+			Workspace wsB;
+			std::vector<Hit> bHits(static_cast<size_t>(m) * k);
+			std::vector<int32_t> bCounts(static_cast<size_t>(m));
+			CHECK(QueryBatch(bank.view, batch.F32(), m, overrideParams, wsB, bHits.data(),
+				bCounts.data()) == Status::Ok);
+			for (int32_t qi = 0; qi < m; ++qi)
+			{
+				Workspace wsS;
+				std::vector<Hit> sHits(static_cast<size_t>(k));
+				int32_t sCount = 0;
+				CHECK(Query(bank.view, batch.F32() + static_cast<int64_t>(qi) * pd,
+					overrideParams, wsS, sHits.data(), &sCount) == Status::Ok);
+				CHECK(sCount == bCounts[static_cast<size_t>(qi)]);
+				for (int32_t i = 0; i < sCount; ++i)
+				{
+					const Hit& bh = bHits[static_cast<size_t>(qi) * k + i];
+					CHECK(bh.index == sHits[i].index && bh.score == sHits[i].score);
+				}
+			}
+		}
+	}
+
+	// Bank rules survive the override: a zero-norm query on a Cosine bank is rejected
+	// under ScoreAs::Dot exactly as without it.
+	{
+		TestBank bank(rng, 8, dims, Quantization::Float32, Metric::Cosine);
+		AlignedBuf zq(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+		QueryParams p;
+		p.k = 3;
+		p.scoreAs = ScoreAs::Dot;
+		Workspace ws;
+		Hit h[3];
+		int32_t n = 0;
+		CHECK(Query(bank.view, zq.F32(), p, ws, h, &n) == Status::ZeroNormQuery);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T17 — margin (plan 18.1): better-direction gap, non-negative on sorted output,
+// exact against hit scores, both metric directions.
+
+static void TestMargin()
+{
+	// Hand case, Dot: scores 2 then 1 give margin 1. L2: 1 then 2 give margin 1.
+	CHECK(Margin(Hit{0, 2.0f}, Hit{1, 1.0f}, Metric::Dot) == 1.0f);
+	CHECK(Margin(Hit{0, 1.0f}, Hit{1, 2.0f}, Metric::L2) == 1.0f);
+
+	Rng rng(0xA46177ull);
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, 120, 16, quant, metric);
+			AlignedBuf q(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+			std::vector<float> qv(16);
+			for (auto& x : qv)
+			{
+				x = rng.NextFloat();
+			}
+			PadQuery(qv, bank.view.paddedDims, q.F32());
+
+			QueryParams p;
+			p.k = 8;
+			Workspace ws;
+			Hit hits[8];
+			int32_t n = 0;
+			CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok);
+			const Metric scored = ScoringMetric(bank.view, p);
+			for (int32_t i = 0; i + 1 < n; ++i)
+			{
+				const float gap = Margin(hits[i], hits[i + 1], scored);
+				CHECK_MSG(gap >= 0.0f, "negative margin %g at %d", gap, i);
+				const float expect = scored == Metric::L2
+					? hits[i + 1].score - hits[i].score
+					: hits[i].score - hits[i + 1].score;
+				CHECK(gap == expect);
+			}
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -948,6 +1223,10 @@ int main()
 	TestAllocationFlat();
 	TestBatchEquivalence();
 	TestRepeatDeterminism();
+	TestCentroid();
+	TestDirection();
+	TestScoreAsOverride();
+	TestMargin();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

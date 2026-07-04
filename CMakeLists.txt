@@ -11,6 +11,7 @@ add_library(superfaiss STATIC
 	src/validate.cpp
 	src/bake.cpp
 	src/query.cpp
+	src/compose.cpp
 )
 target_include_directories(superfaiss PUBLIC include)
 

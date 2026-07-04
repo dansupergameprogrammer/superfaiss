@@ -25,11 +25,17 @@ Status Query(
 		return Status::Ok;
 	}
 
+	// Validation applies the bank's own rules regardless of any scoring override
+	// (a Cosine bank rejects zero-norm queries under ScoreAs::Dot too); scoring and
+	// hit ordering then run against the effective view.
 	const Status queryStatus = ValidateQuery(bank, paddedQuery);
 	if (queryStatus != Status::Ok)
 	{
 		return queryStatus;
 	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
 
 	if (!workspace.Reserve(params.k, 1))
 	{
@@ -37,12 +43,12 @@ Status Query(
 	}
 
 	TopK topk;
-	topk.Init(workspace.HeapStorage(0), params.k, bank.metric);
+	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
 
-	const int32_t chunks = ChunkCount(bank);
+	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		ScoreChunk(bank, paddedQuery, c, params.excludeBits, topk);
+		ScoreChunk(scoring, paddedQuery, c, params.excludeBits, topk);
 	}
 
 	*outCount = topk.Finalize(outHits);
@@ -70,6 +76,7 @@ namespace
 		{
 			topks[m].Init(workspace.HeapStorage(m), params.k, bank.metric);
 		}
+		// Callers pass the effective (already override-resolved) view; see QueryBatch.
 
 		// Chunk loop outermost (cache amortization); queries processed in pairs so the
 		// pair kernels share each row's loads and widening.
@@ -128,6 +135,8 @@ Status QueryBatch(
 		return Status::Ok;
 	}
 
+	// Bank-rule validation, then the effective override-resolved view for scoring —
+	// same contract as Query.
 	for (int32_t m = 0; m < queryCount; ++m)
 	{
 		const Status queryStatus =
@@ -137,6 +146,9 @@ Status QueryBatch(
 			return queryStatus;
 		}
 	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
 
 	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
 	if (!workspace.Reserve(params.k, maxWidth))
@@ -149,7 +161,7 @@ Status QueryBatch(
 		const int32_t width =
 			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
 		QuerySubBatch(
-			bank,
+			scoring,
 			paddedQueries + static_cast<int64_t>(base) * bank.paddedDims,
 			width,
 			params,

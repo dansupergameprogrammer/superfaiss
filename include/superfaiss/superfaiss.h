@@ -11,3 +11,4 @@
 #include "validate.h"
 #include "bake.h"
 #include "query.h"
+#include "compose.h"
