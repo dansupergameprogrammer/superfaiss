@@ -4,7 +4,8 @@ The library is deliberately incomplete: it has **no threads, no I/O, no JSON par
 and no allocator opinions**. Those seams are where your engine plugs in. This guide
 covers each seam, the build flags that keep the determinism promise intact, and the
 performance model that should shape your integration. The reference integration is the
-WizardSimilarity Unreal Engine plugin, which exercises every seam described here.
+SuperFAISS For Unreal Engine plugin (SuperFAISSUnreal), which exercises every seam
+described here.
 
 ## 1. Build
 
