@@ -10,7 +10,7 @@ call %VSDEVCMD% -arch=x64 -no_logo
 pushd %~dp0
 if not exist out mkdir out
 cl /nologo /std:c++17 /O2 /W4 /fp:precise /EHsc /Iinclude ^
-	src\kernels.cpp src\kernels_avx2.cpp src\alloc.cpp src\validate.cpp src\bake.cpp src\query.cpp src\compose.cpp ^
+	src\kernels.cpp src\kernels_avx2.cpp src\alloc.cpp src\validate.cpp src\bake.cpp src\query.cpp src\compose.cpp src\pca.cpp ^
 	tests\test_main.cpp /Fo:out\ /Fe:out\superfaiss_tests.exe
 if errorlevel 1 exit /b 1
 out\superfaiss_tests.exe

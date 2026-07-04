@@ -1427,6 +1427,147 @@ static void TestIntersect()
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T19 — PCA (plan 18.2): power iteration recovers a known dominant direction;
+// components orthonormal; bit-deterministic across runs; projection hand-checked;
+// int8 path dequantizes through scales; degenerate banks yield zero components.
+
+static void TestPca()
+{
+	Rng rng(0x9CA0ull);
+	const int32_t dims = 12;
+	const int32_t count = 300;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		// Rows: large spread along axis 0, small noise elsewhere — PC1 must align
+		// with e0 up to sign.
+		std::vector<float> src(static_cast<size_t>(count) * dims);
+		for (int32_t r = 0; r < count; ++r)
+		{
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				src[static_cast<size_t>(r) * dims + j] =
+					j == 0 ? 4.0f * rng.NextFloat() : 0.05f * rng.NextFloat();
+			}
+		}
+		// Build a bank directly from the shaped source.
+		const int32_t pd = PaddedDims(dims, quant);
+		AlignedBuf payload(static_cast<size_t>(count) * pd * ElementSize(quant));
+		std::vector<float> scales;
+		BankView view;
+		view.count = count;
+		view.dims = dims;
+		view.paddedDims = pd;
+		view.quant = quant;
+		view.metric = Metric::Dot;
+		if (quant == Quantization::Float32)
+		{
+			PadRowsFloat32(src.data(), count, dims, pd, payload.F32());
+			view.rows = payload.ptr;
+			view.scales = nullptr;
+		}
+		else
+		{
+			scales.resize(static_cast<size_t>(count));
+			QuantizeRowsInt8(src.data(), count, dims, pd, payload.I8(), scales.data());
+			view.rows = payload.ptr;
+			view.scales = scales.data();
+		}
+
+		std::vector<float> mean(static_cast<size_t>(dims));
+		std::vector<float> comps(static_cast<size_t>(2) * dims);
+		std::vector<float> scratch(static_cast<size_t>(dims));
+		CHECK(ComputePrincipalComponents(view, 2, 48, mean.data(), comps.data(),
+			scratch.data()) == Status::Ok);
+
+		// PC1 aligns with e0 (up to sign).
+		CHECK_MSG(std::fabs(comps[0]) > 0.99,
+			"PC1 axis-0 loading %.6f", comps[0]);
+
+		// Orthonormal: unit norms, near-zero mutual dot.
+		double n1 = 0.0, n2 = 0.0, dot12 = 0.0;
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			n1 += static_cast<double>(comps[j]) * comps[j];
+			n2 += static_cast<double>(comps[dims + j]) * comps[dims + j];
+			dot12 += static_cast<double>(comps[j]) * comps[dims + j];
+		}
+		CHECK(std::fabs(n1 - 1.0) <= 1e-5);
+		CHECK(std::fabs(n2 - 1.0) <= 1e-5);
+		CHECK(std::fabs(dot12) <= 1e-4);
+
+		// Bit-deterministic: a second run is identical.
+		std::vector<float> mean2(static_cast<size_t>(dims));
+		std::vector<float> comps2(static_cast<size_t>(2) * dims);
+		CHECK(ComputePrincipalComponents(view, 2, 48, mean2.data(), comps2.data(),
+			scratch.data()) == Status::Ok);
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			CHECK(mean[j] == mean2[j]);
+			CHECK(comps[j] == comps2[j] && comps[dims + j] == comps2[dims + j]);
+		}
+
+		// Projection: coordinate of row r on PC1 equals the hand dot product.
+		std::vector<float> coords(static_cast<size_t>(count) * 2);
+		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), 2,
+			coords.data()) == Status::Ok);
+		{
+			const int32_t r = 7;
+			double expect = 0.0;
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				double e = 0.0;
+				if (quant == Quantization::Int8)
+				{
+					const int8_t* row = static_cast<const int8_t*>(view.rows) +
+						static_cast<int64_t>(r) * pd;
+					e = static_cast<double>(row[j]) * scales[r];
+				}
+				else
+				{
+					const float* row = static_cast<const float*>(view.rows) +
+						static_cast<int64_t>(r) * pd;
+					e = row[j];
+				}
+				expect += (e - mean[j]) * comps[j];
+			}
+			CHECK_MSG(std::fabs(coords[static_cast<size_t>(r) * 2] - expect) <=
+				1e-4 * (1.0 + std::fabs(expect)),
+				"projection %.9g expect %.9g", coords[static_cast<size_t>(r) * 2], expect);
+		}
+	}
+
+	// Degenerate: identical rows — zero variance — components come back zero.
+	{
+		const int32_t d = 8;
+		const int32_t n = 10;
+		const int32_t pd = PaddedDims(d, Quantization::Float32);
+		std::vector<float> src(static_cast<size_t>(n) * d, 0.5f);
+		AlignedBuf payload(static_cast<size_t>(n) * pd * sizeof(float));
+		PadRowsFloat32(src.data(), n, d, pd, payload.F32());
+		BankView view;
+		view.rows = payload.ptr;
+		view.count = n;
+		view.dims = d;
+		view.paddedDims = pd;
+		view.quant = Quantization::Float32;
+		view.metric = Metric::Dot;
+		std::vector<float> mean(static_cast<size_t>(d));
+		std::vector<float> comps(static_cast<size_t>(d));
+		std::vector<float> scratch(static_cast<size_t>(d));
+		CHECK(ComputePrincipalComponents(view, 1, 16, mean.data(), comps.data(),
+			scratch.data()) == Status::Ok);
+		double norm = 0.0;
+		for (int32_t j = 0; j < d; ++j)
+		{
+			norm += static_cast<double>(comps[j]) * comps[j];
+		}
+		CHECK(norm == 0.0);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -1447,6 +1588,7 @@ int main()
 	TestScoreAsOverride();
 	TestMargin();
 	TestIntersect();
+	TestPca();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
