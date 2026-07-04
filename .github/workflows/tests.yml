@@ -27,6 +27,17 @@ jobs:
           echo "$out"
           echo "$out" | grep -E "simd path: (sse|avx2)" > /dev/null
 
+  # ThreadSanitizer over the whole suite — the scratch-bank storm test (T-V2-C1)
+  # is the target: single-writer/lock-free-reader races surface here, not on
+  # x86's forgiving memory model (T-044 W5).
+  linux-x64-tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+      - run: cmake --build build
+      - run: ./build/superfaiss_tests
+
   # GitHub macOS runners are Apple Silicon: this executes the NEON path on real ARM.
   macos-arm64:
     runs-on: macos-latest

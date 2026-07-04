@@ -5,9 +5,12 @@
 
 #include "superfaiss/superfaiss.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <thread>
 #include <vector>
 #include <algorithm>
 
@@ -2137,6 +2140,561 @@ static void TestPerChannelCosine()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T22 — scratch banks (V2 plan section 7, T-V2-C): append/remove/snapshot/
+// freeze/serialize, single-writer + lock-free-reader storm, tombstone
+// semantics, zero steady-state allocation. Deterministic-given-history.
+
+namespace
+{
+	// In-memory archive for the persistence seam.
+	struct MemArchive
+	{
+		std::vector<uint8_t> bytes;
+		size_t readPos = 0;
+
+		static bool Write(void* user, const void* data, size_t n)
+		{
+			auto* a = static_cast<MemArchive*>(user);
+			const auto* p = static_cast<const uint8_t*>(data);
+			a->bytes.insert(a->bytes.end(), p, p + n);
+			return true;
+		}
+		static bool Read(void* user, void* data, size_t n)
+		{
+			auto* a = static_cast<MemArchive*>(user);
+			if (a->readPos + n > a->bytes.size())
+			{
+				return false;
+			}
+			std::memcpy(data, a->bytes.data() + a->readPos, n);
+			a->readPos += n;
+			return true;
+		}
+		ScratchArchive Writer() { return {&MemArchive::Write, nullptr, this}; }
+		ScratchArchive Reader() { return {nullptr, &MemArchive::Read, this}; }
+	};
+} // namespace
+
+static void TestScratchBanks()
+{
+	Rng rng(0x5C247C4Bull);
+	const int32_t dims = 48;
+	const int32_t count = 400;
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			// Source rows; Cosine sources keep a non-zero norm by construction of
+			// NextFloat (exact all-zero rows are practically impossible; asserted).
+			std::vector<float> source(static_cast<size_t>(count) * dims);
+			for (auto& v : source)
+			{
+				v = rng.NextFloat();
+			}
+
+			ScratchBank scratch;
+			CHECK(scratch.Create(count, dims, metric, quant) == Status::Ok);
+			for (int32_t r = 0; r < count; ++r)
+			{
+				int32_t index = -1;
+				CHECK(scratch.Append(source.data() + static_cast<size_t>(r) * dims,
+						dims, &index) == Status::Ok);
+				CHECK(index == r);
+			}
+			CHECK(scratch.Count() == count);
+			CHECK(scratch.Append(source.data(), dims, nullptr) == Status::OutOfMemory);
+
+			// Remove a deterministic scatter of rows.
+			int32_t removed = 0;
+			for (int32_t r = 0; r < count; r += 7)
+			{
+				CHECK(scratch.Remove(r) == Status::Ok);
+				++removed;
+			}
+			CHECK(scratch.Remove(3) == Status::Ok); // idempotent-friendly re-remove
+			CHECK(scratch.Remove(3) == Status::Ok);
+			removed += 0; // 3 is 7-aligned? no: count it once below via LiveCount
+			const bool threeWasCounted = (3 % 7) == 0;
+			const int32_t expectLive = count - removed - (threeWasCounted ? 0 : 1);
+			CHECK(scratch.LiveCount() == expectLive);
+			CHECK(scratch.Remove(-1) == Status::InvalidArgument);
+			CHECK(scratch.Remove(count) == Status::InvalidArgument);
+
+			// Snapshot: deletion is exclusion.
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(scratch.Snapshot(&snap, tombs.data()) == Status::Ok);
+			CHECK(snap.count == count);
+			CHECK(ValidateBank(snap) == Status::Ok);
+			CHECK(ValidateBankData(snap, nullptr) == Status::Ok);
+
+			const int32_t pd = snap.paddedDims;
+			std::vector<float> queryRaw(static_cast<size_t>(dims));
+			for (auto& v : queryRaw)
+			{
+				v = rng.NextFloat();
+			}
+			AlignedBuf qbuf(static_cast<size_t>(pd) * sizeof(float));
+			PadQuery(queryRaw, pd, qbuf.F32());
+
+			QueryParams params;
+			params.k = 10;
+			params.excludeBits = tombs.data();
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+			CHECK(n == 10);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				CHECK(!IsExcluded(tombs.data(), hits[i].index));
+			}
+
+			// The segmented path runs on scratch snapshots too: degenerate list is
+			// bit-identical to the plain scan (the compatibility proof on this type).
+			{
+				const QuerySegment degen[1] = {{0, pd, 1.0f}};
+				QueryParams segParams = params;
+				segParams.segments = degen;
+				segParams.segmentCount = 1;
+				Hit segHits[10];
+				int32_t segN = 0;
+				CHECK(Query(snap, qbuf.F32(), segParams, ws, segHits, &segN) == Status::Ok);
+				CHECK(segN == n);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(segHits[i].index == hits[i].index &&
+						segHits[i].score == hits[i].score);
+				}
+			}
+
+			// C2 — freeze ≡ snapshot ≡ equivalent imported bank, bit-identical.
+			{
+				const int32_t live = scratch.FreezeLiveCount();
+				AlignedBuf frozenRows(static_cast<size_t>(live) * pd * ElementSize(quant));
+				std::vector<float> frozenScales(
+					quant == Quantization::Int8 ? static_cast<size_t>(live) : size_t{1});
+				std::vector<int32_t> indexMap(static_cast<size_t>(count), -2);
+				CHECK(scratch.Freeze(frozenRows.ptr,
+						quant == Quantization::Int8 ? frozenScales.data() : nullptr,
+						indexMap.data()) == Status::Ok);
+
+				// The imported twin: bake the live source rows in live order with the
+				// importer's own math; payload must match the frozen payload byte for
+				// byte (per-row normalize/quantize is order-independent, V2-G6).
+				std::vector<float> liveSource;
+				for (int32_t r = 0; r < count; ++r)
+				{
+					if (IsExcluded(tombs.data(), r))
+					{
+						CHECK(indexMap[r] == -1);
+						continue;
+					}
+					CHECK(indexMap[r] >= 0);
+					liveSource.insert(liveSource.end(),
+						source.begin() + static_cast<size_t>(r) * dims,
+						source.begin() + static_cast<size_t>(r + 1) * dims);
+				}
+				if (metric == Metric::Cosine)
+				{
+					CHECK(NormalizeRows(liveSource.data(), live, dims, nullptr) == Status::Ok);
+				}
+				AlignedBuf importedRows(static_cast<size_t>(live) * pd * ElementSize(quant));
+				std::vector<float> importedScales(static_cast<size_t>(live));
+				if (quant == Quantization::Int8)
+				{
+					QuantizeRowsInt8(liveSource.data(), live, dims, pd,
+						importedRows.I8(), importedScales.data());
+					CHECK(std::memcmp(frozenScales.data(), importedScales.data(),
+							static_cast<size_t>(live) * sizeof(float)) == 0);
+				}
+				else
+				{
+					PadRowsFloat32(liveSource.data(), live, dims, pd, importedRows.F32());
+				}
+				CHECK(std::memcmp(frozenRows.ptr, importedRows.ptr,
+						static_cast<size_t>(live) * pd * ElementSize(quant)) == 0);
+
+				// Query the frozen bank: hits are the snapshot's hits renumbered
+				// through the map, scores bit-identical.
+				BankView frozen;
+				frozen.rows = frozenRows.ptr;
+				frozen.scales = quant == Quantization::Int8 ? frozenScales.data() : nullptr;
+				frozen.count = live;
+				frozen.dims = dims;
+				frozen.paddedDims = pd;
+				frozen.quant = quant;
+				frozen.metric = metric;
+				CHECK(ValidateBank(frozen) == Status::Ok);
+				QueryParams fParams;
+				fParams.k = 10;
+				Hit fHits[10];
+				int32_t fN = 0;
+				CHECK(Query(frozen, qbuf.F32(), fParams, ws, fHits, &fN) == Status::Ok);
+				CHECK(fN == n);
+				for (int32_t i = 0; i < n && i < fN; ++i)
+				{
+					CHECK(fHits[i].index == indexMap[hits[i].index]);
+					CHECK(fHits[i].score == hits[i].score);
+				}
+			}
+
+			// C3 — serialize round-trip: identical counts, identical answers.
+			{
+				MemArchive archive;
+				CHECK(scratch.Save(archive.Writer()) == Status::Ok);
+
+				ScratchBank loaded;
+				CHECK(loaded.Load(archive.Reader()) == Status::Ok);
+				CHECK(loaded.Count() == scratch.Count());
+				CHECK(loaded.LiveCount() == scratch.LiveCount());
+				BankView lsnap;
+				std::vector<uint32_t> ltombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(loaded.Snapshot(&lsnap, ltombs.data()) == Status::Ok);
+				CHECK(ltombs == tombs);
+				QueryParams lParams;
+				lParams.k = 10;
+				lParams.excludeBits = ltombs.data();
+				Hit lHits[10];
+				int32_t lN = 0;
+				CHECK(Query(lsnap, qbuf.F32(), lParams, ws, lHits, &lN) == Status::Ok);
+				CHECK(lN == n);
+				for (int32_t i = 0; i < n && i < lN; ++i)
+				{
+					CHECK(lHits[i].index == hits[i].index && lHits[i].score == hits[i].score);
+				}
+
+				// Corrupt magic → BadFormat, and the target bank is left unchanged.
+				MemArchive bad;
+				bad.bytes = archive.bytes;
+				bad.bytes[0] ^= 0xFF;
+				CHECK(loaded.Load(bad.Reader()) == Status::BadFormat);
+				CHECK(loaded.Count() == scratch.Count());
+
+				// Truncated payload → BadFormat.
+				MemArchive trunc;
+				trunc.bytes.assign(archive.bytes.begin(),
+					archive.bytes.begin() + static_cast<long>(archive.bytes.size() / 2));
+				CHECK(loaded.Load(trunc.Reader()) == Status::BadFormat);
+
+				// A tombstone bit at/above count → BadFormat (corrupt archive).
+				// count (400) is not a multiple of 32, so the last word has dead bits.
+				{
+					MemArchive tainted;
+					tainted.bytes = archive.bytes;
+					uint8_t* last = tainted.bytes.data() + tainted.bytes.size() - 1;
+					*last |= 0x80; // top bit of the last tombstone word
+					CHECK(loaded.Load(tainted.Reader()) == Status::BadFormat);
+				}
+			}
+
+			// C4 — tombstone semantics: a snapshot taken BEFORE a remove still
+			// returns the row (snapshot-consistent, not preemptive); one taken after
+			// excludes it.
+			{
+				const int32_t victim = hits[0].index;
+				BankView before;
+				std::vector<uint32_t> beforeTombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(scratch.Snapshot(&before, beforeTombs.data()) == Status::Ok);
+				CHECK(scratch.Remove(victim) == Status::Ok);
+
+				QueryParams bParams;
+				bParams.k = 10;
+				bParams.excludeBits = beforeTombs.data();
+				Hit bHits[10];
+				int32_t bN = 0;
+				CHECK(Query(before, qbuf.F32(), bParams, ws, bHits, &bN) == Status::Ok);
+				CHECK(bN == n && bHits[0].index == victim); // pre-remove snapshot: still there
+
+				BankView after;
+				std::vector<uint32_t> afterTombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(scratch.Snapshot(&after, afterTombs.data()) == Status::Ok);
+				QueryParams aParams;
+				aParams.k = 10;
+				aParams.excludeBits = afterTombs.data();
+				Hit aHits[10];
+				int32_t aN = 0;
+				CHECK(Query(after, qbuf.F32(), aParams, ws, aHits, &aN) == Status::Ok);
+				for (int32_t i = 0; i < aN; ++i)
+				{
+					CHECK(aHits[i].index != victim);
+				}
+			}
+
+			// Grow preserves indices (T-044 W4): same hits, same scores, then room
+			// for more rows.
+			{
+				BankView preGrow;
+				std::vector<uint32_t> preTombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(scratch.Snapshot(&preGrow, preTombs.data()) == Status::Ok);
+				QueryParams gParams;
+				gParams.k = 10;
+				gParams.excludeBits = preTombs.data();
+				Hit preHits[10];
+				int32_t preN = 0;
+				CHECK(Query(preGrow, qbuf.F32(), gParams, ws, preHits, &preN) == Status::Ok);
+
+				CHECK(scratch.Grow(count) == Status::InvalidArgument);
+				CHECK(scratch.Grow(count + 32) == Status::Ok);
+				CHECK(scratch.Capacity() == count + 32);
+				CHECK(scratch.Count() == count);
+
+				BankView postGrow;
+				std::vector<uint32_t> postTombs(
+					ScratchBank::TombstoneWords(count + 32), 0u);
+				CHECK(scratch.Snapshot(&postGrow, postTombs.data()) == Status::Ok);
+				QueryParams pParams;
+				pParams.k = 10;
+				pParams.excludeBits = postTombs.data();
+				Hit postHits[10];
+				int32_t postN = 0;
+				CHECK(Query(postGrow, qbuf.F32(), pParams, ws, postHits, &postN) == Status::Ok);
+				CHECK(postN == preN);
+				for (int32_t i = 0; i < preN && i < postN; ++i)
+				{
+					CHECK(postHits[i].index == preHits[i].index &&
+						postHits[i].score == preHits[i].score);
+				}
+				int32_t grown = -1;
+				CHECK(scratch.Append(source.data(), dims, &grown) == Status::Ok);
+				CHECK(grown == count);
+			}
+		}
+	}
+
+	// Append rejections.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(4, 8, Metric::Cosine, Quantization::Float32) == Status::Ok);
+		float row[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+		CHECK(bank.Append(row, 4, nullptr) == Status::DimsMismatch);
+		float nan[8] = {};
+		nan[3] = std::numeric_limits<float>::quiet_NaN();
+		CHECK(bank.Append(nan, 8, nullptr) == Status::NonFiniteQuery);
+		float zero[8] = {};
+		CHECK(bank.Append(zero, 8, nullptr) == Status::ZeroNormRow);
+		CHECK(bank.Count() == 0);
+		CHECK(bank.Append(row, 8, nullptr) == Status::Ok);
+		// The caller's buffer is never normalized in place.
+		CHECK(row[0] == 1.0f && row[7] == 8.0f);
+		CHECK(bank.Create(4, 8, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument); // double-create
+	}
+
+	// C5 — zero allocation after arena creation: appends, removes, snapshots, and
+	// warm queries allocate nothing; both counters stay flat.
+	{
+		const int32_t cap = 128;
+		ScratchBank bank;
+		CHECK(bank.Create(cap, dims, Metric::Dot, Quantization::Float32) == Status::Ok);
+		std::vector<float> rows(static_cast<size_t>(cap) * dims);
+		for (auto& v : rows)
+		{
+			v = rng.NextFloat();
+		}
+		const int32_t pd = PaddedDims(dims, Quantization::Float32);
+		AlignedBuf qbuf(static_cast<size_t>(pd) * sizeof(float));
+		std::vector<float> queryRaw(rows.begin(), rows.begin() + dims);
+		PadQuery(queryRaw, pd, qbuf.F32());
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(cap), 0u);
+		Workspace ws;
+		CHECK(ws.Reserve(10, 1));
+
+		// Warm one full cycle, then assert flat.
+		int32_t idx = -1;
+		CHECK(bank.Append(rows.data(), dims, &idx) == Status::Ok);
+		const uint64_t allocsBefore = AllocationCount();
+		const uint64_t growthBefore = ws.GrowthCount();
+		BankView snap;
+		Hit hits[10];
+		int32_t n = 0;
+		for (int32_t r = 1; r < cap; ++r)
+		{
+			CHECK(bank.Append(rows.data() + static_cast<size_t>(r) * dims, dims, &idx)
+				== Status::Ok);
+			if ((r & 3) == 0)
+			{
+				CHECK(bank.Remove(r) == Status::Ok);
+			}
+			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			QueryParams params;
+			params.k = 10;
+			params.excludeBits = tombs.data();
+			CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		}
+		CHECK_MSG(AllocationCount() == allocsBefore,
+			"scratch steady state allocated: %llu -> %llu",
+			static_cast<unsigned long long>(allocsBefore),
+			static_cast<unsigned long long>(AllocationCount()));
+		CHECK(ws.GrowthCount() == growthBefore);
+	}
+
+	// C1 — storm: one writer appending and removing, lock-free readers
+	// snapshotting and querying concurrently. Every reader result must equal its
+	// serial twin computed from the same snapshot (deterministic given history);
+	// CHECK is main-thread-only, so readers tally violations locally.
+	{
+		const int32_t cap = 2000;
+		const int32_t stormDims = 32;
+		ScratchBank bank;
+		CHECK(bank.Create(cap, stormDims, Metric::Cosine, Quantization::Int8) == Status::Ok);
+
+		std::vector<float> rows(static_cast<size_t>(cap) * stormDims);
+		{
+			Rng stormRng(0x570A11ull);
+			for (auto& v : rows)
+			{
+				v = stormRng.NextFloat();
+			}
+		}
+		const int32_t pd = PaddedDims(stormDims, Quantization::Int8);
+		AlignedBuf qbuf(static_cast<size_t>(pd) * sizeof(float));
+		std::vector<float> queryRaw(rows.begin(), rows.begin() + stormDims);
+		PadQuery(queryRaw, pd, qbuf.F32());
+
+		std::atomic<bool> done{false};
+		std::atomic<int32_t> readersReady{0};
+		std::atomic<int64_t> readerViolations{0};
+		std::atomic<int64_t> readerQueries{0};
+
+		auto readerFn = [&]() {
+			Workspace myWs;
+			myWs.Reserve(5, 1);
+			std::vector<uint32_t> myTombs(ScratchBank::TombstoneWords(cap), 0u);
+			readersReady.fetch_add(1, std::memory_order_release);
+			Hit a[5], b[5];
+			int64_t bad = 0, ran = 0;
+			while (!done.load(std::memory_order_acquire))
+			{
+				BankView snap;
+				if (bank.Snapshot(&snap, myTombs.data()) != Status::Ok)
+				{
+					++bad;
+					continue;
+				}
+				if (snap.count == 0)
+				{
+					continue;
+				}
+				QueryParams params;
+				params.k = 5;
+				params.excludeBits = myTombs.data();
+				int32_t na = 0, nb = 0;
+				// The serial twin: the same snapshot queried twice must agree
+				// bitwise — the snapshot is immutable, so any divergence means a
+				// torn read of scratch state.
+				if (Query(snap, qbuf.F32(), params, myWs, a, &na) != Status::Ok ||
+					Query(snap, qbuf.F32(), params, myWs, b, &nb) != Status::Ok)
+				{
+					++bad;
+					continue;
+				}
+				if (na != nb)
+				{
+					++bad;
+				}
+				else
+				{
+					for (int32_t i = 0; i < na; ++i)
+					{
+						if (a[i].index != b[i].index || a[i].score != b[i].score ||
+							a[i].index >= snap.count ||
+							IsExcluded(myTombs.data(), a[i].index))
+						{
+							++bad;
+						}
+					}
+				}
+				++ran;
+			}
+			readerViolations.fetch_add(bad, std::memory_order_relaxed);
+			readerQueries.fetch_add(ran, std::memory_order_relaxed);
+		};
+
+		std::thread readers[3] = {
+			std::thread(readerFn), std::thread(readerFn), std::thread(readerFn)};
+
+		// Writer: append everything, removing a scatter as it goes. Wait for the
+		// readers first so the storm actually overlaps (an unsynchronized writer
+		// finishes 2000 appends before the OS even schedules the reader threads).
+		while (readersReady.load(std::memory_order_acquire) < 3)
+		{
+			std::this_thread::yield();
+		}
+		Rng removeRng(0xDE1E7Eull);
+		for (int32_t r = 0; r < cap; ++r)
+		{
+			int32_t idx = -1;
+			if (bank.Append(rows.data() + static_cast<size_t>(r) * stormDims,
+					stormDims, &idx) != Status::Ok ||
+				idx != r)
+			{
+				readerViolations.fetch_add(1, std::memory_order_relaxed);
+				break;
+			}
+			if ((removeRng.Next() & 7) == 0)
+			{
+				if (bank.Remove(removeRng.NextIndex(r + 1)) != Status::Ok)
+				{
+					readerViolations.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+		done.store(true, std::memory_order_release);
+		for (auto& t : readers)
+		{
+			t.join();
+		}
+		CHECK_MSG(readerViolations.load() == 0, "storm violations: %lld",
+			static_cast<long long>(readerViolations.load()));
+		CHECK_MSG(readerQueries.load() > 0, "storm readers never ran a query");
+		CHECK(bank.Count() == cap);
+
+		// Post-storm: the final state equals the serial twin — a fresh bank built
+		// from the same history answers bit-identically.
+		{
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(cap), 0u);
+			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+			ScratchBank serial;
+			CHECK(serial.Create(cap, stormDims, Metric::Cosine, Quantization::Int8)
+				== Status::Ok);
+			Rng replayRng(0xDE1E7Eull);
+			for (int32_t r = 0; r < cap; ++r)
+			{
+				CHECK(serial.Append(rows.data() + static_cast<size_t>(r) * stormDims,
+						stormDims, nullptr) == Status::Ok);
+				if ((replayRng.Next() & 7) == 0)
+				{
+					CHECK(serial.Remove(replayRng.NextIndex(r + 1)) == Status::Ok);
+				}
+			}
+			BankView twin;
+			std::vector<uint32_t> twinTombs(ScratchBank::TombstoneWords(cap), 0u);
+			CHECK(serial.Snapshot(&twin, twinTombs.data()) == Status::Ok);
+			CHECK(twinTombs == tombs);
+
+			Workspace ws;
+			QueryParams params;
+			params.k = 20;
+			params.excludeBits = tombs.data();
+			Hit sa[20], sb[20];
+			int32_t na = 0, nb = 0;
+			CHECK(Query(snap, qbuf.F32(), params, ws, sa, &na) == Status::Ok);
+			params.excludeBits = twinTombs.data();
+			CHECK(Query(twin, qbuf.F32(), params, ws, sb, &nb) == Status::Ok);
+			CHECK(na == nb);
+			for (int32_t i = 0; i < na && i < nb; ++i)
+			{
+				CHECK(sa[i].index == sb[i].index && sa[i].score == sb[i].score);
+			}
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -2160,6 +2718,7 @@ int main()
 	TestPca();
 	TestSegmentedScan();
 	TestPerChannelCosine();
+	TestScratchBanks();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

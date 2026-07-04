@@ -13,3 +13,4 @@
 #include "query.h"
 #include "compose.h"
 #include "pca.h"
+#include "scratch.h"

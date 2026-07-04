@@ -57,6 +57,18 @@ pure-integer scoring path — a planned extension, not present in v1.0. Note tha
 are fixed hardware: "per device" is effectively "per SKU" there, which is the strong
 version of the promise.
 
+## 2b. Scratch banks: determinism given history
+
+A scratch bank (v2.0) extends the guarantee to mutable state: **the same
+append/remove sequence followed by the same query yields bit-identical results
+per device.** Rows are normalized and quantized at append with the exact math
+the importer uses (int8 quantization is per-row and standalone), so a snapshot
+of a scratch bank scores bit-identically to an immutable bank baked from the
+same live rows — and `Freeze()` produces exactly that bank, byte for byte.
+Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
+after the `Remove`, and a snapshot, once taken, is immutable — querying it
+twice is bit-identical regardless of concurrent writer activity.
+
 ## 3. Embedder obligations
 
 1. **Do not let your compiler contract the float math.** Implicit FMA contraction in

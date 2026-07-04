@@ -98,6 +98,38 @@ serial `Query` in any list order (see [DETERMINISM.md](DETERMINISM.md)). Kernels
 re-validate; gate inputs first. `ActiveSimdPath()` reports Scalar/SSE/AVX2/NEON.
 `detail::*Mirror` functions expose the scalar mirrors for equality testing.
 
+## scratch.h — mutable banks (v2.0)
+
+```cpp
+class ScratchBank {              // single writer, lock-free readers
+    Status Create(int32_t capacity, int32_t dims, Metric, Quantization,
+                  const Allocator& = DefaultAllocator());   // ONE arena allocation
+    Status Append(const float* row, int32_t dims, int32_t* outIndex);
+    Status Remove(int32_t index);                 // atomic tombstone; idempotent
+    Status Snapshot(BankView* outView, uint32_t* outTombstones) const;
+    Status Grow(int32_t newCapacity);             // EXCLUSIVE; preserves indices
+    int32_t FreezeLiveCount() const;
+    Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap) const;
+    Status Save(const ScratchArchive&) const;     // writer-side
+    Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE
+    int32_t Count(); int32_t LiveCount(); int32_t Capacity();
+    static int32_t TombstoneWords(int32_t count);
+};
+struct ScratchArchive { bool(*write)(void*, const void*, size_t); bool(*read)(void*, void*, size_t); void* user; };
+```
+
+A snapshot IS a `BankView` — every query entry point works on it unchanged.
+Deletion is exclusion: OR (or pass) the snapshot's tombstone words as
+`QueryParams::excludeBits`. Append validates like the importer (finite, dims
+match; Cosine normalizes and rejects zero-norm; int8 quantizes per-row), writes
+the row, then publishes the count with a store-release — readers never see a
+partial row. Removal is snapshot-consistent, not mid-scan-preemptive. `Grow`
+preserves indices (saved indices are the consumer contract); `Freeze` compacts
+and renumbers, returning the old→new map so consumers remap stored handles.
+Zero steady-state allocation: everything lives in the arena from `Create`.
+Archive format: [FORMAT.md](FORMAT.md) section 3; concurrency guarantees:
+[DETERMINISM.md](DETERMINISM.md) section 2b.
+
 ## alloc.h — memory policy
 
 ```cpp

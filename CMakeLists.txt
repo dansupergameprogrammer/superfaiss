@@ -13,6 +13,7 @@ add_library(superfaiss STATIC
 	src/query.cpp
 	src/compose.cpp
 	src/pca.cpp
+	src/scratch.cpp
 )
 target_include_directories(superfaiss PUBLIC include)
 
@@ -34,7 +35,8 @@ else()
 endif()
 
 add_executable(superfaiss_tests tests/test_main.cpp)
-target_link_libraries(superfaiss_tests PRIVATE superfaiss)
+find_package(Threads REQUIRED)
+target_link_libraries(superfaiss_tests PRIVATE superfaiss Threads::Threads)
 if(MSVC)
 	target_compile_options(superfaiss_tests PRIVATE /W4 /fp:precise)
 else()

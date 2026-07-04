@@ -92,7 +92,32 @@ kernel (a NaN score would break the ranking's total order).
 `dot`/`cosine`: higher is better. `l2`: the score is the **squared** L2 distance;
 lower is better. Ties rank by ascending row index, always.
 
-## 3. Forward compatibility
+## 3. Scratch-bank archives (v2.0)
+
+`ScratchBank::Save`/`Load` stream a self-contained snapshot of a scratch bank
+through the caller-provided `ScratchArchive` seam (the caller owns the medium —
+file, save-game blob, network; the bank owns the format):
+
+| Field | Type | Notes |
+|---|---|---|
+| magic | u32 | `0x42535346` |
+| version | u32 | `1` |
+| capacity | i32 | arena capacity restored on load |
+| count | i32 | published rows; `0 <= count <= capacity` |
+| dims | i32 | logical dims |
+| paddedDims | i32 | must equal `PaddedDims(dims, quant)` |
+| metric, quant | u8, u8 | enum values; 6 reserved bytes follow |
+| rows | payload | `count x paddedDims` elements, baked layout (section 2) |
+| scales | f32[count] | int8 banks only |
+| tombstones | u32[ceil(count/32)] | bit set = removed row |
+
+Load is reject-over-degrade: a bad magic/version, inconsistent header,
+truncated payload, tombstone bit at or above `count`, or content that fails
+bank-data validation rejects the archive and leaves the existing bank
+unchanged. Byte order is the host's; archives are save-game-grade state, not a
+cross-endian interchange format (the `.wvbank` sidecar is the interchange).
+
+## 4. Forward compatibility
 
 Consumers embedding this format in their own asset containers should reserve a
 versioned, skippable block for future index structures (approximate-search
