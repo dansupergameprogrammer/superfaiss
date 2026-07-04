@@ -1176,4 +1176,673 @@ float DecomposeRowScore(
 		kernels, isL2, isInt8, rowInvNorms, outContributions);
 }
 
+// ---------------------------------------------------------------------------
+// v2.2 cross-device exactness (plan section 19)
+//
+// The float kernels above are per-device exact; their cross-device hazard is
+// reduction shape (8-lane AVX2, 4-lane NEON/SSE, 1-lane scalar sum in different
+// orders). The CrossDevice mode removes the hazard at the root: scoring
+// accumulates in integers (associative - any width, same sums), and everything
+// after the integer sums is one fixed-order double-precision expression per row,
+// ending in the subnormal-floor contract (|score| < FLT_MIN is exactly 0.0f).
+// Doubles are used because every intermediate value in the epilogue is provably a
+// normal double, so per-thread FTZ state can never flush one; float inputs (bank
+// scales, channel inverse sub-norms, segment weights, biases) are decoded from
+// their bit patterns so per-thread DAZ state can never flush one either.
+
+namespace detail
+{
+
+double FloatBitsToDouble(float v)
+{
+	uint32_t b;
+	std::memcpy(&b, &v, sizeof(b));
+	if ((b & 0x7f800000u) != 0)
+	{
+		// Normal (or Inf/NaN): the plain conversion is exact and DAZ-immune.
+		return static_cast<double>(v);
+	}
+	// Zero or subnormal: value = mantissa * 2^-149, exact in double (and a normal
+	// double, or zero), built without touching the FP unit's denormal handling.
+	const double m = static_cast<double>(static_cast<int32_t>(b & 0x7fffffu)) * 0x1p-149;
+	return (b >> 31) != 0 ? -m : m;
+}
+
+int32_t RoundHalfEvenI32(double v)
+{
+	uint64_t bits;
+	std::memcpy(&bits, &v, sizeof(bits));
+	const bool neg = (bits >> 63) != 0;
+	const int32_t exp = static_cast<int32_t>((bits >> 52) & 0x7ff) - 1023;
+	uint64_t mant = bits & 0xfffffffffffffull;
+	if (exp < -1)
+	{
+		return 0; // |v| < 0.5 (covers zero and subnormal doubles)
+	}
+	if (exp == -1)
+	{
+		// 0.5 <= |v| < 1: exactly 0.5 rounds to 0 (even); anything above to +/-1.
+		const int32_t r = mant == 0 ? 0 : 1;
+		return neg ? -r : r;
+	}
+	mant |= 1ull << 52; // implicit bit: value = mant * 2^(exp - 52)
+	const int32_t shift = 52 - exp; // caller bounds |v| < 2^31, so shift >= 22
+	const uint64_t whole = mant >> shift;
+	const uint64_t rem = mant & ((1ull << shift) - 1);
+	const uint64_t half = 1ull << (shift - 1);
+	uint64_t rounded = whole;
+	if (rem > half || (rem == half && (whole & 1) != 0))
+	{
+		++rounded;
+	}
+	const int32_t r = static_cast<int32_t>(rounded);
+	return neg ? -r : r;
+}
+
+int32_t DotI8I8Scalar(const int8_t* row, const int8_t* q8, int32_t n)
+{
+	int32_t acc = 0;
+	for (int32_t i = 0; i < n; ++i)
+	{
+		acc += static_cast<int32_t>(row[i]) * q8[i];
+	}
+	return acc;
+}
+
+void L2SumsI8I8Scalar(
+	const int8_t* row, const int8_t* q8, int32_t n, int32_t* outCross, int32_t* outRowSq)
+{
+	int32_t cross = 0;
+	int32_t rowSq = 0;
+	for (int32_t i = 0; i < n; ++i)
+	{
+		const int32_t r = row[i];
+		cross += r * static_cast<int32_t>(q8[i]);
+		rowSq += r * r;
+	}
+	*outCross = cross;
+	*outRowSq = rowSq;
+}
+
+#if defined(SUPERFAISS_SIMD_SSE)
+
+// Defined in kernels_avx2.cpp.
+int32_t DotI8I8Avx2(const int8_t* row, const int8_t* q8, int32_t n);
+void L2SumsI8I8Avx2(const int8_t* row, const int8_t* q8, int32_t n,
+	int32_t* outCross, int32_t* outRowSq);
+
+namespace
+{
+	inline int32_t SumLanesI32Sse(__m128i v)
+	{
+		alignas(16) int32_t l[4];
+		_mm_store_si128(reinterpret_cast<__m128i*>(l), v);
+		return (l[0] + l[1]) + (l[2] + l[3]);
+	}
+}
+
+// Sign-extend to int16, combine with _mm_madd_epi16 (signed x signed) - the
+// _maddubs unsigned-x-signed hazard is avoided by construction.
+static int32_t DotI8I8Sse(const int8_t* row, const int8_t* q8, int32_t n)
+{
+	__m128i acc = _mm_setzero_si128();
+	for (int32_t i = 0; i + 16 <= n; i += 16) // int8 ranges are multiples of 16
+	{
+		const __m128i r = _mm_load_si128(reinterpret_cast<const __m128i*>(row + i));
+		const __m128i q = _mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i));
+		const __m128i rlo = _mm_cvtepi8_epi16(r);
+		const __m128i rhi = _mm_cvtepi8_epi16(_mm_srli_si128(r, 8));
+		const __m128i qlo = _mm_cvtepi8_epi16(q);
+		const __m128i qhi = _mm_cvtepi8_epi16(_mm_srli_si128(q, 8));
+		acc = _mm_add_epi32(acc, _mm_madd_epi16(rlo, qlo));
+		acc = _mm_add_epi32(acc, _mm_madd_epi16(rhi, qhi));
+	}
+	return SumLanesI32Sse(acc);
+}
+
+static void L2SumsI8I8Sse(
+	const int8_t* row, const int8_t* q8, int32_t n, int32_t* outCross, int32_t* outRowSq)
+{
+	__m128i cross = _mm_setzero_si128();
+	__m128i rowSq = _mm_setzero_si128();
+	for (int32_t i = 0; i + 16 <= n; i += 16)
+	{
+		const __m128i r = _mm_load_si128(reinterpret_cast<const __m128i*>(row + i));
+		const __m128i q = _mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i));
+		const __m128i rlo = _mm_cvtepi8_epi16(r);
+		const __m128i rhi = _mm_cvtepi8_epi16(_mm_srli_si128(r, 8));
+		const __m128i qlo = _mm_cvtepi8_epi16(q);
+		const __m128i qhi = _mm_cvtepi8_epi16(_mm_srli_si128(q, 8));
+		cross = _mm_add_epi32(cross, _mm_madd_epi16(rlo, qlo));
+		cross = _mm_add_epi32(cross, _mm_madd_epi16(rhi, qhi));
+		rowSq = _mm_add_epi32(rowSq, _mm_madd_epi16(rlo, rlo));
+		rowSq = _mm_add_epi32(rowSq, _mm_madd_epi16(rhi, rhi));
+	}
+	*outCross = SumLanesI32Sse(cross);
+	*outRowSq = SumLanesI32Sse(rowSq);
+}
+
+#elif defined(SUPERFAISS_SIMD_NEON)
+
+namespace
+{
+	inline int32_t SumLanesI32Neon(int32x4_t v)
+	{
+		alignas(16) int32_t l[4];
+		vst1q_s32(l, v);
+		return (l[0] + l[1]) + (l[2] + l[3]);
+	}
+}
+
+// vmull_s8 (int8 x int8 -> int16, exact: |product| <= 16129 < 32767) then
+// pairwise-accumulate into int32 lanes.
+static int32_t DotI8I8Neon(const int8_t* row, const int8_t* q8, int32_t n)
+{
+	int32x4_t acc = vdupq_n_s32(0);
+	for (int32_t i = 0; i + 16 <= n; i += 16)
+	{
+		const int8x16_t r = vld1q_s8(row + i);
+		const int8x16_t q = vld1q_s8(q8 + i);
+		acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(r), vget_low_s8(q)));
+		acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(r), vget_high_s8(q)));
+	}
+	return SumLanesI32Neon(acc);
+}
+
+static void L2SumsI8I8Neon(
+	const int8_t* row, const int8_t* q8, int32_t n, int32_t* outCross, int32_t* outRowSq)
+{
+	int32x4_t cross = vdupq_n_s32(0);
+	int32x4_t rowSq = vdupq_n_s32(0);
+	for (int32_t i = 0; i + 16 <= n; i += 16)
+	{
+		const int8x16_t r = vld1q_s8(row + i);
+		const int8x16_t q = vld1q_s8(q8 + i);
+		cross = vpadalq_s16(cross, vmull_s8(vget_low_s8(r), vget_low_s8(q)));
+		cross = vpadalq_s16(cross, vmull_s8(vget_high_s8(r), vget_high_s8(q)));
+		rowSq = vpadalq_s16(rowSq, vmull_s8(vget_low_s8(r), vget_low_s8(r)));
+		rowSq = vpadalq_s16(rowSq, vmull_s8(vget_high_s8(r), vget_high_s8(r)));
+	}
+	*outCross = SumLanesI32Neon(cross);
+	*outRowSq = SumLanesI32Neon(rowSq);
+}
+
+#endif
+
+namespace
+{
+	// Test-only forced dispatch for the CI forced-path matrix (19.4 W1). Not
+	// thread-safe; the shipped default is the per-device-stable dispatch below.
+	bool GXdPathForced = false;
+	SimdPath GXdForcedPath = SimdPath::Scalar;
+
+	inline SimdPath ActiveXdPath()
+	{
+#if defined(SUPERFAISS_SIMD_NEON)
+		return GXdPathForced ? GXdForcedPath : SimdPath::NEON;
+#elif defined(SUPERFAISS_SIMD_SSE)
+		if (GXdPathForced)
+		{
+			return GXdForcedPath;
+		}
+		return IsAvx2() ? SimdPath::AVX2 : SimdPath::SSE;
+#else
+		return GXdPathForced ? GXdForcedPath : SimdPath::Scalar;
+#endif
+	}
+}
+
+void ForceXdSimdPath(SimdPath path)
+{
+	GXdPathForced = true;
+	GXdForcedPath = path;
+}
+
+void ClearForcedXdSimdPath()
+{
+	GXdPathForced = false;
+}
+
+int32_t DotI8I8(const int8_t* row, const int8_t* q8, int32_t n)
+{
+	switch (ActiveXdPath())
+	{
+#if defined(SUPERFAISS_SIMD_SSE)
+	case SimdPath::AVX2: return DotI8I8Avx2(row, q8, n);
+	case SimdPath::SSE: return DotI8I8Sse(row, q8, n);
+#elif defined(SUPERFAISS_SIMD_NEON)
+	case SimdPath::NEON: return DotI8I8Neon(row, q8, n);
+#endif
+	default: return DotI8I8Scalar(row, q8, n);
+	}
+}
+
+void L2SumsI8I8(
+	const int8_t* row, const int8_t* q8, int32_t n, int32_t* outCross, int32_t* outRowSq)
+{
+	switch (ActiveXdPath())
+	{
+#if defined(SUPERFAISS_SIMD_SSE)
+	case SimdPath::AVX2: L2SumsI8I8Avx2(row, q8, n, outCross, outRowSq); return;
+	case SimdPath::SSE: L2SumsI8I8Sse(row, q8, n, outCross, outRowSq); return;
+#elif defined(SUPERFAISS_SIMD_NEON)
+	case SimdPath::NEON: L2SumsI8I8Neon(row, q8, n, outCross, outRowSq); return;
+#endif
+	default: L2SumsI8I8Scalar(row, q8, n, outCross, outRowSq); return;
+	}
+}
+
+} // namespace detail
+
+void QuantizeQueryXd(
+	const float* paddedQuery,
+	int32_t paddedDims,
+	int8_t* outQ8,
+	double* outScale,
+	int64_t* outSqSum)
+{
+	// Max |q_i| over bit-decoded doubles: exact, DAZ-immune, order-free.
+	double maxAbs = 0.0;
+	for (int32_t i = 0; i < paddedDims; ++i)
+	{
+		double a = detail::FloatBitsToDouble(paddedQuery[i]);
+		a = a < 0.0 ? -a : a;
+		if (a > maxAbs)
+		{
+			maxAbs = a;
+		}
+	}
+	if (maxAbs == 0.0)
+	{
+		std::memset(outQ8, 0, static_cast<size_t>(paddedDims));
+		*outScale = 0.0;
+		*outSqSum = 0;
+		return;
+	}
+	// One correctly rounded divide; maxAbs in [2^-149, ~2^128] keeps the quotient
+	// (and every per-element product below) a normal double - FTZ can never fire.
+	const double inv = 127.0 / maxAbs;
+	int64_t sq = 0;
+	for (int32_t i = 0; i < paddedDims; ++i)
+	{
+		int32_t qi = detail::RoundHalfEvenI32(detail::FloatBitsToDouble(paddedQuery[i]) * inv);
+		// |q_i| <= maxAbs makes the exact product <= 127; the clamp guards the
+		// rounded edge, nothing more.
+		qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+		outQ8[i] = static_cast<int8_t>(qi);
+		sq += static_cast<int64_t>(qi) * qi;
+	}
+	*outScale = maxAbs / 127.0;
+	*outSqSum = sq;
+}
+
+namespace
+{
+	// The subnormal-floor contract (19.2 S1): any final score with magnitude below
+	// FLT_MIN is exactly 0.0f, by specification, on every machine. At or above
+	// FLT_MIN the single double->float conversion produces a normal float, which
+	// per-thread FTZ state cannot touch.
+	inline float XdFloorToFloat(double score)
+	{
+		const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly
+		if (score < lim && score > -lim)
+		{
+			return 0.0f;
+		}
+		return static_cast<float>(score);
+	}
+
+	// Dot-family per-row epilogue: one fixed-order double expression.
+	inline double XdDotScoreD(int32_t acc, double rowScaleD, double queryScaleD)
+	{
+		return static_cast<double>(acc) * (rowScaleD * queryScaleD);
+	}
+
+	// L2 per-row epilogue: ||qs*q8 - rs*r8||^2 in expanded form -
+	// qs^2*Sum(q^2) + rs^2*Sum(r^2) - 2*qs*rs*Sum(q*r) - because query and row
+	// carry different scales, so raw int8 differences are not meaningful; the three
+	// sums are exact integers and the expression is fixed-order double. Note the
+	// expansion can round to a tiny NEGATIVE value where the true distance is ~0;
+	// the result is still bit-identical everywhere (and the floor maps
+	// (-FLT_MIN, FLT_MIN) to exactly 0.0f).
+	inline double XdL2ScoreD(
+		int64_t cross, int64_t rowSq, int64_t querySq, double rowScaleD, double queryScaleD)
+	{
+		const double a = (queryScaleD * queryScaleD) * static_cast<double>(querySq);
+		const double b = (rowScaleD * rowScaleD) * static_cast<double>(rowSq);
+		const double c = ((rowScaleD * queryScaleD) * static_cast<double>(cross)) * 2.0;
+		return (a + b) - c;
+	}
+
+	// v2.2 bias composition: defined on the FLOORED unbiased float score -
+	// XdFloor((double)unbiased + (double)bias) - so the sparse k+P path (which only
+	// holds the converted candidate floats) composes bit-identically to the dense
+	// in-scan form. Reuses the v2.1 fused finite-only law (integer exponent test).
+	inline float XdComposeBias(float unbiased, const float* rowBias, int32_t r, bool* flag)
+	{
+		if (rowBias == nullptr)
+		{
+			return unbiased;
+		}
+		const float b = rowBias[r];
+		uint32_t bits;
+		std::memcpy(&bits, &b, sizeof(bits));
+		if ((bits & 0x7f800000u) == 0x7f800000u && flag != nullptr)
+		{
+			*flag = true;
+		}
+		return XdFloorToFloat(
+			static_cast<double>(unbiased) + detail::FloatBitsToDouble(b));
+	}
+
+	// Whole-row CrossDevice score (unbiased): integer sums + the double epilogue.
+	inline float XdWholeRowScore(
+		const BankView& bank, const XdQuery& query, bool isL2, int32_t r)
+	{
+		const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * bank.paddedDims;
+		const double rowScaleD = detail::FloatBitsToDouble(bank.scales[r]);
+		if (isL2)
+		{
+			int32_t cross = 0;
+			int32_t rowSq = 0;
+			detail::L2SumsI8I8(row, query.q8, bank.paddedDims, &cross, &rowSq);
+			return XdFloorToFloat(
+				XdL2ScoreD(cross, rowSq, query.sqSum, rowScaleD, query.scale));
+		}
+		const int32_t acc = detail::DotI8I8(row, query.q8, bank.paddedDims);
+		return XdFloorToFloat(XdDotScoreD(acc, rowScaleD, query.scale));
+	}
+
+	// Segmented CrossDevice row score over a prebuilt range list. Per-range integer
+	// partials feed the canonical fixed-order double combine:
+	//   partial = epilogue(acc, rowScale, queryScale)   [dot or expanded L2]
+	//   partial *= channelInvNorm (channel-matched cosine ranges)
+	//   contribution = weight * partial
+	//   total += contribution                            [range order]
+	// outContributions (when non-null) receives each contribution floored to float
+	// (so reported decompositions are themselves cross-device bit-identical); the
+	// returned double is the unfloored total (the caller floors the final score).
+	// rangeQuerySq carries the per-range Sum(q8^2) integers (L2 only; computed once
+	// per scan, not per row).
+	inline double XdSegmentedRowScoreD(
+		const XdQuery& query,
+		const FScanRange* ranges,
+		int32_t rangeCount,
+		const int64_t* rangeQuerySq,
+		bool isL2,
+		const int8_t* row,
+		double rowScaleD,
+		const float* rowInvNorms,
+		float* outContributions)
+	{
+		double total = 0.0;
+		for (int32_t i = 0; i < rangeCount; ++i)
+		{
+			const FScanRange& range = ranges[i];
+			if (range.accIndex < 0)
+			{
+				// CrossDevice gaps are skipped, not scored-and-discarded: integer
+				// sums carry no prefetch-stride obligation, and untouched bytes
+				// cannot perturb a determinism proof.
+				continue;
+			}
+			double partial;
+			if (isL2)
+			{
+				int32_t cross = 0;
+				int32_t rowSq = 0;
+				detail::L2SumsI8I8(row + range.offset, query.q8 + range.offset,
+					range.length, &cross, &rowSq);
+				int64_t querySq;
+				if (rangeQuerySq != nullptr)
+				{
+					querySq = rangeQuerySq[i];
+				}
+				else
+				{
+					// No precomputed table (the fused path with unbounded member
+					// count): the range self-sum is exact integer either way.
+					querySq = 0;
+					const int8_t* q = query.q8 + range.offset;
+					for (int32_t j = 0; j < range.length; ++j)
+					{
+						querySq += static_cast<int64_t>(q[j]) * q[j];
+					}
+				}
+				partial = XdL2ScoreD(cross, rowSq, querySq, rowScaleD, query.scale);
+			}
+			else
+			{
+				const int32_t acc = detail::DotI8I8(row + range.offset,
+					query.q8 + range.offset, range.length);
+				partial = XdDotScoreD(acc, rowScaleD, query.scale);
+			}
+			if (rowInvNorms != nullptr && range.channelIndex >= 0)
+			{
+				partial *= detail::FloatBitsToDouble(rowInvNorms[range.channelIndex]);
+			}
+			const double contribution =
+				detail::FloatBitsToDouble(ranges[i].weight) * partial;
+			if (outContributions != nullptr)
+			{
+				outContributions[range.accIndex] = XdFloorToFloat(contribution);
+			}
+			total += contribution;
+		}
+		return total;
+	}
+
+	// Per-range query self-sums for segmented L2 (integer, once per scan).
+	inline void BuildRangeQuerySq(
+		const XdQuery& query, const FScanRange* ranges, int32_t rangeCount,
+		int64_t* outRangeSq)
+	{
+		for (int32_t i = 0; i < rangeCount; ++i)
+		{
+			int64_t sq = 0;
+			if (ranges[i].accIndex >= 0)
+			{
+				const int8_t* q = query.q8 + ranges[i].offset;
+				for (int32_t j = 0; j < ranges[i].length; ++j)
+				{
+					sq += static_cast<int64_t>(q[j]) * q[j];
+				}
+			}
+			outRangeSq[i] = sq;
+		}
+	}
+}
+
+void ScoreChunkXd(
+	const BankView& bank,
+	const XdQuery& query,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+	const bool isL2 = bank.metric == Metric::L2;
+	for (int32_t r = begin; r < end; ++r)
+	{
+		if (IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		const float score = XdWholeRowScore(bank, query, isL2, r);
+		inout.Push(r, XdComposeBias(score, rowBias, r, outNonFiniteBias));
+	}
+}
+
+void ScoreChunkSegmentedXd(
+	const BankView& bank,
+	const XdQuery& query,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool perChannelCosine =
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
+	FScanRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
+	int64_t rangeQuerySq[2 * kMaxSegments + 1];
+	if (isL2)
+	{
+		BuildRangeQuerySq(query, ranges, rangeCount, rangeQuerySq);
+	}
+
+	for (int32_t r = begin; r < end; ++r)
+	{
+		if (IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * bank.paddedDims;
+		const double rowScaleD = detail::FloatBitsToDouble(bank.scales[r]);
+		const float* rowInvNorms = perChannelCosine
+			? bank.channelInvNorms + static_cast<int64_t>(r) * bank.channelCount
+			: nullptr;
+		const float score = XdFloorToFloat(XdSegmentedRowScoreD(query, ranges,
+			rangeCount, rangeQuerySq, isL2, row, rowScaleD, rowInvNorms, nullptr));
+		inout.Push(r, XdComposeBias(score, rowBias, r, outNonFiniteBias));
+	}
+}
+
+void ScoreChunkFusedXd(
+	const BankView& bank,
+	const XdQuery* queries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout,
+	const float* rowBias,
+	bool* outNonFiniteBias)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool perChannelCosine = segments != nullptr &&
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
+	FScanRange ranges[2 * kMaxSegments + 1];
+	int32_t rangeCount = 0;
+	if (segments != nullptr)
+	{
+		rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
+	}
+
+	for (int32_t r = begin; r < end; ++r)
+	{
+		if (IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		float fused = 0.0f;
+		if (segments == nullptr)
+		{
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				const float score = XdWholeRowScore(bank, queries[m], isL2, r);
+				if (m == 0 || (isL2 ? score > fused : score < fused))
+				{
+					fused = score;
+				}
+			}
+		}
+		else
+		{
+			const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+				static_cast<int64_t>(r) * bank.paddedDims;
+			const double rowScaleD = detail::FloatBitsToDouble(bank.scales[r]);
+			const float* rowInvNorms = perChannelCosine
+				? bank.channelInvNorms + static_cast<int64_t>(r) * bank.channelCount
+				: nullptr;
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				const float score = XdFloorToFloat(XdSegmentedRowScoreD(
+					queries[m], ranges, rangeCount, nullptr, isL2, row,
+					rowScaleD, rowInvNorms, nullptr));
+				if (m == 0 || (isL2 ? score > fused : score < fused))
+				{
+					fused = score;
+				}
+			}
+		}
+		inout.Push(r, XdComposeBias(fused, rowBias, r, outNonFiniteBias));
+	}
+}
+
+float DecomposeRowScoreXd(
+	const BankView& bank,
+	const XdQuery& query,
+	int32_t rowIndex,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	float* outContributions)
+{
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool perChannelCosine =
+		bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
+	FScanRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
+	int64_t rangeQuerySq[2 * kMaxSegments + 1];
+	if (isL2)
+	{
+		BuildRangeQuerySq(query, ranges, rangeCount, rangeQuerySq);
+	}
+	const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+		static_cast<int64_t>(rowIndex) * bank.paddedDims;
+	const double rowScaleD = detail::FloatBitsToDouble(bank.scales[rowIndex]);
+	const float* rowInvNorms = perChannelCosine
+		? bank.channelInvNorms + static_cast<int64_t>(rowIndex) * bank.channelCount
+		: nullptr;
+	for (int32_t i = 0; i < segmentCount; ++i)
+	{
+		outContributions[i] = 0.0f; // weight-0 segments contribute exactly 0
+	}
+	return XdFloorToFloat(XdSegmentedRowScoreD(query, ranges, rangeCount,
+		rangeQuerySq, isL2, row, rowScaleD, rowInvNorms, outContributions));
+}
+
+float ScoreRowXd(const BankView& bank, const XdQuery& query, int32_t rowIndex)
+{
+	return XdWholeRowScore(bank, query, bank.metric == Metric::L2, rowIndex);
+}
+
+namespace detail
+{
+	float XdComposeBiasValue(float unbiasedScore, float bias)
+	{
+		return XdFloorToFloat(
+			static_cast<double>(unbiasedScore) + FloatBitsToDouble(bias));
+	}
+}
+
 } // namespace superfaiss

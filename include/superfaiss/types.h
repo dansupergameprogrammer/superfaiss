@@ -108,6 +108,32 @@ struct QuerySegment
 // result-buffer sizing, keeps per-row loop overhead predictable. Raising is additive.
 inline constexpr int32_t kMaxSegments = 8;
 
+// Per-query exactness mode (v2.2, plan section 19).
+//   PerDevice   - the shipped default: scores and rankings are bit-identical across
+//                 runs, threads, and SIMD paths on one device (per SKU on consoles).
+//   CrossDevice - opt-in: scores and rankings are bit-identical across DIFFERENT
+//                 machines - x86 and ARM, any OS, any SIMD width. Int8 banks only
+//                 (f32 banks stay per-device). The query is quantized to int8 with a
+//                 symmetric per-query scale (round-half-even, integer math); scoring
+//                 accumulates in integers (associative, order-free); the per-row
+//                 epilogue is a fixed-order double-precision expression with an
+//                 explicit subnormal floor - any final score with magnitude below
+//                 FLT_MIN is exactly 0.0f, by contract, on every machine (the
+//                 FTZ/DAZ hole, closed by specification). Composes with segments,
+//                 channels, bias, exclusion, batch, intersection, and scratch banks.
+//                 Query quantization adds error beyond row quantization; measure the
+//                 recall cost per bank before adopting.
+enum class Exactness : uint8_t
+{
+	PerDevice = 0,
+	CrossDevice = 1,
+};
+
+// CrossDevice paddedDims ceiling: integer accumulators are proven overflow-free for
+// paddedDims * 127 * 127 < 2^31 (dot, L2 cross/self sums alike). Queries against
+// wider banks return InvalidArgument in CrossDevice mode.
+inline constexpr int32_t kMaxCrossDeviceDims = 131072;
+
 // One sparse bias entry (v2.1): a row index and the bias added to that row's score.
 struct BiasPair
 {
@@ -155,6 +181,10 @@ struct QueryParams
 	// is the degenerate case - point every entry's dense at the same array). Null
 	// means no bias anywhere.
 	const RowBias* bias = nullptr;
+	// Exactness mode (v2.2): PerDevice is the shipped default, bit-identical to
+	// every prior release. CrossDevice requires an Int8 bank and
+	// paddedDims <= kMaxCrossDeviceDims (else InvalidArgument).
+	Exactness exactness = Exactness::PerDevice;
 };
 
 // The metric a query with these params is actually scored (and its hits ordered) by.

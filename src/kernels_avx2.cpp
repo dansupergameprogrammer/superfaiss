@@ -492,6 +492,69 @@ float L2I8ScalarAvx2(const int8_t* row, float scale, const float* query, int32_t
 	return (acc[0].Sum() + acc[1].Sum()) + (acc[2].Sum() + acc[3].Sum());
 }
 
+// --- v2.2 cross-device integer kernels (plan section 19) ---
+//
+// int8 x int8 -> int32 accumulation. Integer addition is associative, so the lane
+// structure below is a throughput choice, not a determinism contract - any width
+// produces the same sums (the property the CrossDevice mode is built on). The x86
+// int8 multiply hazard is avoided by construction: elements are sign-extended to
+// int16 and combined with _mm256_madd_epi16 (signed x signed), never _maddubs
+// (unsigned x signed). No overflow: n <= kMaxCrossDeviceDims bounds every |sum| by
+// n * 127 * 127 < 2^31, and each int32 lane accumulates a strict subset of it.
+
+SUPERFAISS_AVX2_TARGET static int32_t SumLanesI32(__m256i v)
+{
+	alignas(32) int32_t l[8];
+	_mm256_store_si256(reinterpret_cast<__m256i*>(l), v);
+	return ((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7]));
+}
+
+SUPERFAISS_AVX2_TARGET int32_t DotI8I8Avx2(const int8_t* row, const int8_t* q8, int32_t n)
+{
+	__m256i acc = _mm256_setzero_si256();
+	int32_t i = 0;
+	for (; i + 32 <= n; i += 32)
+	{
+		const __m256i r0 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(row + i)));
+		const __m256i q0 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i)));
+		const __m256i r1 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(row + i + 16)));
+		const __m256i q1 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i + 16)));
+		acc = _mm256_add_epi32(acc, _mm256_madd_epi16(r0, q0));
+		acc = _mm256_add_epi32(acc, _mm256_madd_epi16(r1, q1));
+	}
+	if (i + 16 <= n) // int8 ranges are multiples of 16 elements
+	{
+		const __m256i r0 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(row + i)));
+		const __m256i q0 = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i)));
+		acc = _mm256_add_epi32(acc, _mm256_madd_epi16(r0, q0));
+	}
+	return SumLanesI32(acc);
+}
+
+SUPERFAISS_AVX2_TARGET void L2SumsI8I8Avx2(
+	const int8_t* row, const int8_t* q8, int32_t n, int32_t* outCross, int32_t* outRowSq)
+{
+	__m256i cross = _mm256_setzero_si256();
+	__m256i rowSq = _mm256_setzero_si256();
+	for (int32_t i = 0; i + 16 <= n; i += 16)
+	{
+		const __m256i r = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(row + i)));
+		const __m256i q = _mm256_cvtepi8_epi16(
+			_mm_load_si128(reinterpret_cast<const __m128i*>(q8 + i)));
+		cross = _mm256_add_epi32(cross, _mm256_madd_epi16(r, q));
+		rowSq = _mm256_add_epi32(rowSq, _mm256_madd_epi16(r, r));
+	}
+	*outCross = SumLanesI32(cross);
+	*outRowSq = SumLanesI32(rowSq);
+}
+
 } // namespace detail
 } // namespace superfaiss
 

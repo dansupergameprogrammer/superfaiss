@@ -8,6 +8,8 @@
 namespace superfaiss
 {
 
+struct XdQuery; // kernels.h
+
 // Pluggable allocator seam. Hosts (engines) may route this to their own allocators.
 // Every allocation made through the seam is counted, so a caller can assert
 // zero steady-state allocation across warm queries.
@@ -65,6 +67,17 @@ public:
 	bool ReserveBiasBits(int32_t count);
 	uint32_t* BiasBits();
 
+	// Aligned int8 scratch for CrossDevice-quantized queries (v2.2): `count`
+	// queries of `paddedDims` bytes plus per-query scale/self-dot slots. Same
+	// growth accounting as Reserve().
+	bool ReserveXdQuery(int32_t paddedDims, int32_t count);
+	int8_t* XdQ8(int32_t queryIndex);
+	double* XdScale(int32_t queryIndex);
+	int64_t* XdSqSum(int32_t queryIndex);
+	// `count` XdQuery slots in the same block (callers fill them from the three
+	// accessors above; QueryIntersect passes the array to the fused kernel).
+	XdQuery* XdSlots();
+
 	// Number of times Reserve() actually grew the buffer. Flat across warm queries.
 	uint64_t GrowthCount() const { return GrowthCount_; }
 
@@ -78,6 +91,9 @@ private:
 	int32_t ScratchCount_ = 0;
 	uint32_t* BiasBits_ = nullptr;
 	int32_t BiasBitWords_ = 0;
+	int8_t* XdQ8_ = nullptr;      // count x paddedDims int8, then count doubles, then count int64s
+	int32_t XdDims_ = 0;
+	int32_t XdCount_ = 0;
 	uint64_t GrowthCount_ = 0;
 };
 

@@ -1,3 +1,7 @@
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS // getenv/fopen in the selection-recording emitter
+#endif
+
 // SuperFAISS test harness. Standard library only; no third-party test framework.
 // Reference results are computed in double precision with the same total order
 // (score, then ascending index); float-vs-double near-ties are handled with an
@@ -5,9 +9,12 @@
 
 #include "superfaiss/superfaiss.h"
 
+#include "xd_fixtures.h"
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -3192,6 +3199,742 @@ static void TestPerRowBias()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T25 — cross-device exactness (V2 plan section 19, T-V2-X).
+//
+// The claim under proof: Exactness::CrossDevice produces bit-identical scores
+// and hit ORDER on any machine at any SIMD width. Within one process the proof
+// is the forced-path sweep (scalar / SSE4.1 / AVX2 on x86, scalar / NEON on
+// ARM — 19.4 W1); across machines it is the pinned golden hash over the
+// COMMITTED fixture bytes in xd_fixtures.h (19.4 N2), asserted by every CI
+// runner. The adversarial fixtures put epilogue products into and around the
+// float subnormal window, so the arbiter rules on the FTZ/DAZ weak case (S1).
+
+namespace xd
+{
+	// FNV-1a 64 over the battery's hits: per query, the count then each hit's
+	// index and score bits in rank order — hit ORDER is hashed, which is what a
+	// lockstep consumer consumes.
+	struct BatteryHash
+	{
+		uint64_t h = 1469598103934665603ull;
+
+		void Bytes(const void* p, size_t n)
+		{
+			const uint8_t* b = static_cast<const uint8_t*>(p);
+			for (size_t i = 0; i < n; ++i)
+			{
+				h = (h ^ b[i]) * 1099511628211ull;
+			}
+		}
+
+		void U32(uint32_t v) { Bytes(&v, 4); }
+
+		void Hits(const Hit* hits, int32_t count)
+		{
+			U32(static_cast<uint32_t>(count));
+			for (int32_t i = 0; i < count; ++i)
+			{
+				U32(static_cast<uint32_t>(hits[i].index));
+				uint32_t bits;
+				std::memcpy(&bits, &hits[i].score, 4);
+				U32(bits);
+			}
+		}
+	};
+
+	// The subnormal-floor contract, asserted on every battery hit.
+	inline void CheckFloor(const Hit* hits, int32_t count)
+	{
+		for (int32_t i = 0; i < count; ++i)
+		{
+			const float s = hits[i].score;
+			CHECK_MSG(s == 0.0f || std::fabs(s) >= 1.1754943508222875e-38f,
+				"subnormal score leaked: %.9g (index %d)", s, hits[i].index);
+		}
+	}
+
+	// A fixture-backed bank view. Rows point straight at the committed bytes
+	// (alignas(16) in the header); scales decode from committed float bits.
+	struct FixBank
+	{
+		std::vector<float> scales;
+		std::vector<ChannelInfo> channels;
+		std::vector<float> invNorms;
+		BankView view;
+
+		FixBank(const int8_t* rows, const uint32_t* scaleBits, int32_t count,
+			int32_t dims, Metric metric, int32_t channelCount = 0)
+		{
+			scales.resize(static_cast<size_t>(count));
+			for (int32_t r = 0; r < count; ++r)
+			{
+				std::memcpy(&scales[static_cast<size_t>(r)], &scaleBits[r], 4);
+			}
+			view.rows = rows;
+			view.scales = scales.data();
+			view.count = count;
+			view.dims = dims;
+			view.paddedDims = PaddedDims(dims, Quantization::Int8);
+			view.quant = Quantization::Int8;
+			view.metric = metric;
+			if (channelCount > 0)
+			{
+				const int32_t len = dims / channelCount;
+				channels.resize(static_cast<size_t>(channelCount));
+				for (int32_t c = 0; c < channelCount; ++c)
+				{
+					channels[static_cast<size_t>(c)] = {c * len, len};
+				}
+				view.channels = channels.data();
+				view.channelCount = channelCount;
+				invNorms.resize(static_cast<size_t>(count) * channelCount);
+				CHECK(ComputeChannelInverseNorms(view, invNorms.data()) == Status::Ok);
+				view.channelInvNorms = invNorms.data();
+			}
+			CHECK(ValidateBank(view) == Status::Ok);
+		}
+	};
+
+	// Fixture query `q`, sliced to `pd` elements with pads zeroed, into `out`.
+	inline void LoadQuery(int32_t q, int32_t pd, float* out)
+	{
+		std::memset(out, 0, static_cast<size_t>(pd) * sizeof(float));
+		const int32_t n = pd < xdfix::kQueryDims ? pd : xdfix::kQueryDims;
+		for (int32_t i = 0; i < n; ++i)
+		{
+			std::memcpy(&out[i], &xdfix::kQueryBits[q * xdfix::kQueryDims + i], 4);
+		}
+	}
+
+	// Runs the full committed-fixture battery under the CURRENT dispatch and
+	// returns its hash. Every hit is floor-checked. When `record` is non-null,
+	// each hit list is appended as text (the ARM selection recording).
+	inline uint64_t RunBattery(Workspace& ws, std::FILE* record)
+	{
+		BatteryHash hash;
+		FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+			xdfix::kBankADims, Metric::Dot);
+		FixBank bankB(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+			xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+		FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+			xdfix::kBankCDims, Metric::L2);
+		FixBank bankD(xdfix::kBankDRows, xdfix::kBankDScaleBits, xdfix::kBankDCount,
+			xdfix::kBankDDims, Metric::Dot);
+		FixBank bankE(xdfix::kBankERows, xdfix::kBankEScaleBits, xdfix::kBankECount,
+			xdfix::kBankEDims, Metric::L2);
+
+		AlignedBuf queryBuf(sizeof(float) * 64 * 8);
+		Hit hits[64 * 8];
+		int32_t counts[8];
+
+		QueryParams xdParams;
+		xdParams.exactness = Exactness::CrossDevice;
+
+		auto emit = [&](const char* label, const Hit* h, int32_t n)
+		{
+			CheckFloor(h, n);
+			hash.Hits(h, n);
+			if (record != nullptr)
+			{
+				std::fprintf(record, "%s n=%d:", label, n);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					uint32_t bits;
+					std::memcpy(&bits, &h[i].score, 4);
+					std::fprintf(record, " %d:%08x", h[i].index, bits);
+				}
+				std::fprintf(record, "\n");
+			}
+		};
+
+		// --- Bank A (Dot): singles, exclusion, dense bias (subnormal values
+		// included), sparse bias, batch, intersect.
+		{
+			std::vector<uint32_t> exclude((bankA.view.count + 31) / 32, 0u);
+			for (int32_t r = 0; r < bankA.view.count; r += 3)
+			{
+				exclude[r >> 5] |= 1u << (r & 31);
+			}
+			std::vector<float> dense(static_cast<size_t>(bankA.view.count));
+			for (int32_t r = 0; r < bankA.view.count; ++r)
+			{
+				// Mix of ordinary, tiny-normal, and SUBNORMAL bias values — the
+				// DAZ-proof bias decode is part of the proof surface.
+				const uint32_t bits = (r % 4 == 0) ? 0x00000007u          // subnormal
+					: (r % 4 == 1) ? 0x80000123u                          // -subnormal
+					: (r % 4 == 2) ? 0x3c23d70au                          // 0.01f
+					: 0x00800000u;                                        // FLT_MIN
+				std::memcpy(&dense[static_cast<size_t>(r)], &bits, 4);
+			}
+			const BiasPair pairs[2] = {{5, 0.25f}, {40, -0.5f}};
+			RowBias denseBias;
+			denseBias.dense = dense.data();
+			RowBias pairBias;
+			pairBias.pairs = pairs;
+			pairBias.pairCount = 2;
+
+			for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+			{
+				LoadQuery(q, bankA.view.paddedDims, queryBuf.F32());
+				QueryParams p = xdParams;
+				p.k = 10;
+				CHECK(Query(bankA.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("A.single", hits, counts[0]);
+
+				p.excludeBits = exclude.data();
+				CHECK(Query(bankA.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				for (int32_t i = 0; i < counts[0]; ++i)
+				{
+					CHECK(hits[i].index % 3 != 0); // the exclusion mask held
+				}
+				emit("A.excluded", hits, counts[0]);
+
+				p.excludeBits = nullptr;
+				p.bias = &denseBias;
+				CHECK(Query(bankA.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("A.dense-bias", hits, counts[0]);
+
+				p.bias = &pairBias;
+				CHECK(Query(bankA.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("A.sparse-bias", hits, counts[0]);
+			}
+
+			// Batch of 5 == the same 5 singles, bitwise.
+			AlignedBuf batchBuf(sizeof(float) * 5 * bankA.view.paddedDims);
+			for (int32_t q = 0; q < 5; ++q)
+			{
+				LoadQuery(q, bankA.view.paddedDims,
+					batchBuf.F32() + static_cast<int64_t>(q) * bankA.view.paddedDims);
+			}
+			QueryParams p = xdParams;
+			p.k = 8;
+			CHECK(QueryBatch(bankA.view, batchBuf.F32(), 5, p, ws, hits, counts) == Status::Ok);
+			for (int32_t q = 0; q < 5; ++q)
+			{
+				emit("A.batch", hits + static_cast<int64_t>(q) * p.k, counts[q]);
+				Hit single[8];
+				int32_t singleCount = 0;
+				CHECK(Query(bankA.view,
+					batchBuf.F32() + static_cast<int64_t>(q) * bankA.view.paddedDims,
+					p, ws, single, &singleCount) == Status::Ok);
+				CHECK(singleCount == counts[q]);
+				for (int32_t i = 0; i < singleCount; ++i)
+				{
+					const Hit& b = hits[static_cast<int64_t>(q) * p.k + i];
+					CHECK(b.index == single[i].index);
+					uint32_t bb, sb;
+					std::memcpy(&bb, &b.score, 4);
+					std::memcpy(&sb, &single[i].score, 4);
+					CHECK_MSG(bb == sb, "batch != single bits: %08x vs %08x", bb, sb);
+				}
+			}
+
+			// Intersection over 3 members; queryCount == 1 degenerates to Query.
+			int32_t n = 0;
+			CHECK(QueryIntersect(bankA.view, batchBuf.F32(), 3, p, ws, hits, &n) == Status::Ok);
+			emit("A.intersect", hits, n);
+			Hit single[8];
+			int32_t singleCount = 0;
+			CHECK(QueryIntersect(bankA.view, batchBuf.F32(), 1, p, ws, hits, &n) == Status::Ok);
+			CHECK(Query(bankA.view, batchBuf.F32(), p, ws, single, &singleCount) == Status::Ok);
+			CHECK(n == singleCount);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				uint32_t ib, sb;
+				std::memcpy(&ib, &hits[i].score, 4);
+				std::memcpy(&sb, &single[i].score, 4);
+				CHECK(hits[i].index == single[i].index && ib == sb);
+			}
+		}
+
+		// --- Bank B (Cosine + channels): whole-row, channel-matched segments,
+		// ScoreAs override, decomposition.
+		{
+			const QuerySegment segs[3] = {
+				{bankB.channels[0].offset, bankB.channels[0].length, 1.5f},
+				{bankB.channels[1].offset, bankB.channels[1].length, 0.0f}, // omitted
+				{bankB.channels[3].offset, bankB.channels[3].length, -0.75f},
+			};
+			for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+			{
+				LoadQuery(q, bankB.view.paddedDims, queryBuf.F32());
+				QueryParams p = xdParams;
+				p.k = 10;
+				CHECK(Query(bankB.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("B.single", hits, counts[0]);
+
+				p.segments = segs;
+				p.segmentCount = 3;
+				CHECK(Query(bankB.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("B.segmented", hits, counts[0]);
+
+				// Decomposition of the top hit: contributions are floored floats,
+				// total is the scan score bitwise.
+				if (counts[0] > 0)
+				{
+					AlignedBuf q8(static_cast<size_t>(bankB.view.paddedDims));
+					double scale = 0.0;
+					int64_t sq = 0;
+					QuantizeQueryXd(queryBuf.F32(), bankB.view.paddedDims, q8.I8(), &scale, &sq);
+					XdQuery xq{q8.I8(), scale, sq};
+					float contributions[kMaxSegments];
+					const float total = DecomposeRowScoreXd(bankB.view, xq,
+						hits[0].index, segs, 3, contributions);
+					uint32_t tb, sb;
+					std::memcpy(&tb, &total, 4);
+					std::memcpy(&sb, &hits[0].score, 4);
+					CHECK_MSG(tb == sb, "decompose total != scan score: %08x vs %08x", tb, sb);
+					CHECK(contributions[1] == 0.0f); // weight-0 contributes exactly 0
+					for (int32_t s = 0; s < 3; ++s)
+					{
+						const float c = contributions[s];
+						CHECK(c == 0.0f || std::fabs(c) >= 1.1754943508222875e-38f);
+					}
+					hash.Bytes(contributions, sizeof(float) * 3);
+				}
+
+				p.segments = nullptr;
+				p.segmentCount = 0;
+				p.scoreAs = ScoreAs::Dot;
+				CHECK(Query(bankB.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("B.score-as-dot", hits, counts[0]);
+			}
+		}
+
+		// --- Bank C (L2): whole-row and segmented (the expanded-epilogue path).
+		{
+			const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 2.0f}};
+			for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+			{
+				LoadQuery(q, bankC.view.paddedDims, queryBuf.F32());
+				QueryParams p = xdParams;
+				p.k = 10;
+				CHECK(Query(bankC.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("C.single", hits, counts[0]);
+
+				p.segments = segs;
+				p.segmentCount = 2;
+				CHECK(Query(bankC.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("C.segmented", hits, counts[0]);
+			}
+		}
+
+		// --- Banks D and E (adversarial): full k so every row's score is pinned.
+		{
+			int32_t floored = 0;
+			int32_t unfloored = 0;
+			for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+			{
+				LoadQuery(q, bankD.view.paddedDims, queryBuf.F32());
+				QueryParams p = xdParams;
+				p.k = bankD.view.count;
+				CHECK(Query(bankD.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("D.single", hits, counts[0]);
+				for (int32_t i = 0; i < counts[0]; ++i)
+				{
+					(hits[i].score == 0.0f ? floored : unfloored) += 1;
+				}
+			}
+			// The adversarial fixture must actually exercise the flush window:
+			// both floored and unfloored scores present, or the arbiter is
+			// ruling around the weak case.
+			CHECK_MSG(floored > 0, "bank D produced no floored scores");
+			CHECK_MSG(unfloored > 0, "bank D produced only floored scores");
+
+			for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+			{
+				LoadQuery(q, bankE.view.paddedDims, queryBuf.F32());
+				QueryParams p = xdParams;
+				p.k = bankE.view.count;
+				CHECK(Query(bankE.view, queryBuf.F32(), p, ws, hits, &counts[0]) == Status::Ok);
+				emit("E.single", hits, counts[0]);
+			}
+		}
+
+		return hash.h;
+	}
+
+	// Independent test-side reimplementation of the whole-row CrossDevice score,
+	// coded from the 19.2/19.3 contract (not from the kernel source): plain
+	// integer loops, the fixed-order double epilogue, the floor.
+	inline float RefXdScore(const BankView& bank, const int8_t* q8, double qs,
+		int64_t qSq, int32_t r)
+	{
+		const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * bank.paddedDims;
+		double rsD;
+		{
+			uint32_t b;
+			std::memcpy(&b, &bank.scales[r], 4);
+			if ((b & 0x7f800000u) != 0)
+			{
+				rsD = static_cast<double>(bank.scales[r]);
+			}
+			else
+			{
+				const double m =
+					static_cast<double>(static_cast<int32_t>(b & 0x7fffffu)) *
+					1.4012984643248171e-45; // 2^-149
+				rsD = (b >> 31) != 0 ? -m : m;
+			}
+		}
+		double d;
+		if (bank.metric == Metric::L2)
+		{
+			int64_t cross = 0;
+			int64_t rowSq = 0;
+			for (int32_t i = 0; i < bank.paddedDims; ++i)
+			{
+				cross += static_cast<int64_t>(row[i]) * q8[i];
+				rowSq += static_cast<int64_t>(row[i]) * row[i];
+			}
+			const double a = (qs * qs) * static_cast<double>(qSq);
+			const double b = (rsD * rsD) * static_cast<double>(rowSq);
+			const double c = ((rsD * qs) * static_cast<double>(cross)) * 2.0;
+			d = (a + b) - c;
+		}
+		else
+		{
+			int64_t acc = 0;
+			for (int32_t i = 0; i < bank.paddedDims; ++i)
+			{
+				acc += static_cast<int64_t>(row[i]) * q8[i];
+			}
+			d = static_cast<double>(acc) * (rsD * qs);
+		}
+		const double lim = 1.1754943508222875e-38;
+		if (d < lim && d > -lim)
+		{
+			return 0.0f;
+		}
+		return static_cast<float>(d);
+	}
+} // namespace xd
+
+static void TestCrossDevice()
+{
+	// --- Round-half-even, integer math (19.2 S1 c) ---
+	CHECK(detail::RoundHalfEvenI32(0.0) == 0);
+	CHECK(detail::RoundHalfEvenI32(0.5) == 0);
+	CHECK(detail::RoundHalfEvenI32(-0.5) == 0);
+	CHECK(detail::RoundHalfEvenI32(1.5) == 2);
+	CHECK(detail::RoundHalfEvenI32(2.5) == 2);
+	CHECK(detail::RoundHalfEvenI32(-1.5) == -2);
+	CHECK(detail::RoundHalfEvenI32(-2.5) == -2);
+	CHECK(detail::RoundHalfEvenI32(3.5) == 4);
+	CHECK(detail::RoundHalfEvenI32(126.5) == 126);
+	CHECK(detail::RoundHalfEvenI32(127.49999) == 127);
+	CHECK(detail::RoundHalfEvenI32(0.49999999) == 0);
+	CHECK(detail::RoundHalfEvenI32(-126.5) == -126);
+	CHECK(detail::RoundHalfEvenI32(2.2250738585072014e-308) == 0); // min normal double
+	CHECK(detail::RoundHalfEvenI32(100.25) == 100);
+	CHECK(detail::RoundHalfEvenI32(100.75) == 101);
+
+	// --- DAZ-proof float decode ---
+	{
+		const uint32_t cases[] = {0x00000001u, 0x007fffffu, 0x80000001u, 0x00400000u,
+			0x3f800000u, 0xbf800000u, 0x00800000u, 0x7f7fffffu, 0x00000000u, 0x80000000u};
+		for (uint32_t bits : cases)
+		{
+			float f;
+			std::memcpy(&f, &bits, 4);
+			const double got = detail::FloatBitsToDouble(f);
+			// Reference: sign * mant * 2^-149 for exp==0, else the plain cast.
+			double want;
+			if ((bits & 0x7f800000u) != 0)
+			{
+				want = static_cast<double>(f);
+			}
+			else
+			{
+				want = static_cast<double>(static_cast<int32_t>(bits & 0x7fffffu)) *
+					1.4012984643248171e-45;
+				if ((bits >> 31) != 0)
+				{
+					want = -want;
+				}
+			}
+			CHECK(got == want);
+		}
+	}
+
+	// --- Quantizer contracts ---
+	{
+		AlignedBuf q(sizeof(float) * 32);
+		AlignedBuf q8(32);
+		double scale = 0.0;
+		int64_t sq = 0;
+
+		// All-zero query: scale 0, all-zero output.
+		QuantizeQueryXd(q.F32(), 32, q8.I8(), &scale, &sq);
+		CHECK(scale == 0.0 && sq == 0);
+
+		// The max element pins to +/-127; half-way products round to even.
+		q.F32()[0] = 2.0f;
+		q.F32()[1] = -2.0f;
+		q.F32()[2] = 1.0f;
+		QuantizeQueryXd(q.F32(), 32, q8.I8(), &scale, &sq);
+		CHECK(q8.I8()[0] == 127 && q8.I8()[1] == -127);
+		CHECK(q8.I8()[2] == 64); // 63.5 rounds half-even UP to 64
+		CHECK(scale == 2.0 / 127.0);
+		CHECK(sq == 127ll * 127 + 127ll * 127 + 64ll * 64);
+
+		// An all-subnormal query still quantizes (bit-decode, not DAZ-dependent).
+		const uint32_t sub1 = 0x00000100u, sub2 = 0x80000200u;
+		std::memset(q.F32(), 0, 32 * sizeof(float));
+		std::memcpy(&q.F32()[0], &sub1, 4);
+		std::memcpy(&q.F32()[1], &sub2, 4);
+		QuantizeQueryXd(q.F32(), 32, q8.I8(), &scale, &sq);
+		CHECK(scale > 0.0);
+		CHECK(q8.I8()[0] == 64 && q8.I8()[1] == -127); // 0x100/0x200 = half, rounds even
+	}
+
+	Workspace ws;
+
+	// --- Rejection matrix: f32 banks and oversized strides stay PerDevice-only ---
+	{
+		Rng rng(77);
+		TestBank f32bank(rng, 16, 32, Quantization::Float32, Metric::Dot);
+		AlignedBuf q(sizeof(float) * f32bank.view.paddedDims);
+		q.F32()[0] = 1.0f;
+		QueryParams p;
+		p.k = 4;
+		p.exactness = Exactness::CrossDevice;
+		Hit hits[4];
+		int32_t n = 0;
+		CHECK(Query(f32bank.view, q.F32(), p, ws, hits, &n) == Status::InvalidArgument);
+		CHECK(QueryBatch(f32bank.view, q.F32(), 1, p, ws, hits, &n) == Status::InvalidArgument);
+		CHECK(QueryIntersect(f32bank.view, q.F32(), 1, p, ws, hits, &n) == Status::InvalidArgument);
+
+		// paddedDims over the overflow-proof ceiling is refused.
+		const int32_t bigDims = kMaxCrossDeviceDims + 16;
+		AlignedBuf bigQ(sizeof(float) * bigDims);
+		AlignedBuf bigRow(static_cast<size_t>(bigDims));
+		std::vector<float> bigScales(1, 0.5f);
+		BankView big;
+		big.rows = bigRow.I8();
+		big.scales = bigScales.data();
+		big.count = 1;
+		big.dims = bigDims;
+		big.paddedDims = bigDims;
+		big.quant = Quantization::Int8;
+		big.metric = Metric::Dot;
+		bigQ.F32()[0] = 1.0f;
+		CHECK(Query(big, bigQ.F32(), p, ws, hits, &n) == Status::InvalidArgument);
+	}
+
+	// --- Whole-row scores match the independent contract reimplementation, and
+	// the CrossDevice ranking tracks the full-precision reference (recall) ---
+	{
+		Rng rng(2026);
+		for (const Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, 300, 40, Quantization::Int8, metric);
+			AlignedBuf q(sizeof(float) * bank.view.paddedDims);
+			std::vector<float> qv(40);
+			for (auto& v : qv)
+			{
+				v = rng.NextFloat();
+			}
+			PadQuery(qv, bank.view.paddedDims, q.F32());
+
+			AlignedBuf q8(static_cast<size_t>(bank.view.paddedDims));
+			double scale = 0.0;
+			int64_t sq = 0;
+			QuantizeQueryXd(q.F32(), bank.view.paddedDims, q8.I8(), &scale, &sq);
+
+			QueryParams p;
+			p.k = bank.view.count;
+			p.exactness = Exactness::CrossDevice;
+			std::vector<Hit> hits(static_cast<size_t>(p.k));
+			int32_t n = 0;
+			CHECK(Query(bank.view, q.F32(), p, ws, hits.data(), &n) == Status::Ok);
+			CHECK(n == bank.view.count);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				const float want = xd::RefXdScore(bank.view, q8.I8(), scale, sq,
+					hits[i].index);
+				uint32_t wb, gb;
+				std::memcpy(&wb, &want, 4);
+				std::memcpy(&gb, &hits[i].score, 4);
+				CHECK_MSG(wb == gb, "metric %d row %d: ref %08x got %08x",
+					static_cast<int>(metric), hits[i].index, wb, gb);
+			}
+
+			// Recall@10 of CrossDevice mode vs the double reference (the honesty
+			// number: query quantization adds error beyond row quantization).
+			const std::vector<RefHit> ref = ReferenceScan(bank, q.F32(), nullptr);
+			int32_t match = 0;
+			for (int32_t i = 0; i < 10; ++i)
+			{
+				for (int32_t j = 0; j < 10; ++j)
+				{
+					if (hits[static_cast<size_t>(i)].index == ref[static_cast<size_t>(j)].index)
+					{
+						++match;
+						break;
+					}
+				}
+			}
+			// Standard-mode recall on the same query, for the side-by-side print.
+			QueryParams pd;
+			pd.k = 10;
+			Hit stdHits[10];
+			int32_t stdN = 0;
+			CHECK(Query(bank.view, q.F32(), pd, ws, stdHits, &stdN) == Status::Ok);
+			int32_t stdMatch = 0;
+			for (int32_t i = 0; i < stdN; ++i)
+			{
+				for (int32_t j = 0; j < 10; ++j)
+				{
+					if (stdHits[i].index == ref[static_cast<size_t>(j)].index)
+					{
+						++stdMatch;
+						break;
+					}
+				}
+			}
+			std::printf("cross-device recall@10 (metric %d): standard %d/10, cross-device %d/10\n",
+				static_cast<int>(metric), stdMatch, match);
+			CHECK_MSG(match >= 5, "cross-device recall collapsed: %d/10", match);
+		}
+	}
+
+	// --- Scratch snapshots score CrossDevice like their imported twin ---
+	{
+		Rng rng(4242);
+		const int32_t dims = 32;
+		const int32_t capacity = 24;
+		ScratchBank scratch;
+		CHECK(scratch.Create(capacity, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < capacity; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			int32_t index = -1;
+			CHECK(scratch.Append(row.data(), dims, &index) == Status::Ok);
+		}
+		BankView snapView;
+		std::vector<uint32_t> tombstones(
+			static_cast<size_t>(ScratchBank::TombstoneWords(capacity)));
+		CHECK(scratch.Snapshot(&snapView, tombstones.data()) == Status::Ok);
+
+		// Twin: a plain view over the same payload bytes.
+		BankView twin = snapView;
+
+		AlignedBuf q(sizeof(float) * snapView.paddedDims);
+		std::vector<float> qv(static_cast<size_t>(dims));
+		for (auto& v : qv)
+		{
+			v = rng.NextFloat();
+		}
+		PadQuery(qv, snapView.paddedDims, q.F32());
+		QueryParams p;
+		p.k = 8;
+		p.exactness = Exactness::CrossDevice;
+		Hit a[8], b[8];
+		int32_t na = 0, nb = 0;
+		CHECK(Query(snapView, q.F32(), p, ws, a, &na) == Status::Ok);
+		CHECK(Query(twin, q.F32(), p, ws, b, &nb) == Status::Ok);
+		CHECK(na == nb);
+		for (int32_t i = 0; i < na; ++i)
+		{
+			uint32_t ab, bb;
+			std::memcpy(&ab, &a[i].score, 4);
+			std::memcpy(&bb, &b[i].score, 4);
+			CHECK(a[i].index == b[i].index && ab == bb);
+		}
+	}
+
+	// --- Allocation flatness: warm CrossDevice queries never allocate ---
+	{
+		Rng rng(99);
+		TestBank bank(rng, 200, 48, Quantization::Int8, Metric::Dot);
+		AlignedBuf q(sizeof(float) * bank.view.paddedDims);
+		std::vector<float> qv(48);
+		for (auto& v : qv)
+		{
+			v = rng.NextFloat();
+		}
+		PadQuery(qv, bank.view.paddedDims, q.F32());
+		QueryParams p;
+		p.k = 12;
+		p.exactness = Exactness::CrossDevice;
+		Hit hits[12];
+		int32_t n = 0;
+		CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok); // warm
+		const uint64_t before = AllocationCount();
+		for (int32_t i = 0; i < 16; ++i)
+		{
+			CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok);
+		}
+		CHECK_MSG(AllocationCount() == before, "warm CrossDevice queries allocated");
+	}
+
+	// --- The forced-path matrix + the pinned committed-fixture hash (19.4) ---
+	{
+		std::vector<SimdPath> paths;
+		paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+		paths.push_back(SimdPath::SSE);
+		if (ActiveSimdPath() == SimdPath::AVX2)
+		{
+			paths.push_back(SimdPath::AVX2);
+		}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+		paths.push_back(SimdPath::NEON);
+#endif
+
+		uint64_t hashes[4] = {};
+		for (size_t i = 0; i < paths.size(); ++i)
+		{
+			detail::ForceXdSimdPath(paths[i]);
+			hashes[i] = xd::RunBattery(ws, nullptr);
+			detail::ClearForcedXdSimdPath();
+			if (i > 0)
+			{
+				CHECK_MSG(hashes[i] == hashes[0],
+					"forced path %d hash %llx != path %d hash %llx",
+					static_cast<int>(paths[i]),
+					static_cast<unsigned long long>(hashes[i]),
+					static_cast<int>(paths[0]),
+					static_cast<unsigned long long>(hashes[0]));
+			}
+		}
+
+		// The default dispatch matches the forced sweep.
+		std::FILE* record = nullptr;
+		const char* recordPath = std::getenv("SUPERFAISS_XD_SELECTION_OUT");
+		if (recordPath != nullptr)
+		{
+			record = std::fopen(recordPath, "wb");
+		}
+		const uint64_t defaultHash = xd::RunBattery(ws, record);
+		if (record != nullptr)
+		{
+			std::fprintf(record, "hash %016llx\n",
+				static_cast<unsigned long long>(defaultHash));
+			std::fclose(record);
+		}
+		CHECK(defaultHash == hashes[0]);
+
+		std::printf("cross-device hash: %016llx (%d forced paths agree)\n",
+			static_cast<unsigned long long>(defaultHash),
+			static_cast<int>(paths.size()));
+		if constexpr (xdfix::kGoldenXdHash != 0)
+		{
+			CHECK_MSG(defaultHash == xdfix::kGoldenXdHash,
+				"cross-device hash %016llx != pinned golden %016llx",
+				static_cast<unsigned long long>(defaultHash),
+				static_cast<unsigned long long>(xdfix::kGoldenXdHash));
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -3218,6 +3961,7 @@ int main()
 	TestScratchBanks();
 	TestPinDrainLitmus();
 	TestPerRowBias();
+	TestCrossDevice();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

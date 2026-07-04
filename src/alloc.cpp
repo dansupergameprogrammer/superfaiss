@@ -1,5 +1,7 @@
 #include "superfaiss/alloc.h"
 
+#include "superfaiss/kernels.h"
+
 #include <atomic>
 #include <cstdlib>
 
@@ -67,6 +69,67 @@ Workspace::~Workspace()
 	detail::SeamFree(Allocator_, Storage_);
 	detail::SeamFree(Allocator_, QueryScratch_);
 	detail::SeamFree(Allocator_, BiasBits_);
+	detail::SeamFree(Allocator_, XdQ8_);
+}
+
+bool Workspace::ReserveXdQuery(int32_t paddedDims, int32_t count)
+{
+	if (paddedDims <= 0 || count < 1)
+	{
+		return false;
+	}
+	if (paddedDims <= XdDims_ && count <= XdCount_)
+	{
+		return true;
+	}
+	const int32_t newDims = paddedDims > XdDims_ ? paddedDims : XdDims_;
+	const int32_t newCount = count > XdCount_ ? count : XdCount_;
+	// One block: count x paddedDims int8 (16-aligned rows since paddedDims is a
+	// multiple of 16 for int8 banks), then count doubles, then count int64s -
+	// the scalar slots padded up to 16-byte alignment.
+	const size_t q8Bytes =
+		((static_cast<size_t>(newDims) * newCount + 15) / 16) * 16;
+	const size_t bytes = q8Bytes +
+		static_cast<size_t>(newCount) * (sizeof(double) + sizeof(int64_t) + sizeof(XdQuery));
+	int8_t* grown = static_cast<int8_t*>(detail::SeamAlloc(Allocator_, bytes, 16));
+	if (grown == nullptr)
+	{
+		return false;
+	}
+	detail::SeamFree(Allocator_, XdQ8_);
+	XdQ8_ = grown;
+	XdDims_ = newDims;
+	XdCount_ = newCount;
+	++GrowthCount_;
+	return true;
+}
+
+int8_t* Workspace::XdQ8(int32_t queryIndex)
+{
+	return XdQ8_ + static_cast<int64_t>(queryIndex) * XdDims_;
+}
+
+double* Workspace::XdScale(int32_t queryIndex)
+{
+	const size_t q8Bytes =
+		((static_cast<size_t>(XdDims_) * XdCount_ + 15) / 16) * 16;
+	return reinterpret_cast<double*>(XdQ8_ + q8Bytes) + queryIndex;
+}
+
+int64_t* Workspace::XdSqSum(int32_t queryIndex)
+{
+	const size_t q8Bytes =
+		((static_cast<size_t>(XdDims_) * XdCount_ + 15) / 16) * 16;
+	return reinterpret_cast<int64_t*>(
+		XdQ8_ + q8Bytes + static_cast<size_t>(XdCount_) * sizeof(double)) + queryIndex;
+}
+
+XdQuery* Workspace::XdSlots()
+{
+	const size_t q8Bytes =
+		((static_cast<size_t>(XdDims_) * XdCount_ + 15) / 16) * 16;
+	return reinterpret_cast<XdQuery*>(XdQ8_ + q8Bytes +
+		static_cast<size_t>(XdCount_) * (sizeof(double) + sizeof(int64_t)));
 }
 
 bool Workspace::ReserveQueryScratch(int32_t paddedDims, int32_t count)

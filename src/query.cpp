@@ -78,8 +78,21 @@ namespace
 		const float* originalQuery,
 		const QueryParams& params,
 		bool bFoldable,
+		const XdQuery* xd,
 		int32_t r)
 	{
+		if (xd != nullptr)
+		{
+			// CrossDevice rescore: the same integer kernels + double epilogue the
+			// scan ran, so the composed similarity term is bit-identical.
+			if (params.segments != nullptr)
+			{
+				float contributions[kMaxSegments];
+				return DecomposeRowScoreXd(scoring, *xd, r, params.segments,
+					params.segmentCount, contributions);
+			}
+			return ScoreRowXd(scoring, *xd, r);
+		}
 		if (params.segments != nullptr && !bFoldable)
 		{
 			float contributions[kMaxSegments];
@@ -120,6 +133,7 @@ namespace
 		const float* originalQuery,
 		const QueryParams& params,
 		bool bFoldable,
+		const XdQuery* xd,
 		Hit* selectionStorage,
 		Hit* outHits)
 	{
@@ -158,9 +172,13 @@ namespace
 			if (!found)
 			{
 				s = RescoreRow(scoring, effectiveQuery, originalQuery, params,
-					bFoldable, row);
+					bFoldable, xd, row);
 			}
-			selection.Push(row, s + bias.pairs[p].bias);
+			// CrossDevice composes through the floored-double form - the same
+			// expression the dense in-scan path uses, so sparse == dense bitwise.
+			selection.Push(row, xd != nullptr
+				? detail::XdComposeBiasValue(s, bias.pairs[p].bias)
+				: s + bias.pairs[p].bias);
 		}
 		return selection.Finalize(outHits);
 	}
@@ -224,6 +242,15 @@ Status Query(
 		}
 	}
 
+	// CrossDevice laws (v2.2): Int8 banks only, and the paddedDims ceiling that
+	// keeps every integer accumulator overflow-free.
+	const bool bXd = params.exactness == Exactness::CrossDevice;
+	if (bXd &&
+		(bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims))
+	{
+		return Status::InvalidArgument;
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
@@ -237,10 +264,11 @@ Status Query(
 
 	// Per-channel-cosine banks score through the dense path (the inverse sub-norm
 	// is a row-side factor and cannot fold into the query); the metric override
-	// composes to raw-dot projection and folds (section 5).
+	// composes to raw-dot projection and folds (section 5). CrossDevice never
+	// folds: weights apply at combine, in double, on integer partials.
 	const bool bPerChannelCosine = bank.metric == Metric::Cosine &&
 		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
-	const bool bFoldable = params.segments != nullptr &&
+	const bool bFoldable = !bXd && params.segments != nullptr &&
 		scoring.metric != Metric::L2 && !bPerChannelCosine;
 	const float* effectiveQuery = paddedQuery;
 	if (bFoldable)
@@ -254,6 +282,20 @@ Status Query(
 		effectiveQuery = workspace.QueryScratch(0);
 	}
 
+	XdQuery xdQuery;
+	if (bXd)
+	{
+		if (!workspace.ReserveXdQuery(bank.paddedDims, 1))
+		{
+			return Status::OutOfMemory;
+		}
+		QuantizeQueryXd(paddedQuery, bank.paddedDims, workspace.XdQ8(0),
+			workspace.XdScale(0), workspace.XdSqSum(0));
+		xdQuery.q8 = workspace.XdQ8(0);
+		xdQuery.scale = *workspace.XdScale(0);
+		xdQuery.sqSum = *workspace.XdSqSum(0);
+	}
+
 	TopK topk;
 	topk.Init(workspace.HeapStorage(0), scanK, scoring.metric);
 
@@ -261,7 +303,21 @@ Status Query(
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		if (params.segments != nullptr && !bFoldable)
+		if (bXd)
+		{
+			if (params.segments != nullptr)
+			{
+				ScoreChunkSegmentedXd(scoring, xdQuery, c, params.excludeBits,
+					params.segments, params.segmentCount, topk, bias.dense,
+					&nonFiniteBias);
+			}
+			else
+			{
+				ScoreChunkXd(scoring, xdQuery, c, params.excludeBits, topk,
+					bias.dense, &nonFiniteBias);
+			}
+		}
+		else if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkSegmented(scoring, paddedQuery, c, params.excludeBits,
 				params.segments, params.segmentCount, topk, bias.dense, &nonFiniteBias);
@@ -282,7 +338,8 @@ Status Query(
 		const int32_t candidateCount = topk.Finalize(workspace.HeapStorage(1));
 		*outCount = SelectWithSparseBias(scoring, workspace.HeapStorage(1),
 			candidateCount, bias, workspace.BiasBits(), effectiveQuery, paddedQuery,
-			params, bFoldable, workspace.HeapStorage(2), outHits);
+			params, bFoldable, bXd ? &xdQuery : nullptr, workspace.HeapStorage(2),
+			outHits);
 		return Status::Ok;
 	}
 
@@ -458,12 +515,19 @@ Status QueryBatch(
 		}
 	}
 
+	const bool bXd = params.exactness == Exactness::CrossDevice;
+	if (bXd &&
+		(bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims))
+	{
+		return Status::InvalidArgument;
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
 	const bool bBatchPerChannelCosine = bank.metric == Metric::Cosine &&
 		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
-	const bool bFoldable = params.segments != nullptr &&
+	const bool bFoldable = !bXd && params.segments != nullptr &&
 		scoring.metric != Metric::L2 && !bBatchPerChannelCosine;
 
 	// Dot-family segmented batch: fold each query once, then the batch IS the
@@ -492,6 +556,10 @@ Status QueryBatch(
 	{
 		return Status::OutOfMemory;
 	}
+	if (bXd && !workspace.ReserveXdQuery(bank.paddedDims, maxWidth))
+	{
+		return Status::OutOfMemory;
+	}
 
 	const bool bNonFoldSegmented = params.segments != nullptr && !bFoldable;
 	bool nonFiniteBias = false;
@@ -512,11 +580,31 @@ Status QueryBatch(
 			biasForms = biasStack;
 		}
 
-		if (bNonFoldSegmented)
+		XdQuery* xdSlots = nullptr;
+		if (bXd)
 		{
-			// Segmented batches keep the chunk-outermost structure — the bank
-			// streams once per batch — with the single-query segmented kernel
-			// scoring each query inside the chunk (plan 18.7/W1 composition).
+			// CrossDevice quantization per sub-batch query; the scan below keeps
+			// the chunk-outermost structure with the single-query CrossDevice
+			// kernel inside (batch == singles bitwise by construction; the pair
+			// row-sharing kernels are a PerDevice throughput device, not used).
+			xdSlots = workspace.XdSlots();
+			for (int32_t m = 0; m < width; ++m)
+			{
+				QuantizeQueryXd(
+					paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims,
+					bank.paddedDims, workspace.XdQ8(m), workspace.XdScale(m),
+					workspace.XdSqSum(m));
+				xdSlots[m].q8 = workspace.XdQ8(m);
+				xdSlots[m].scale = *workspace.XdScale(m);
+				xdSlots[m].sqSum = *workspace.XdSqSum(m);
+			}
+		}
+
+		if (bNonFoldSegmented || bXd)
+		{
+			// Segmented (and CrossDevice) batches keep the chunk-outermost
+			// structure — the bank streams once per batch — with the single-query
+			// kernel scoring each query inside the chunk (plan 18.7/W1).
 			TopK topks[kSubBatchWidth];
 			for (int32_t m = 0; m < width; ++m)
 			{
@@ -528,12 +616,30 @@ Status QueryBatch(
 			{
 				for (int32_t m = 0; m < width; ++m)
 				{
-					ScoreChunkSegmented(scoring,
-						paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims,
-						c, params.excludeBits, params.segments, params.segmentCount,
-						topks[m],
-						biasForms != nullptr ? biasForms[m].dense : nullptr,
-						&nonFiniteBias);
+					const float* denseBias =
+						biasForms != nullptr ? biasForms[m].dense : nullptr;
+					if (bXd)
+					{
+						if (params.segments != nullptr)
+						{
+							ScoreChunkSegmentedXd(scoring, xdSlots[m], c,
+								params.excludeBits, params.segments,
+								params.segmentCount, topks[m], denseBias,
+								&nonFiniteBias);
+						}
+						else
+						{
+							ScoreChunkXd(scoring, xdSlots[m], c, params.excludeBits,
+								topks[m], denseBias, &nonFiniteBias);
+						}
+					}
+					else
+					{
+						ScoreChunkSegmented(scoring,
+							paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims,
+							c, params.excludeBits, params.segments, params.segmentCount,
+							topks[m], denseBias, &nonFiniteBias);
+					}
 				}
 			}
 			for (int32_t m = 0; m < width; ++m)
@@ -597,6 +703,7 @@ Status QueryBatch(
 				outCounts[base + m] = SelectWithSparseBias(scoring,
 					workspace.HeapStorage(width + m), candidateCounts[m], biasForms[m],
 					bits, effective, original, params, bFoldable,
+					bXd ? &xdSlots[m] : nullptr,
 					workspace.HeapStorage(2 * maxWidth), // shared selection slot
 					outHits + static_cast<int64_t>(base + m) * params.k);
 			}
@@ -673,6 +780,13 @@ Status QueryIntersect(
 		}
 	}
 
+	const bool bXd = params.exactness == Exactness::CrossDevice;
+	if (bXd &&
+		(bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims))
+	{
+		return Status::InvalidArgument;
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
@@ -687,7 +801,7 @@ Status QueryIntersect(
 
 	const bool bIntersectPerChannelCosine = bank.metric == Metric::Cosine &&
 		bank.channelInvNorms != nullptr && params.scoreAs == ScoreAs::BankMetric;
-	const bool bFoldable = params.segments != nullptr &&
+	const bool bFoldable = !bXd && params.segments != nullptr &&
 		scoring.metric != Metric::L2 && !bIntersectPerChannelCosine;
 	const float* effectiveQueries = paddedQueries;
 	if (bFoldable)
@@ -706,11 +820,37 @@ Status QueryIntersect(
 		effectiveQueries = workspace.QueryScratch(0);
 	}
 
+	XdQuery* xdSlots = nullptr;
+	if (bXd)
+	{
+		if (!workspace.ReserveXdQuery(bank.paddedDims, queryCount))
+		{
+			return Status::OutOfMemory;
+		}
+		xdSlots = workspace.XdSlots();
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			QuantizeQueryXd(
+				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+				bank.paddedDims, workspace.XdQ8(m), workspace.XdScale(m),
+				workspace.XdSqSum(m));
+			xdSlots[m].q8 = workspace.XdQ8(m);
+			xdSlots[m].scale = *workspace.XdScale(m);
+			xdSlots[m].sqSum = *workspace.XdSqSum(m);
+		}
+	}
+
 	bool nonFiniteBias = false;
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		if (params.segments != nullptr && !bFoldable)
+		if (bXd)
+		{
+			ScoreChunkFusedXd(scoring, xdSlots, queryCount, c, params.excludeBits,
+				params.segments, params.segmentCount, topk, bias.dense,
+				&nonFiniteBias);
+		}
+		else if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkFusedSegmented(scoring, paddedQueries, queryCount, c,
 				params.excludeBits, params.segments, params.segmentCount, topk,
@@ -770,14 +910,16 @@ Status QueryIntersect(
 					const float score = RescoreRow(scoring,
 						effectiveQueries + static_cast<int64_t>(m) * bank.paddedDims,
 						paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
-						params, bFoldable, row);
+						params, bFoldable, bXd ? &xdSlots[m] : nullptr, row);
 					if (m == 0 || (isL2 ? score > fused : score < fused))
 					{
 						fused = score;
 					}
 				}
 			}
-			selection.Push(row, fused + bias.pairs[p].bias);
+			selection.Push(row, bXd
+				? detail::XdComposeBiasValue(fused, bias.pairs[p].bias)
+				: fused + bias.pairs[p].bias);
 		}
 		*outCount = selection.Finalize(outHits);
 		return Status::Ok;
