@@ -1568,6 +1568,336 @@ static void TestPca()
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T20 — segmented scan, slot 1 (V2 plan §4/§12):
+//   A1 — degenerate one-segment list bit-identical to the V1 kernel, full
+//        metric x quantization matrix, through Query, QueryBatch, and
+//        QueryIntersect.
+//   A2 — segmented scores equal an independent float64 reference over the same
+//        segments with weights (dot / L2; cosine's per-channel norms are bank
+//        data and land with schemaVersion 2 in slot 2).
+//   A3 — masked ranges are never read: perturbing them leaves scores bitwise
+//        unchanged.
+//   B  — repeat determinism, external chunk-fusion merge bit-identity,
+//        validation rejections including the query-side zero-norm segment law.
+
+static void TestSegmentedScan()
+{
+	Rng rng(0x5E63E17ull);
+	const int32_t dims = 32; // f32 grid 4, int8 grid 16: 32 works for both
+	const int32_t count = 300;
+	const int32_t k = 10;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			TestBank bank(rng, count, dims, quant, metric);
+			const int32_t pd = bank.view.paddedDims;
+			AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+			std::vector<float> qv(static_cast<size_t>(dims));
+			for (auto& x : qv)
+			{
+				x = rng.NextFloat();
+			}
+			PadQuery(qv, pd, q.F32());
+
+			// --- A1: degenerate segment ≡ V1, bit-identical.
+			{
+				QueryParams plain;
+				plain.k = k;
+				Workspace ws;
+				std::vector<Hit> v1(static_cast<size_t>(k));
+				int32_t v1Count = 0;
+				CHECK(Query(bank.view, q.F32(), plain, ws, v1.data(), &v1Count) ==
+					Status::Ok);
+
+				const QuerySegment degenerate[1] = {{0, pd, 1.0f}};
+				QueryParams seg = plain;
+				seg.segments = degenerate;
+				seg.segmentCount = 1;
+				Workspace ws2;
+				std::vector<Hit> v2(static_cast<size_t>(k));
+				int32_t v2Count = 0;
+				CHECK(Query(bank.view, q.F32(), seg, ws2, v2.data(), &v2Count) ==
+					Status::Ok);
+				CHECK(v2Count == v1Count);
+				for (int32_t i = 0; i < v1Count && i < v2Count; ++i)
+				{
+					CHECK(v2[i].index == v1[i].index && v2[i].score == v1[i].score);
+				}
+
+				// Batch degenerate ≡ plain batch, bit-identical.
+				const int32_t m = 3;
+				AlignedBuf batch(static_cast<size_t>(m) * pd * sizeof(float));
+				for (int32_t qi = 0; qi < m; ++qi)
+				{
+					std::vector<float> row(static_cast<size_t>(dims));
+					for (auto& x : row)
+					{
+						x = rng.NextFloat();
+					}
+					PadQuery(row, pd, batch.F32() + static_cast<int64_t>(qi) * pd);
+				}
+				Workspace wsB1, wsB2;
+				std::vector<Hit> plainHits(static_cast<size_t>(m) * k);
+				std::vector<Hit> segHits(static_cast<size_t>(m) * k);
+				std::vector<int32_t> plainCounts(static_cast<size_t>(m));
+				std::vector<int32_t> segCounts(static_cast<size_t>(m));
+				CHECK(QueryBatch(bank.view, batch.F32(), m, plain, wsB1,
+					plainHits.data(), plainCounts.data()) == Status::Ok);
+				CHECK(QueryBatch(bank.view, batch.F32(), m, seg, wsB2,
+					segHits.data(), segCounts.data()) == Status::Ok);
+				for (int32_t qi = 0; qi < m; ++qi)
+				{
+					CHECK(segCounts[qi] == plainCounts[qi]);
+					for (int32_t i = 0; i < segCounts[qi]; ++i)
+					{
+						const Hit& a = segHits[static_cast<size_t>(qi) * k + i];
+						const Hit& b = plainHits[static_cast<size_t>(qi) * k + i];
+						CHECK(a.index == b.index && a.score == b.score);
+					}
+				}
+
+				// Intersect degenerate ≡ plain intersect, bit-identical.
+				Workspace wsI1, wsI2;
+				std::vector<Hit> plainF(static_cast<size_t>(k));
+				std::vector<Hit> segF(static_cast<size_t>(k));
+				int32_t plainFCount = 0, segFCount = 0;
+				CHECK(QueryIntersect(bank.view, batch.F32(), m, plain, wsI1,
+					plainF.data(), &plainFCount) == Status::Ok);
+				CHECK(QueryIntersect(bank.view, batch.F32(), m, seg, wsI2,
+					segF.data(), &segFCount) == Status::Ok);
+				CHECK(segFCount == plainFCount);
+				for (int32_t i = 0; i < plainFCount && i < segFCount; ++i)
+				{
+					CHECK(segF[i].index == plainF[i].index &&
+						segF[i].score == plainF[i].score);
+				}
+			}
+
+			// --- A2: two weighted segments vs float64 reference (dot and L2; a
+			// Cosine bank's segmented semantics refine with slot 2's channel norms —
+			// here its rows score as stored, which the reference mirrors).
+			{
+				const int32_t grid = kAlignment / ElementSize(quant);
+				const int32_t segLen = (dims / 2 / grid) * grid;
+				const QuerySegment segs[2] = {
+					{0, segLen, 0.75f},
+					{segLen, segLen, 2.0f},
+				};
+				QueryParams sp;
+				sp.k = k;
+				sp.segments = segs;
+				sp.segmentCount = 2;
+				Workspace ws;
+				std::vector<Hit> got(static_cast<size_t>(k));
+				int32_t gotCount = 0;
+				CHECK(Query(bank.view, q.F32(), sp, ws, got.data(), &gotCount) ==
+					Status::Ok);
+
+				std::vector<RefHit> ref;
+				for (int32_t r = 0; r < count; ++r)
+				{
+					const double* row = bank.refRows.data() + static_cast<size_t>(r) * dims;
+					double total = 0.0;
+					for (const QuerySegment& sg : segs)
+					{
+						double partial = 0.0;
+						for (int32_t j = sg.offset; j < sg.offset + sg.length && j < dims; ++j)
+						{
+							if (metric == Metric::L2)
+							{
+								const double d = static_cast<double>(q.F32()[j]) - row[j];
+								partial += d * d;
+							}
+							else
+							{
+								partial += static_cast<double>(q.F32()[j]) * row[j];
+							}
+						}
+						total += static_cast<double>(sg.weight) * partial;
+					}
+					ref.push_back({r, total});
+				}
+				std::sort(ref.begin(), ref.end(), [&](const RefHit& a, const RefHit& b) {
+					return RefBetter(a, b, metric);
+				});
+				CheckTopK(bank, ref, got.data(), gotCount, k);
+			}
+
+			// --- A3: masked ranges never read — perturb the omitted middle, scores
+			// bitwise unchanged. (Copy the payload, poison the masked range, rescan.)
+			{
+				const int32_t grid = kAlignment / ElementSize(quant);
+				const int32_t third = (dims / 3 / grid) * grid;
+				if (third > 0 && 3 * third <= pd)
+				{
+					const QuerySegment maskSegs[2] = {
+						{0, third, 1.0f},
+						{2 * third, third, 1.0f}, // middle third omitted = masked
+					};
+					QueryParams mp;
+					mp.k = k;
+					mp.segments = maskSegs;
+					mp.segmentCount = 2;
+					Workspace ws;
+					std::vector<Hit> before(static_cast<size_t>(k));
+					int32_t beforeCount = 0;
+					CHECK(Query(bank.view, q.F32(), mp, ws, before.data(),
+						&beforeCount) == Status::Ok);
+
+					const int64_t bytes = BankBytes(bank.view);
+					AlignedBuf poisoned(static_cast<size_t>(bytes));
+					std::memcpy(poisoned.ptr, bank.view.rows, static_cast<size_t>(bytes));
+					BankView pv = bank.view;
+					pv.rows = poisoned.ptr;
+					for (int32_t r = 0; r < count; ++r)
+					{
+						if (quant == Quantization::Float32)
+						{
+							float* row = poisoned.F32() + static_cast<int64_t>(r) * pd;
+							for (int32_t j = third; j < 2 * third; ++j)
+							{
+								row[j] = 12345.678f + j;
+							}
+						}
+						else
+						{
+							int8_t* row = poisoned.I8() + static_cast<int64_t>(r) * pd;
+							for (int32_t j = third; j < 2 * third; ++j)
+							{
+								row[j] = static_cast<int8_t>((j * 37) & 0x7F);
+							}
+						}
+					}
+					Workspace ws2;
+					std::vector<Hit> after(static_cast<size_t>(k));
+					int32_t afterCount = 0;
+					CHECK(Query(pv, q.F32(), mp, ws2, after.data(), &afterCount) ==
+						Status::Ok);
+					CHECK(afterCount == beforeCount);
+					for (int32_t i = 0; i < beforeCount && i < afterCount; ++i)
+					{
+						CHECK(after[i].index == before[i].index &&
+							after[i].score == before[i].score);
+					}
+				}
+			}
+
+			// --- B: repeat determinism + external chunk merge bit-identity.
+			{
+				const int32_t grid = kAlignment / ElementSize(quant);
+				const QuerySegment segs[1] = {{0, (dims / grid) * grid, 1.5f}};
+				QueryParams sp;
+				sp.k = k;
+				sp.segments = segs;
+				sp.segmentCount = 1;
+
+				Workspace wsA, wsB;
+				std::vector<Hit> a(static_cast<size_t>(k)), b(static_cast<size_t>(k));
+				int32_t na = 0, nb = 0;
+				CHECK(Query(bank.view, q.F32(), sp, wsA, a.data(), &na) == Status::Ok);
+				CHECK(Query(bank.view, q.F32(), sp, wsB, b.data(), &nb) == Status::Ok);
+				CHECK(na == nb);
+				for (int32_t i = 0; i < na && i < nb; ++i)
+				{
+					CHECK(a[i].index == b[i].index && a[i].score == b[i].score);
+				}
+
+				const int32_t chunks = ChunkCount(bank.view);
+				std::vector<Hit> heap(static_cast<size_t>(chunks) * k);
+				std::vector<Hit> sorted(static_cast<size_t>(chunks) * k);
+				std::vector<const Hit*> lists(static_cast<size_t>(chunks));
+				std::vector<int32_t> counts(static_cast<size_t>(chunks));
+				for (int32_t c = 0; c < chunks; ++c)
+				{
+					TopK chunkTop;
+					chunkTop.Init(heap.data() + static_cast<size_t>(c) * k, k,
+						bank.view.metric);
+					ScoreChunkSegmented(bank.view, q.F32(), c, nullptr, segs, 1, chunkTop);
+					lists[c] = sorted.data() + static_cast<size_t>(c) * k;
+					counts[c] = chunkTop.Finalize(
+						sorted.data() + static_cast<size_t>(c) * k);
+				}
+				std::vector<Hit> mergeHeap(static_cast<size_t>(k));
+				std::vector<Hit> merged(static_cast<size_t>(k));
+				const int32_t mergedCount = MergeTopK(lists.data(), counts.data(),
+					chunks, bank.view.metric, k, mergeHeap.data(), merged.data());
+				CHECK(mergedCount == na);
+				for (int32_t i = 0; i < mergedCount && i < na; ++i)
+				{
+					CHECK(merged[i].index == a[i].index && merged[i].score == a[i].score);
+				}
+			}
+		}
+	}
+
+	// --- Validation rejections.
+	{
+		TestBank bank(rng, 16, dims, Quantization::Float32, Metric::Cosine);
+		const int32_t pd = bank.view.paddedDims;
+		AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+		std::vector<float> qv(static_cast<size_t>(dims));
+		for (auto& x : qv)
+		{
+			x = rng.NextFloat();
+		}
+		PadQuery(qv, pd, q.F32());
+		Workspace ws;
+		Hit h[4];
+		int32_t n = 0;
+		QueryParams sp;
+		sp.k = 4;
+
+		// Overlap.
+		const QuerySegment overlap[2] = {{0, 8, 1.0f}, {4, 8, 1.0f}};
+		sp.segments = overlap;
+		sp.segmentCount = 2;
+		CHECK(Query(bank.view, q.F32(), sp, ws, h, &n) == Status::InvalidArgument);
+
+		// Off-grid offset (grid is 4 for f32).
+		const QuerySegment offgrid[1] = {{2, 8, 1.0f}};
+		sp.segments = offgrid;
+		sp.segmentCount = 1;
+		CHECK(Query(bank.view, q.F32(), sp, ws, h, &n) == Status::InvalidArgument);
+
+		// Out of range.
+		const QuerySegment oob[1] = {{0, pd + 4, 1.0f}};
+		sp.segments = oob;
+		sp.segmentCount = 1;
+		CHECK(Query(bank.view, q.F32(), sp, ws, h, &n) == Status::InvalidArgument);
+
+		// Too many segments.
+		QuerySegment many[kMaxSegments + 1];
+		for (int32_t i = 0; i <= kMaxSegments; ++i)
+		{
+			many[i] = {i * 4, 4, 1.0f};
+		}
+		sp.segments = many;
+		sp.segmentCount = kMaxSegments + 1;
+		CHECK(Query(bank.view, q.F32(), sp, ws, h, &n) == Status::InvalidArgument);
+
+		// Query-side zero-norm segment law on a Cosine bank: zero the query over a
+		// nonzero-weight segment -> ZeroNormQuery; weight-0 on that segment -> Ok.
+		AlignedBuf zq(static_cast<size_t>(pd) * sizeof(float));
+		std::memcpy(zq.F32(), q.F32(), static_cast<size_t>(pd) * sizeof(float));
+		for (int32_t j = 0; j < 8; ++j)
+		{
+			zq.F32()[j] = 0.0f;
+		}
+		const QuerySegment zseg[2] = {{0, 8, 1.0f}, {8, 8, 1.0f}};
+		sp.segments = zseg;
+		sp.segmentCount = 2;
+		CHECK(Query(bank.view, zq.F32(), sp, ws, h, &n) == Status::ZeroNormQuery);
+		const QuerySegment zskip[2] = {{0, 8, 0.0f}, {8, 8, 1.0f}};
+		sp.segments = zskip;
+		sp.segmentCount = 2;
+		CHECK(Query(bank.view, zq.F32(), sp, ws, h, &n) == Status::Ok);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -1589,6 +1919,7 @@ int main()
 	TestMargin();
 	TestIntersect();
 	TestPca();
+	TestSegmentedScan();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

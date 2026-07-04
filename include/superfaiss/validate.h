@@ -16,6 +16,19 @@ Status ValidateBank(const BankView& bank);
 // (normalized embeddings cannot overflow).
 Status ValidateQuery(const BankView& bank, const float* paddedQuery);
 
+// Segmented-query validation (V2): segment count in [1, kMaxSegments]; offsets and
+// lengths positive, on the 16-byte element grid for the bank's quantization,
+// ascending and non-overlapping, ending within paddedDims; weights finite. On Cosine
+// banks, a zero-norm query sub-vector over a nonzero-weight segment is rejected as
+// ZeroNormQuery (the whole-vector zero-norm law, applied per scored segment) —
+// weight-0 segments are skipped before validation, matching their omission
+// semantics. Call after ValidateQuery.
+Status ValidateSegments(
+	const BankView& bank,
+	const float* paddedQuery,
+	const QuerySegment* segments,
+	int32_t segmentCount);
+
 // Full bank-content validation — O(count x paddedDims); intended for load time, not
 // per query. Rejects what the kernels cannot tolerate: non-finite float32 lanes (a NaN
 // score breaks the top-k total order), non-zero pad lanes (silently wrong L2), and

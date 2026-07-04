@@ -71,6 +71,23 @@ enum class ScoreAs : uint8_t
 	Dot = 1,
 };
 
+// One segment of a segmented query (the V2 unifying design): a contiguous element
+// range of the row with a scalar weight. Offsets and lengths lie on the 16-byte
+// element grid for the bank's quantization; segments are ascending, non-overlapping.
+// A mask is a range simply omitted from the list (those bytes are never read); a
+// weight-0 segment is equivalent to omission. Scores combine additively:
+// total = sum(weight_s * partial_s), valid for dot and squared-L2 alike.
+struct QuerySegment
+{
+	int32_t offset = 0; // elements
+	int32_t length = 0; // elements
+	float weight = 1.0f;
+};
+
+// Segment-count cap per query: covers the named use cases, bounds accumulator and
+// result-buffer sizing, keeps per-row loop overhead predictable. Raising is additive.
+inline constexpr int32_t kMaxSegments = 8;
+
 struct QueryParams
 {
 	int32_t k = 0;
@@ -78,6 +95,11 @@ struct QueryParams
 	// Null means no exclusions.
 	const uint32_t* excludeBits = nullptr;
 	ScoreAs scoreAs = ScoreAs::BankMetric;
+	// Optional segmented query: null means the whole row at weight 1 (the V1 path,
+	// bit-identical). The degenerate one-segment list (0, paddedDims, 1.0) is also
+	// bit-identical to the V1 path by construction.
+	const QuerySegment* segments = nullptr;
+	int32_t segmentCount = 0;
 };
 
 // The metric a query with these params is actually scored (and its hits ordered) by.

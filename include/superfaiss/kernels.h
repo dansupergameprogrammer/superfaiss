@@ -47,6 +47,35 @@ void ScoreChunkFused(
 	const uint32_t* excludeBits,
 	TopK& inout);
 
+// Segmented scan (V2 §4): scores each non-excluded row of one chunk over a segment
+// list — per-segment partials from the SAME per-row kernels ScoreChunk uses, combined
+// as sum(weight_s * partial_s) in segment order. The degenerate one-segment list
+// (0, paddedDims, 1.0) is bit-identical to ScoreChunk by construction (same kernel
+// entry points; x*1.0f is bitwise identity). Weight-0 segments and omitted ranges are
+// never read — masking is a bandwidth cut. Callers validate segments first
+// (ValidateSegments); kernels do not re-validate.
+void ScoreChunkSegmented(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout);
+
+// Segmented intersection: the fused worst-of law over segmented totals — each member
+// query scores through the same segmented per-row path, then worst-of in the metric's
+// better-direction. One segment list applies to every member query.
+void ScoreChunkFusedSegmented(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout);
+
 // Kernel path selected at compile time (NEON/SSE/scalar), plus a runtime AVX2+FMA
 // upgrade on x86 hardware that supports it. Dispatch is per-device stable, so the
 // per-device determinism promise is unaffected. Exposed for tests and diagnostics.

@@ -34,6 +34,16 @@ Status Query(
 		return queryStatus;
 	}
 
+	if (params.segments != nullptr)
+	{
+		const Status segStatus =
+			ValidateSegments(bank, paddedQuery, params.segments, params.segmentCount);
+		if (segStatus != Status::Ok)
+		{
+			return segStatus;
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
@@ -48,7 +58,15 @@ Status Query(
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		ScoreChunk(scoring, paddedQuery, c, params.excludeBits, topk);
+		if (params.segments != nullptr)
+		{
+			ScoreChunkSegmented(scoring, paddedQuery, c, params.excludeBits,
+				params.segments, params.segmentCount, topk);
+		}
+		else
+		{
+			ScoreChunk(scoring, paddedQuery, c, params.excludeBits, topk);
+		}
 	}
 
 	*outCount = topk.Finalize(outHits);
@@ -147,8 +165,61 @@ Status QueryBatch(
 		}
 	}
 
+	if (params.segments != nullptr)
+	{
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			const Status segStatus = ValidateSegments(bank,
+				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+				params.segments, params.segmentCount);
+			if (segStatus != Status::Ok)
+			{
+				return segStatus;
+			}
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
+
+	// Segmented batches keep the chunk-outermost structure — the bank streams once
+	// per batch — with the single-query segmented kernel scoring each query inside
+	// the chunk (plan 18.7/W1 composition; pair-blocked variants stay V1-shaped).
+	if (params.segments != nullptr)
+	{
+		const int32_t segWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
+		if (!workspace.Reserve(params.k, segWidth))
+		{
+			return Status::OutOfMemory;
+		}
+		for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+		{
+			const int32_t width =
+				(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+			TopK topks[kSubBatchWidth];
+			for (int32_t m = 0; m < width; ++m)
+			{
+				topks[m].Init(workspace.HeapStorage(m), params.k, scoring.metric);
+			}
+			const int32_t chunks = ChunkCount(scoring);
+			for (int32_t c = 0; c < chunks; ++c)
+			{
+				for (int32_t m = 0; m < width; ++m)
+				{
+					ScoreChunkSegmented(scoring,
+						paddedQueries + static_cast<int64_t>(base + m) * bank.paddedDims,
+						c, params.excludeBits, params.segments, params.segmentCount,
+						topks[m]);
+				}
+			}
+			for (int32_t m = 0; m < width; ++m)
+			{
+				outCounts[base + m] = topks[m].Finalize(
+					outHits + static_cast<int64_t>(base + m) * params.k);
+			}
+		}
+		return Status::Ok;
+	}
 
 	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
 	if (!workspace.Reserve(params.k, maxWidth))
@@ -203,6 +274,20 @@ Status QueryIntersect(
 		}
 	}
 
+	if (params.segments != nullptr)
+	{
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			const Status segStatus = ValidateSegments(bank,
+				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+				params.segments, params.segmentCount);
+			if (segStatus != Status::Ok)
+			{
+				return segStatus;
+			}
+		}
+	}
+
 	BankView scoring = bank;
 	scoring.metric = ScoringMetric(bank, params);
 
@@ -217,7 +302,16 @@ Status QueryIntersect(
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		ScoreChunkFused(scoring, paddedQueries, queryCount, c, params.excludeBits, topk);
+		if (params.segments != nullptr)
+		{
+			ScoreChunkFusedSegmented(scoring, paddedQueries, queryCount, c,
+				params.excludeBits, params.segments, params.segmentCount, topk);
+		}
+		else
+		{
+			ScoreChunkFused(scoring, paddedQueries, queryCount, c, params.excludeBits,
+				topk);
+		}
 	}
 
 	*outCount = topk.Finalize(outHits);

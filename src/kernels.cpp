@@ -849,4 +849,127 @@ void ScoreChunkFused(
 	}
 }
 
+namespace
+{
+	// Per-row segmented score: partials from the same dispatched per-row kernels the
+	// plain scan uses, combined in segment order. Weight-0 segments are never read.
+	template <typename RowType>
+	inline float SegmentedRowScore(
+		const RowType* row,
+		float scale, // int8 dequant scale; ignored for float32 via kernel choice
+		const float* paddedQuery,
+		const QuerySegment* segments,
+		int32_t segmentCount,
+		bool isL2,
+		bool isInt8)
+	{
+		float total = 0.0f;
+		for (int32_t s = 0; s < segmentCount; ++s)
+		{
+			const QuerySegment& seg = segments[s];
+			if (seg.weight == 0.0f)
+			{
+				continue;
+			}
+			float partial;
+			if (isInt8)
+			{
+				const int8_t* r = reinterpret_cast<const int8_t*>(row) + seg.offset;
+				partial = isL2
+					? detail::L2I8(r, scale, paddedQuery + seg.offset, seg.length)
+					: detail::DotI8(r, scale, paddedQuery + seg.offset, seg.length);
+			}
+			else
+			{
+				const float* r = reinterpret_cast<const float*>(row) + seg.offset;
+				partial = isL2
+					? detail::L2F32(r, paddedQuery + seg.offset, seg.length)
+					: detail::DotF32(r, paddedQuery + seg.offset, seg.length);
+			}
+			total += seg.weight * partial;
+		}
+		return total;
+	}
+}
+
+void ScoreChunkSegmented(
+	const BankView& bank,
+	const float* paddedQuery,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool isInt8 = bank.quant == Quantization::Int8;
+
+	for (int32_t r = begin; r < end; ++r)
+	{
+		if (IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		const uint8_t* row = static_cast<const uint8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * RowBytes(bank);
+		const float scale = isInt8 ? bank.scales[r] : 1.0f;
+		inout.Push(r, SegmentedRowScore(row, scale, paddedQuery, segments,
+			segmentCount, isL2, isInt8));
+	}
+}
+
+void ScoreChunkFusedSegmented(
+	const BankView& bank,
+	const float* paddedQueries,
+	int32_t queryCount,
+	int32_t chunkIndex,
+	const uint32_t* excludeBits,
+	const QuerySegment* segments,
+	int32_t segmentCount,
+	TopK& inout)
+{
+	const int32_t chunkRows = ChunkRows(bank);
+	const int32_t begin = chunkIndex * chunkRows;
+	int32_t end = begin + chunkRows;
+	if (end > bank.count)
+	{
+		end = bank.count;
+	}
+
+	const int32_t pd = bank.paddedDims;
+	const bool isL2 = bank.metric == Metric::L2;
+	const bool isInt8 = bank.quant == Quantization::Int8;
+
+	for (int32_t r = begin; r < end; ++r)
+	{
+		if (IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		const uint8_t* row = static_cast<const uint8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * RowBytes(bank);
+		const float scale = isInt8 ? bank.scales[r] : 1.0f;
+		float fused = 0.0f;
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			const float score = SegmentedRowScore(row, scale,
+				paddedQueries + static_cast<int64_t>(m) * pd, segments, segmentCount,
+				isL2, isInt8);
+			if (m == 0 || (isL2 ? score > fused : score < fused))
+			{
+				fused = score;
+			}
+		}
+		inout.Push(r, fused);
+	}
+}
+
 } // namespace superfaiss

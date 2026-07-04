@@ -86,6 +86,47 @@ Status ValidateQuery(const BankView& bank, const float* paddedQuery)
 	return Status::Ok;
 }
 
+Status ValidateSegments(
+	const BankView& bank,
+	const float* paddedQuery,
+	const QuerySegment* segments,
+	int32_t segmentCount)
+{
+	if (segments == nullptr || segmentCount <= 0 || segmentCount > kMaxSegments)
+	{
+		return Status::InvalidArgument;
+	}
+	const int32_t grid = kAlignment / ElementSize(bank.quant);
+	int32_t prevEnd = 0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		const QuerySegment& seg = segments[s];
+		if (seg.offset < 0 || seg.length <= 0 ||
+			seg.offset % grid != 0 || seg.length % grid != 0 ||
+			seg.offset < prevEnd ||
+			static_cast<int64_t>(seg.offset) + seg.length > bank.paddedDims ||
+			!std::isfinite(seg.weight))
+		{
+			return Status::InvalidArgument;
+		}
+		prevEnd = seg.offset + seg.length;
+
+		if (bank.metric == Metric::Cosine && seg.weight != 0.0f)
+		{
+			double norm = 0.0;
+			for (int32_t j = seg.offset; j < seg.offset + seg.length; ++j)
+			{
+				norm += static_cast<double>(paddedQuery[j]) * paddedQuery[j];
+			}
+			if (norm == 0.0)
+			{
+				return Status::ZeroNormQuery;
+			}
+		}
+	}
+	return Status::Ok;
+}
+
 Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 {
 	const Status structural = ValidateBank(bank);
