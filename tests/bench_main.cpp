@@ -4,8 +4,10 @@
 
 #include "superfaiss/superfaiss.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace superfaiss;
@@ -143,6 +145,214 @@ namespace
 	};
 }
 
+
+namespace
+{
+	// V2 slot-1 calibration (plan section 10): mask bandwidth win, weight overhead,
+	// segment break-even, V1 non-regression baseline, segmented-batch never-worse.
+	struct SegBench
+	{
+		Allocator alloc = DefaultAllocator();
+
+		static double Median(std::vector<double>& v)
+		{
+			std::sort(v.begin(), v.end());
+			return v[v.size() / 2];
+		}
+
+		void Run(int32_t count, int32_t dims, Quantization quant)
+		{
+			Rng rng;
+			std::vector<float> src(static_cast<size_t>(count) * dims);
+			for (auto& v : src)
+			{
+				v = rng.NextFloat();
+			}
+			const int32_t pd = PaddedDims(dims, quant);
+			const int64_t payloadBytes =
+				static_cast<int64_t>(count) * pd * ElementSize(quant);
+			void* payload = alloc.alloc(static_cast<size_t>(payloadBytes), kAlignment,
+				alloc.user);
+			std::vector<float> scales(static_cast<size_t>(count));
+			BankView view;
+			view.rows = payload;
+			view.count = count;
+			view.dims = dims;
+			view.paddedDims = pd;
+			view.quant = quant;
+			view.metric = Metric::Dot;
+			if (quant == Quantization::Float32)
+			{
+				PadRowsFloat32(src.data(), count, dims, pd, static_cast<float*>(payload));
+				view.scales = nullptr;
+			}
+			else
+			{
+				QuantizeRowsInt8(src.data(), count, dims, pd,
+					static_cast<int8_t*>(payload), scales.data());
+				view.scales = scales.data();
+			}
+
+			void* qmem = alloc.alloc(static_cast<size_t>(pd) * sizeof(float), kAlignment,
+				alloc.user);
+			float* q = static_cast<float*>(qmem);
+			std::memset(q, 0, static_cast<size_t>(pd) * sizeof(float));
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				q[j] = rng.NextFloat();
+			}
+
+			Workspace ws;
+			std::vector<Hit> hits(16);
+			int32_t n = 0;
+			QueryParams plain;
+			plain.k = 10;
+
+			auto timeQuery = [&](const QueryParams& params) -> double
+			{
+				std::vector<double> samples;
+				for (int32_t rep = 0; rep < 9; ++rep)
+				{
+					const double t0 = Now();
+					Query(view, q, params, ws, hits.data(), &n);
+					samples.push_back(Now() - t0);
+				}
+				return Median(samples) * 1000.0;
+			};
+
+			const double v1Ms = timeQuery(plain);
+
+			const QuerySegment degen[1] = {{0, pd, 1.0f}};
+			QueryParams degenParams = plain;
+			degenParams.segments = degen;
+			degenParams.segmentCount = 1;
+			const double degenMs = timeQuery(degenParams);
+
+			const int32_t grid = kAlignment / ElementSize(quant);
+			const int32_t quarter = (pd / 4 / grid) * grid;
+			const QuerySegment mask[1] = {{0, quarter, 1.0f}};
+			QueryParams maskParams = plain;
+			maskParams.segments = mask;
+			maskParams.segmentCount = 1;
+			const double maskMs = timeQuery(maskParams);
+
+			QuerySegment eight[8];
+			const int32_t seg8 = (pd / 8 / grid) * grid;
+			for (int32_t i = 0; i < 8; ++i)
+			{
+				eight[i].offset = i * seg8;
+				eight[i].length = seg8;
+				eight[i].weight = 1.0f + 0.1f * static_cast<float>(i);
+			}
+			QueryParams eightParams = plain;
+			eightParams.segments = eight;
+			eightParams.segmentCount = 8;
+			const double eightMs = timeQuery(eightParams);
+
+			const int32_t m = 64;
+			void* bmem = alloc.alloc(static_cast<size_t>(m) * pd * sizeof(float),
+				kAlignment, alloc.user);
+			float* batch = static_cast<float*>(bmem);
+			std::memset(batch, 0, static_cast<size_t>(m) * pd * sizeof(float));
+			for (int32_t qi = 0; qi < m; ++qi)
+			{
+				for (int32_t j = 0; j < dims; ++j)
+				{
+					batch[static_cast<int64_t>(qi) * pd + j] = rng.NextFloat();
+				}
+			}
+			std::vector<Hit> bhits(static_cast<size_t>(m) * 10);
+			std::vector<int32_t> bcounts(static_cast<size_t>(m));
+			std::vector<double> bsamples;
+			for (int32_t rep = 0; rep < 5; ++rep)
+			{
+				const double t0 = Now();
+				QueryBatch(view, batch, m, eightParams, ws, bhits.data(), bcounts.data());
+				bsamples.push_back(Now() - t0);
+			}
+			const double batchPerQueryMs = Median(bsamples) * 1000.0 / m;
+
+			std::printf(
+				"seg %7d x %3d %s: v1 %.3f ms | degen %.3f (%+.1f%%) | mask1/4 %.3f "
+				"(%.2fx) | 8seg %.3f (%+.1f%%) | segbatch/q %.3f (%.2fx single)\n",
+				count, dims, quant == Quantization::Int8 ? "int8" : "f32 ",
+				v1Ms, degenMs, (degenMs / v1Ms - 1.0) * 100.0,
+				maskMs, v1Ms / maskMs,
+				eightMs, (eightMs / v1Ms - 1.0) * 100.0,
+				batchPerQueryMs, batchPerQueryMs / eightMs);
+
+			alloc.free(bmem, alloc.user);
+			alloc.free(qmem, alloc.user);
+			alloc.free(payload, alloc.user);
+		}
+
+		void BreakEven(int32_t count, int32_t dims)
+		{
+			Rng rng;
+			std::vector<float> src(static_cast<size_t>(count) * dims);
+			for (auto& v : src)
+			{
+				v = rng.NextFloat();
+			}
+			const int32_t pd = PaddedDims(dims, Quantization::Float32);
+			void* payload = alloc.alloc(
+				static_cast<size_t>(count) * pd * sizeof(float), kAlignment, alloc.user);
+			PadRowsFloat32(src.data(), count, dims, pd, static_cast<float*>(payload));
+			BankView view;
+			view.rows = payload;
+			view.count = count;
+			view.dims = dims;
+			view.paddedDims = pd;
+			view.quant = Quantization::Float32;
+			view.metric = Metric::Dot;
+
+			void* qmem = alloc.alloc(static_cast<size_t>(pd) * sizeof(float), kAlignment,
+				alloc.user);
+			float* q = static_cast<float*>(qmem);
+			std::memset(q, 0, static_cast<size_t>(pd) * sizeof(float));
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				q[j] = rng.NextFloat();
+			}
+			Workspace ws;
+			std::vector<Hit> hits(16);
+			int32_t n = 0;
+
+			std::printf("break-even %d x %d f32 (seglen:ms)", count, dims);
+			for (int32_t segLen = 32; segLen <= pd && pd % segLen == 0; segLen *= 2)
+			{
+				const int32_t segCount = pd / segLen;
+				if (segCount > kMaxSegments)
+				{
+					continue;
+				}
+				std::vector<QuerySegment> segs(static_cast<size_t>(segCount));
+				for (int32_t i = 0; i < segCount; ++i)
+				{
+					segs[static_cast<size_t>(i)].offset = i * segLen;
+					segs[static_cast<size_t>(i)].length = segLen;
+					segs[static_cast<size_t>(i)].weight = 1.0f;
+				}
+				QueryParams sp;
+				sp.k = 10;
+				sp.segments = segs.data();
+				sp.segmentCount = segCount;
+				std::vector<double> samples;
+				for (int32_t rep = 0; rep < 9; ++rep)
+				{
+					const double t0 = Now();
+					Query(view, q, sp, ws, hits.data(), &n);
+					samples.push_back(Now() - t0);
+				}
+				std::printf(" %d:%.3f", segLen, Median(samples) * 1000.0);
+			}
+			std::printf("\n");
+			alloc.free(qmem, alloc.user);
+			alloc.free(payload, alloc.user);
+		}
+	};
+}
+
 int main()
 {
 	std::printf("superfaiss bench (single thread, simd path: %s)\n",
@@ -158,5 +368,11 @@ int main()
 	bench.Run(100000, 256, Quantization::Float32, 64);
 	// Scaling guard points (E3).
 	bench.Run(200000, 256, Quantization::Int8, 64);
+
+	// V2 slot-1 calibration (segmented scan; plan section 10 predictions).
+	SegBench segBench;
+	segBench.Run(100000, 256, Quantization::Float32);
+	segBench.Run(100000, 256, Quantization::Int8);
+	segBench.BreakEven(100000, 256);
 	return 0;
 }
