@@ -7,6 +7,36 @@
 namespace superfaiss
 {
 
+namespace
+{
+	// Weight folding (T-050 W1 bench clause, taken and recorded in plan section 10):
+	// for dot-family scoring, sum_s w_s * sum_{j in s} r_j q_j == sum_j r_j (w(j) q_j)
+	// exactly, so segmented dot/cosine scans fold the segment weights into a query
+	// copy once (gaps and weight-0 segments fold to 0, preserving omission
+	// semantics) and run the plain V1 kernels at V1 speed. L2 cannot fold (the
+	// weight sits inside the square) and keeps the dense range path.
+	void FoldSegmentsIntoQuery(
+		const float* paddedQuery,
+		int32_t paddedDims,
+		const QuerySegment* segments,
+		int32_t segmentCount,
+		float* outFolded)
+	{
+		for (int32_t j = 0; j < paddedDims; ++j)
+		{
+			outFolded[j] = 0.0f;
+		}
+		for (int32_t s = 0; s < segmentCount; ++s)
+		{
+			const QuerySegment& seg = segments[s];
+			for (int32_t j = seg.offset; j < seg.offset + seg.length; ++j)
+			{
+				outFolded[j] = seg.weight * paddedQuery[j];
+			}
+		}
+	}
+}
+
 Status Query(
 	const BankView& bank,
 	const float* paddedQuery,
@@ -52,20 +82,34 @@ Status Query(
 		return Status::OutOfMemory;
 	}
 
+	const bool bFoldable =
+		params.segments != nullptr && scoring.metric != Metric::L2;
+	const float* effectiveQuery = paddedQuery;
+	if (bFoldable)
+	{
+		if (!workspace.ReserveQueryScratch(bank.paddedDims, 1))
+		{
+			return Status::OutOfMemory;
+		}
+		FoldSegmentsIntoQuery(paddedQuery, bank.paddedDims, params.segments,
+			params.segmentCount, workspace.QueryScratch(0));
+		effectiveQuery = workspace.QueryScratch(0);
+	}
+
 	TopK topk;
 	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
 
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		if (params.segments != nullptr)
+		if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkSegmented(scoring, paddedQuery, c, params.excludeBits,
 				params.segments, params.segmentCount, topk);
 		}
 		else
 		{
-			ScoreChunk(scoring, paddedQuery, c, params.excludeBits, topk);
+			ScoreChunk(scoring, effectiveQuery, c, params.excludeBits, topk);
 		}
 	}
 
@@ -185,6 +229,43 @@ Status QueryBatch(
 	// Segmented batches keep the chunk-outermost structure — the bank streams once
 	// per batch — with the single-query segmented kernel scoring each query inside
 	// the chunk (plan 18.7/W1 composition; pair-blocked variants stay V1-shaped).
+	if (params.segments != nullptr && scoring.metric != Metric::L2)
+	{
+		// Dot-family segmented batch: fold each query once, then the batch IS the
+		// plain V1 batch (pair kernels included) over the folded queries.
+		if (!workspace.ReserveQueryScratch(bank.paddedDims, queryCount))
+		{
+			return Status::OutOfMemory;
+		}
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			FoldSegmentsIntoQuery(
+				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+				bank.paddedDims, params.segments, params.segmentCount,
+				workspace.QueryScratch(m));
+		}
+		const float* folded = workspace.QueryScratch(0);
+		const int32_t maxW = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
+		if (!workspace.Reserve(params.k, maxW))
+		{
+			return Status::OutOfMemory;
+		}
+		for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+		{
+			const int32_t width =
+				(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+			QuerySubBatch(
+				scoring,
+				folded + static_cast<int64_t>(base) * bank.paddedDims,
+				width,
+				params,
+				workspace,
+				outHits + static_cast<int64_t>(base) * params.k,
+				outCounts + base);
+		}
+		return Status::Ok;
+	}
+
 	if (params.segments != nullptr)
 	{
 		const int32_t segWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
@@ -299,18 +380,37 @@ Status QueryIntersect(
 	TopK topk;
 	topk.Init(workspace.HeapStorage(0), params.k, scoring.metric);
 
+	const bool bFoldable =
+		params.segments != nullptr && scoring.metric != Metric::L2;
+	const float* effectiveQueries = paddedQueries;
+	if (bFoldable)
+	{
+		if (!workspace.ReserveQueryScratch(bank.paddedDims, queryCount))
+		{
+			return Status::OutOfMemory;
+		}
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			FoldSegmentsIntoQuery(
+				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+				bank.paddedDims, params.segments, params.segmentCount,
+				workspace.QueryScratch(m));
+		}
+		effectiveQueries = workspace.QueryScratch(0);
+	}
+
 	const int32_t chunks = ChunkCount(scoring);
 	for (int32_t c = 0; c < chunks; ++c)
 	{
-		if (params.segments != nullptr)
+		if (params.segments != nullptr && !bFoldable)
 		{
 			ScoreChunkFusedSegmented(scoring, paddedQueries, queryCount, c,
 				params.excludeBits, params.segments, params.segmentCount, topk);
 		}
 		else
 		{
-			ScoreChunkFused(scoring, paddedQueries, queryCount, c, params.excludeBits,
-				topk);
+			ScoreChunkFused(scoring, effectiveQueries, queryCount, c,
+				params.excludeBits, topk);
 		}
 	}
 

@@ -47,7 +47,11 @@ void ScoreChunkFused(
 	const uint32_t* excludeBits,
 	TopK& inout);
 
-// Segmented scan (V2 §4): scores each non-excluded row of one chunk over a segment
+// Segmented scan, dense form (V2 §10 decision). NOTE the shipped split: dot-family
+// segmented scans FOLD segment weights into the query (see query.cpp) and run the
+// plain ScoreChunk at V1 speed — this dense primitive is the L2 path (weights sit
+// inside the square and cannot fold), and the substrate for slot-2 decomposition.
+// It scores each non-excluded row of one chunk over a segment
 // list — per-segment partials from the SAME per-row kernels ScoreChunk uses, combined
 // as sum(weight_s * partial_s) in segment order. The degenerate one-segment list
 // (0, paddedDims, 1.0) is bit-identical to ScoreChunk by construction (same kernel

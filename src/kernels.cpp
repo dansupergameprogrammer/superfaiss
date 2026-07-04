@@ -851,42 +851,126 @@ void ScoreChunkFused(
 
 namespace
 {
-	// Per-row segmented score: partials from the same dispatched per-row kernels the
-	// plain scan uses, combined in segment order. Weight-0 segments are never read.
-	template <typename RowType>
-	inline float SegmentedRowScore(
-		const RowType* row,
-		float scale, // int8 dequant scale; ignored for float32 via kernel choice
-		const float* paddedQuery,
+	// The dense segmented scan (V2 plan section 10 decision, T-050-corrected):
+	// one contiguous pass over the whole row - gaps between and after segments are
+	// scored into a discarded partial so reads stay sequential and the prefetcher
+	// never sees a stride - with per-segment partials produced by the SAME per-row
+	// kernel bodies the V1 scan uses (range-parameterized by construction), and
+	// weights applied at combine: total = sum(weight_s * partial_s). A single
+	// full-row segment therefore IS the V1 computation, bit-identically. Kernel
+	// dispatch is resolved once per chunk, not once per range.
+
+	struct FRowKernels
+	{
+		float (*dotF32)(const float*, const float*, int32_t);
+		float (*l2F32)(const float*, const float*, int32_t);
+		float (*dotI8)(const int8_t*, float, const float*, int32_t);
+		float (*l2I8)(const int8_t*, float, const float*, int32_t);
+	};
+
+	inline FRowKernels ResolveRowKernels()
+	{
+		FRowKernels k;
+#if defined(SUPERFAISS_SIMD_SSE)
+		if (detail::IsAvx2())
+		{
+			k.dotF32 = detail::DotF32Avx2;
+			k.l2F32 = detail::L2F32Avx2;
+			k.dotI8 = detail::DotI8Avx2;
+			k.l2I8 = detail::L2I8Avx2;
+			return k;
+		}
+#endif
+		k.dotF32 = detail::DotF32;
+		k.l2F32 = detail::L2F32;
+		k.dotI8 = detail::DotI8;
+		k.l2I8 = detail::L2I8;
+		return k;
+	}
+
+	// A range is a contiguous element run: a live segment (accIndex >= 0, weight
+	// applied at combine) or a gap (accIndex < 0, partial discarded).
+	struct FScanRange
+	{
+		int32_t offset;
+		int32_t length;
+		float weight;
+		int32_t accIndex; // -1 = discard
+	};
+
+	// Builds the full-coverage range list: segments in order, gaps filled, trailing
+	// gap to paddedDims. Returns the range count (<= 2*kMaxSegments + 1).
+	inline int32_t BuildScanRanges(
 		const QuerySegment* segments,
 		int32_t segmentCount,
+		int32_t paddedDims,
+		FScanRange* outRanges)
+	{
+		int32_t n = 0;
+		int32_t cursor = 0;
+		for (int32_t i = 0; i < segmentCount; ++i)
+		{
+			const QuerySegment& seg = segments[i];
+			if (seg.offset > cursor)
+			{
+				outRanges[n++] = {cursor, seg.offset - cursor, 0.0f, -1};
+			}
+			// Weight-0 segments keep omission semantics: scanned for stride
+			// continuity, discarded like a gap.
+			outRanges[n++] = {seg.offset, seg.length, seg.weight,
+				seg.weight == 0.0f ? -1 : i};
+			cursor = seg.offset + seg.length;
+		}
+		if (cursor < paddedDims)
+		{
+			outRanges[n++] = {cursor, paddedDims - cursor, 0.0f, -1};
+		}
+		return n;
+	}
+
+	// Scores one row over the range list. outPartials (kMaxSegments floats) receives
+	// unweighted per-segment partials when non-null (the decomposition surface);
+	// the return value is the weighted combine.
+	inline float DenseSegmentedRowScore(
+		const void* row,
+		float scale,
+		const float* paddedQuery,
+		const FScanRange* ranges,
+		int32_t rangeCount,
+		const FRowKernels& kernels,
 		bool isL2,
-		bool isInt8)
+		bool isInt8,
+		float* outPartials)
 	{
 		float total = 0.0f;
-		for (int32_t s = 0; s < segmentCount; ++s)
+		for (int32_t i = 0; i < rangeCount; ++i)
 		{
-			const QuerySegment& seg = segments[s];
-			if (seg.weight == 0.0f)
-			{
-				continue;
-			}
+			const FScanRange& range = ranges[i];
 			float partial;
 			if (isInt8)
 			{
-				const int8_t* r = reinterpret_cast<const int8_t*>(row) + seg.offset;
+				const int8_t* r = static_cast<const int8_t*>(row) + range.offset;
 				partial = isL2
-					? detail::L2I8(r, scale, paddedQuery + seg.offset, seg.length)
-					: detail::DotI8(r, scale, paddedQuery + seg.offset, seg.length);
+					? kernels.l2I8(r, scale, paddedQuery + range.offset, range.length)
+					: kernels.dotI8(r, scale, paddedQuery + range.offset, range.length);
 			}
 			else
 			{
-				const float* r = reinterpret_cast<const float*>(row) + seg.offset;
+				const float* r = static_cast<const float*>(row) + range.offset;
 				partial = isL2
-					? detail::L2F32(r, paddedQuery + seg.offset, seg.length)
-					: detail::DotF32(r, paddedQuery + seg.offset, seg.length);
+					? kernels.l2F32(r, paddedQuery + range.offset, range.length)
+					: kernels.dotF32(r, paddedQuery + range.offset, range.length);
 			}
-			total += seg.weight * partial;
+			if (range.accIndex >= 0)
+			{
+				if (outPartials != nullptr)
+				{
+					outPartials[range.accIndex] = partial;
+				}
+				total += range.weight * partial;
+			}
+			// Gap partials are computed for stride continuity and discarded; their
+			// products never touch a live score (T-050 W1 discard semantics).
 		}
 		return total;
 	}
@@ -911,6 +995,11 @@ void ScoreChunkSegmented(
 
 	const bool isL2 = bank.metric == Metric::L2;
 	const bool isInt8 = bank.quant == Quantization::Int8;
+	const FRowKernels kernels = ResolveRowKernels();
+	FScanRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount =
+		BuildScanRanges(segments, segmentCount, bank.paddedDims, ranges);
+	const int64_t rowBytes = RowBytes(bank);
 
 	for (int32_t r = begin; r < end; ++r)
 	{
@@ -918,11 +1007,11 @@ void ScoreChunkSegmented(
 		{
 			continue;
 		}
-		const uint8_t* row = static_cast<const uint8_t*>(bank.rows) +
-			static_cast<int64_t>(r) * RowBytes(bank);
+		const void* row = static_cast<const uint8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * rowBytes;
 		const float scale = isInt8 ? bank.scales[r] : 1.0f;
-		inout.Push(r, SegmentedRowScore(row, scale, paddedQuery, segments,
-			segmentCount, isL2, isInt8));
+		inout.Push(r, DenseSegmentedRowScore(row, scale, paddedQuery, ranges,
+			rangeCount, kernels, isL2, isInt8, nullptr));
 	}
 }
 
@@ -947,6 +1036,10 @@ void ScoreChunkFusedSegmented(
 	const int32_t pd = bank.paddedDims;
 	const bool isL2 = bank.metric == Metric::L2;
 	const bool isInt8 = bank.quant == Quantization::Int8;
+	const FRowKernels kernels = ResolveRowKernels();
+	FScanRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount = BuildScanRanges(segments, segmentCount, pd, ranges);
+	const int64_t rowBytes = RowBytes(bank);
 
 	for (int32_t r = begin; r < end; ++r)
 	{
@@ -954,15 +1047,15 @@ void ScoreChunkFusedSegmented(
 		{
 			continue;
 		}
-		const uint8_t* row = static_cast<const uint8_t*>(bank.rows) +
-			static_cast<int64_t>(r) * RowBytes(bank);
+		const void* row = static_cast<const uint8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * rowBytes;
 		const float scale = isInt8 ? bank.scales[r] : 1.0f;
 		float fused = 0.0f;
 		for (int32_t m = 0; m < queryCount; ++m)
 		{
-			const float score = SegmentedRowScore(row, scale,
-				paddedQueries + static_cast<int64_t>(m) * pd, segments, segmentCount,
-				isL2, isInt8);
+			const float score = DenseSegmentedRowScore(row, scale,
+				paddedQueries + static_cast<int64_t>(m) * pd, ranges, rangeCount,
+				kernels, isL2, isInt8, nullptr);
 			if (m == 0 || (isL2 ? score > fused : score < fused))
 			{
 				fused = score;

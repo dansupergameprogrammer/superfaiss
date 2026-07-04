@@ -1811,12 +1811,36 @@ static void TestSegmentedScan()
 				std::vector<Hit> sorted(static_cast<size_t>(chunks) * k);
 				std::vector<const Hit*> lists(static_cast<size_t>(chunks));
 				std::vector<int32_t> counts(static_cast<size_t>(chunks));
+				// The external chunk path mirrors the shipped split: dot-family
+				// folds weights into the query and runs the plain chunk scan; L2
+				// uses the dense segmented chunk primitive.
+				AlignedBuf folded(static_cast<size_t>(pd) * sizeof(float));
+				if (metric != Metric::L2)
+				{
+					for (int32_t j = 0; j < pd; ++j)
+					{
+						folded.F32()[j] = 0.0f;
+					}
+					for (int32_t j = segs[0].offset;
+						j < segs[0].offset + segs[0].length; ++j)
+					{
+						folded.F32()[j] = segs[0].weight * q.F32()[j];
+					}
+				}
 				for (int32_t c = 0; c < chunks; ++c)
 				{
 					TopK chunkTop;
 					chunkTop.Init(heap.data() + static_cast<size_t>(c) * k, k,
 						bank.view.metric);
-					ScoreChunkSegmented(bank.view, q.F32(), c, nullptr, segs, 1, chunkTop);
+					if (metric != Metric::L2)
+					{
+						ScoreChunk(bank.view, folded.F32(), c, nullptr, chunkTop);
+					}
+					else
+					{
+						ScoreChunkSegmented(bank.view, q.F32(), c, nullptr, segs, 1,
+							chunkTop);
+					}
 					lists[c] = sorted.data() + static_cast<size_t>(c) * k;
 					counts[c] = chunkTop.Finalize(
 						sorted.data() + static_cast<size_t>(c) * k);

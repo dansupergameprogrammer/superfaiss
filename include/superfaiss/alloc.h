@@ -54,6 +54,11 @@ public:
 	int32_t ReservedK() const { return ReservedK_; }
 	int32_t ReservedBatch() const { return ReservedBatch_; }
 
+	// Aligned float scratch for folded segmented queries (dot/cosine weight folding):
+	// `count` queries of `paddedDims` elements. Same growth accounting as Reserve().
+	bool ReserveQueryScratch(int32_t paddedDims, int32_t count);
+	float* QueryScratch(int32_t queryIndex);
+
 	// Number of times Reserve() actually grew the buffer. Flat across warm queries.
 	uint64_t GrowthCount() const { return GrowthCount_; }
 
@@ -62,6 +67,9 @@ private:
 	Hit* Storage_ = nullptr;
 	int32_t ReservedK_ = 0;
 	int32_t ReservedBatch_ = 0;
+	float* QueryScratch_ = nullptr;
+	int32_t ScratchDims_ = 0;
+	int32_t ScratchCount_ = 0;
 	uint64_t GrowthCount_ = 0;
 };
 

@@ -65,6 +65,38 @@ namespace detail
 Workspace::~Workspace()
 {
 	detail::SeamFree(Allocator_, Storage_);
+	detail::SeamFree(Allocator_, QueryScratch_);
+}
+
+bool Workspace::ReserveQueryScratch(int32_t paddedDims, int32_t count)
+{
+	if (paddedDims <= 0 || count < 1)
+	{
+		return false;
+	}
+	if (paddedDims <= ScratchDims_ && count <= ScratchCount_)
+	{
+		return true;
+	}
+	const int32_t newDims = paddedDims > ScratchDims_ ? paddedDims : ScratchDims_;
+	const int32_t newCount = count > ScratchCount_ ? count : ScratchCount_;
+	const size_t bytes = static_cast<size_t>(newDims) * newCount * sizeof(float);
+	float* grown = static_cast<float*>(detail::SeamAlloc(Allocator_, bytes, 16));
+	if (grown == nullptr)
+	{
+		return false;
+	}
+	detail::SeamFree(Allocator_, QueryScratch_);
+	QueryScratch_ = grown;
+	ScratchDims_ = newDims;
+	ScratchCount_ = newCount;
+	++GrowthCount_;
+	return true;
+}
+
+float* Workspace::QueryScratch(int32_t queryIndex)
+{
+	return QueryScratch_ + static_cast<int64_t>(queryIndex) * ScratchDims_;
 }
 
 bool Workspace::Reserve(int32_t k, int32_t batchWidth)
