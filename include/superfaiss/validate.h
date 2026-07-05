@@ -43,8 +43,13 @@ Status ValidateBiasPairs(
 
 // Full bank-content validation — O(count x paddedDims); intended for load time, not
 // per query. Rejects what the kernels cannot tolerate: non-finite float32 lanes (a NaN
-// score breaks the top-k total order), non-zero pad lanes (silently wrong L2), and
-// non-finite or negative int8 scales (a negative scale inverts a row's ranking).
+// score breaks the top-k total order), non-zero pad lanes (silently wrong L2),
+// non-finite or negative int8 scales (a negative scale inverts a row's ranking),
+// int8 values of -128 (outside the bake clamp; admitting them would void the
+// CrossDevice overflow proof), and Cosine rows whose norm deviates from 1 beyond
+// the bake's own tolerance (float rounding, plus scale/2 x sqrt(dims) quantization
+// error on int8) — non-unit Cosine rows silently corrupt ranking, and zero-norm
+// rows are illegal on Cosine banks by the format's own law.
 // Writes the first offending row to outBadRow if non-null.
 Status ValidateBankData(const BankView& bank, int32_t* outBadRow);
 

@@ -1758,6 +1758,22 @@ void ScoreChunkFusedXd(
 		rangeCount = BuildScanRanges(bank, segments, segmentCount, ranges);
 	}
 
+	// Per-member per-range query self-sums, built ONCE per chunk call instead of
+	// once per row (Poirot R-6: the sums are row-invariant integers; recomputing
+	// them per row was O(rows x members x dims) of redundant work on the L2
+	// segmented-intersect path). Kernels stay allocation-free: stack tables up to
+	// kFusedSqTableMembers members, per-row recompute (bit-identical - the sums
+	// are exact integers either way) beyond that.
+	constexpr int32_t kFusedSqTableMembers = 16;
+	int64_t memberQuerySq[kFusedSqTableMembers][2 * kMaxSegments + 1];
+	const int32_t tabled = (segments != nullptr && isL2)
+		? (queryCount < kFusedSqTableMembers ? queryCount : kFusedSqTableMembers)
+		: 0;
+	for (int32_t m = 0; m < tabled; ++m)
+	{
+		BuildRangeQuerySq(queries[m], ranges, rangeCount, memberQuerySq[m]);
+	}
+
 	for (int32_t r = begin; r < end; ++r)
 	{
 		if (IsExcluded(excludeBits, r))
@@ -1787,7 +1803,8 @@ void ScoreChunkFusedXd(
 			for (int32_t m = 0; m < queryCount; ++m)
 			{
 				const float score = XdFloorToFloat(XdSegmentedRowScoreD(
-					queries[m], ranges, rangeCount, nullptr, isL2, row,
+					queries[m], ranges, rangeCount,
+					m < tabled ? memberQuerySq[m] : nullptr, isL2, row,
 					rowScaleD, rowInvNorms, nullptr));
 				if (m == 0 || (isL2 ? score > fused : score < fused))
 				{

@@ -4111,6 +4111,91 @@ static void TestWorkspaceReuseAcrossShapes()
 	(void)degenSmall;
 }
 
+
+// ---------------------------------------------------------------------------
+// T26 — trust-boundary validation (Poirot R-2): a loaded payload must satisfy
+// the bake's own laws. Tampered content that the old validation admitted -
+// non-unit Cosine rows, zero-norm Cosine rows, int8 -128 lanes (outside the
+// bake clamp; the CrossDevice overflow proof depends on it) - is BadFormat,
+// through both ValidateBankData and the scratch-archive Load that builds on it.
+
+static void TestTrustBoundaryValidation()
+{
+	Rng rng(0x7B057ull);
+	const int32_t dims = 32;
+
+	// Non-unit Cosine f32 row -> BadFormat at the offending row.
+	{
+		TestBank bank(rng, 20, dims, Quantization::Float32, Metric::Cosine);
+		CHECK(ValidateBankData(bank.view, nullptr) == Status::Ok);
+		float* rows = static_cast<float*>(const_cast<void*>(bank.view.rows));
+		const int32_t victim = 7;
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			rows[victim * bank.view.paddedDims + j] *= 3.0f; // norm 3, finite
+		}
+		int32_t bad = -1;
+		CHECK(ValidateBankData(bank.view, &bad) == Status::BadFormat);
+		CHECK(bad == victim);
+	}
+
+	// Zero-norm Cosine row -> BadFormat (the append/bake law, now at load too).
+	{
+		TestBank bank(rng, 12, dims, Quantization::Float32, Metric::Cosine);
+		float* rows = static_cast<float*>(const_cast<void*>(bank.view.rows));
+		for (int32_t j = 0; j < bank.view.paddedDims; ++j)
+		{
+			rows[3 * bank.view.paddedDims + j] = 0.0f;
+		}
+		int32_t bad = -1;
+		CHECK(ValidateBankData(bank.view, &bad) == Status::BadFormat);
+		CHECK(bad == 3);
+	}
+
+	// Int8 -128 lane -> BadFormat (bake clamps to [-127, 127]).
+	{
+		TestBank bank(rng, 16, dims, Quantization::Int8, Metric::Dot);
+		CHECK(ValidateBankData(bank.view, nullptr) == Status::Ok);
+		int8_t* rows = static_cast<int8_t*>(const_cast<void*>(bank.view.rows));
+		rows[5 * bank.view.paddedDims + 2] = INT8_MIN;
+		int32_t bad = -1;
+		CHECK(ValidateBankData(bank.view, &bad) == Status::BadFormat);
+		CHECK(bad == 5);
+	}
+
+	// Int8 Cosine quantization noise stays WITHIN tolerance (no false rejection).
+	{
+		TestBank bank(rng, 200, dims, Quantization::Int8, Metric::Cosine);
+		CHECK(ValidateBankData(bank.view, nullptr) == Status::Ok);
+	}
+
+	// Tampered scratch archive: denormalize a Cosine row's bytes in the blob ->
+	// Load rejects (BadFormat) and the target bank is untouched.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(8, dims, Metric::Cosine, Quantization::Float32) == Status::Ok);
+		alignas(16) float row[dims];
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			row[j] = rng.NextFloat();
+		}
+		CHECK(bank.Append(row, dims, nullptr) == Status::Ok);
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+		// Scale the row payload in place (header is 32 bytes; floats follow).
+		float tampered[dims];
+		std::memcpy(tampered, archive.bytes.data() + 32, sizeof(tampered));
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			tampered[j] *= 2.0f;
+		}
+		std::memcpy(archive.bytes.data() + 32, tampered, sizeof(tampered));
+		ScratchBank loaded;
+		CHECK(loaded.Load(archive.Reader()) == Status::BadFormat);
+		CHECK(!loaded.IsCreated());
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -4138,6 +4223,7 @@ int main()
 	TestPinDrainLitmus();
 	TestPerRowBias();
 	TestWorkspaceReuseAcrossShapes();
+	TestTrustBoundaryValidation();
 	TestCrossDevice();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",

@@ -195,9 +195,21 @@ Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 	}
 
 	const int32_t pd = bank.paddedDims;
+	// Bake-law tolerances (Poirot R-2 - a loaded payload must satisfy what the
+	// bake actually produces, or the "re-validated on load" claim is hollow):
+	// Cosine rows are unit-norm at bake; float32 stores them exactly (up to
+	// normalization rounding), int8 adds at most scale/2 per element, so the
+	// dequantized norm sits within (scale/2)*sqrt(dims) of 1. A row outside its
+	// bound is tampering or corruption, not quantization. The int8 bake clamp is
+	// [-127, 127]: -128 never occurs, and admitting it would void the CrossDevice
+	// overflow proof (an all--128 row at kMaxCrossDeviceDims reaches 2^31 in the
+	// L2 self-sum) - so -128 is rejected as BadFormat.
+	const bool cosine = bank.metric == Metric::Cosine;
 	for (int32_t r = 0; r < bank.count; ++r)
 	{
 		bool bad = false;
+		double normSq = 0.0;
+		double normTolerance = 1e-3;
 		if (bank.quant == Quantization::Float32)
 		{
 			const float* row = static_cast<const float*>(bank.rows) + static_cast<int64_t>(r) * pd;
@@ -208,6 +220,10 @@ Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 					bad = true;
 					break;
 				}
+				if (cosine)
+				{
+					normSq += static_cast<double>(row[i]) * row[i];
+				}
 			}
 			for (int32_t i = bank.dims; !bad && i < pd; ++i)
 			{
@@ -217,16 +233,32 @@ Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 		else
 		{
 			const int8_t* row = static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(r) * pd;
-			for (int32_t i = bank.dims; i < pd; ++i)
+			const float scale = bank.scales[r];
+			for (int32_t i = 0; i < bank.dims; ++i)
 			{
-				if (row[i] != 0)
+				if (row[i] == INT8_MIN)
 				{
-					bad = true;
+					bad = true; // outside the bake clamp of [-127, 127]
 					break;
 				}
+				if (cosine)
+				{
+					const double v = static_cast<double>(row[i]) * scale;
+					normSq += v * v;
+				}
 			}
-			const float scale = bank.scales[r];
+			for (int32_t i = bank.dims; !bad && i < pd; ++i)
+			{
+				bad = row[i] != 0;
+			}
 			bad = bad || !std::isfinite(scale) || scale < 0.0f;
+			normTolerance += 0.5 * static_cast<double>(scale) * std::sqrt(static_cast<double>(bank.dims));
+		}
+		if (!bad && cosine)
+		{
+			// Covers the zero-norm-row law too: norm 0 is maximally out of tolerance.
+			const double norm = std::sqrt(normSq);
+			bad = !(std::fabs(norm - 1.0) <= normTolerance);
 		}
 		if (bad)
 		{
