@@ -3935,6 +3935,182 @@ static void TestCrossDevice()
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// T25 — workspace reuse across shapes (external bug report, 2026-07-04): the
+// query-scratch buffer grows monotonically (allocation-flat contract), so its
+// internal stride can EXCEED the current bank's paddedDims after serving a
+// larger reservation. The folded-batch paths packed queries at the scratch
+// stride but consumed them at bank.paddedDims - wrong hits on perfectly normal
+// reuse. This suite drives one Workspace through the reviewer's matrix:
+// large->small dims (the repro), small->large, f32->int8, segmented->plain,
+// batch->single->intersect, cross-device->per-device - every result compared
+// against a FRESH workspace's answer, bit for bit. A fresh workspace cannot
+// carry stale strides, so agreement proves reuse-independence.
+
+static void TestWorkspaceReuseAcrossShapes()
+{
+	Rng rng(0x5E05Eull);
+	const QuerySegment degenSmall[1] = {{0, 0, 1.0f}}; // patched per-bank below
+
+	// One long-lived workspace, deliberately polluted by a LARGE segmented batch
+	// first; every later shape must still answer identically to a fresh one.
+	Workspace reused;
+
+	auto checkAgainstFresh = [&](const BankView& view, const float* queries,
+		int32_t queryCount, const QueryParams& params, const char* label) {
+		std::vector<Hit> hitsReused(static_cast<size_t>(queryCount) * params.k);
+		std::vector<Hit> hitsFresh(static_cast<size_t>(queryCount) * params.k);
+		std::vector<int32_t> countsReused(queryCount), countsFresh(queryCount);
+		Workspace fresh;
+		if (queryCount == 1)
+		{
+			CHECK(Query(view, queries, params, reused, hitsReused.data(),
+				countsReused.data()) == Status::Ok);
+			CHECK(Query(view, queries, params, fresh, hitsFresh.data(),
+				countsFresh.data()) == Status::Ok);
+		}
+		else
+		{
+			CHECK(QueryBatch(view, queries, queryCount, params, reused,
+				hitsReused.data(), countsReused.data()) == Status::Ok);
+			CHECK(QueryBatch(view, queries, queryCount, params, fresh,
+				hitsFresh.data(), countsFresh.data()) == Status::Ok);
+		}
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			CHECK_MSG(countsReused[m] == countsFresh[m], "%s q%d count %d != %d",
+				label, m, countsReused[m], countsFresh[m]);
+			for (int32_t i = 0; i < countsFresh[m] && i < countsReused[m]; ++i)
+			{
+				const Hit& a = hitsReused[static_cast<size_t>(m) * params.k + i];
+				const Hit& b = hitsFresh[static_cast<size_t>(m) * params.k + i];
+				CHECK_MSG(a.index == b.index && a.score == b.score,
+					"%s q%d hit%d (%d, %.9g) != fresh (%d, %.9g)",
+					label, m, i, a.index, a.score, b.index, b.score);
+			}
+		}
+	};
+
+	// Step 1: pollute with a big segmented dot-family batch (dims 256 -> the
+	// scratch stride grows to 256-padded).
+	{
+		TestBank big(rng, 600, 256, Quantization::Float32, Metric::Cosine);
+		const int32_t m = 8;
+		AlignedBuf qs(static_cast<size_t>(m) * big.view.paddedDims * sizeof(float));
+		for (int32_t q = 0; q < m; ++q)
+		{
+			std::vector<float> raw(256);
+			for (auto& v : raw)
+			{
+				v = rng.NextFloat();
+			}
+			PadQuery(raw, big.view.paddedDims,
+				qs.F32() + static_cast<int64_t>(q) * big.view.paddedDims);
+		}
+		const QuerySegment segs[2] = {{0, 128, 1.0f}, {128, 128, 0.5f}};
+		QueryParams p;
+		p.k = 5;
+		p.segments = segs;
+		p.segmentCount = 2;
+		checkAgainstFresh(big.view, qs.F32(), m, p, "pollute-big-segbatch");
+	}
+
+	// Step 2 (the reviewer's repro): smaller bank, segmented dot-family batch on
+	// the SAME workspace - the folded queries must not be read at the wrong stride.
+	{
+		TestBank small(rng, 200, 32, Quantization::Float32, Metric::Cosine);
+		const int32_t m = 4;
+		AlignedBuf qs(static_cast<size_t>(m) * small.view.paddedDims * sizeof(float));
+		for (int32_t q = 0; q < m; ++q)
+		{
+			std::vector<float> raw(32);
+			for (auto& v : raw)
+			{
+				v = rng.NextFloat();
+			}
+			PadQuery(raw, small.view.paddedDims,
+				qs.F32() + static_cast<int64_t>(q) * small.view.paddedDims);
+		}
+		const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 1.0f}};
+		QueryParams p;
+		p.k = 3;
+		p.segments = segs;
+		p.segmentCount = 2;
+		checkAgainstFresh(small.view, qs.F32(), m, p, "small-after-big-segbatch");
+
+		// Same shape through QueryIntersect (the second folded consumer).
+		{
+			Hit hitsReused[3], hitsFresh[3];
+			int32_t nr = 0, nf = 0;
+			Workspace fresh;
+			CHECK(QueryIntersect(small.view, qs.F32(), m, p, reused, hitsReused, &nr)
+				== Status::Ok);
+			CHECK(QueryIntersect(small.view, qs.F32(), m, p, fresh, hitsFresh, &nf)
+				== Status::Ok);
+			CHECK_MSG(nr == nf, "intersect count %d != %d", nr, nf);
+			for (int32_t i = 0; i < nf && i < nr; ++i)
+			{
+				CHECK_MSG(hitsReused[i].index == hitsFresh[i].index &&
+					hitsReused[i].score == hitsFresh[i].score,
+					"intersect hit%d (%d, %.9g) != fresh (%d, %.9g)", i,
+					hitsReused[i].index, hitsReused[i].score,
+					hitsFresh[i].index, hitsFresh[i].score);
+			}
+		}
+
+		// Sparse bias on the segmented fold path (the rescore walks the folded
+		// queries too).
+		{
+			BiasPair pair[1] = {{150, 100.0f}};
+			RowBias rb;
+			rb.pairs = pair;
+			rb.pairCount = 1;
+			QueryParams bp = p;
+			bp.bias = &rb;
+			checkAgainstFresh(small.view, qs.F32(), 1, bp, "sparse-after-big");
+		}
+	}
+
+	// Step 3: the rest of the matrix on the same reused workspace.
+	{
+		// small -> large again (regrow), f32 -> int8, segmented -> plain,
+		// batch -> single, per-device after cross-device.
+		TestBank medium(rng, 300, 64, Quantization::Int8, Metric::Dot);
+		const int32_t m = 5;
+		AlignedBuf qs(static_cast<size_t>(m) * medium.view.paddedDims * sizeof(float));
+		for (int32_t q = 0; q < m; ++q)
+		{
+			std::vector<float> raw(64);
+			for (auto& v : raw)
+			{
+				v = rng.NextFloat();
+			}
+			PadQuery(raw, medium.view.paddedDims,
+				qs.F32() + static_cast<int64_t>(q) * medium.view.paddedDims);
+		}
+		const QuerySegment segs[2] = {{0, 32, 1.0f}, {32, 32, 2.0f}};
+		QueryParams segp;
+		segp.k = 4;
+		segp.segments = segs;
+		segp.segmentCount = 2;
+		checkAgainstFresh(medium.view, qs.F32(), m, segp, "int8-segbatch");
+
+		QueryParams plain;
+		plain.k = 4;
+		checkAgainstFresh(medium.view, qs.F32(), m, plain, "plain-batch");
+		checkAgainstFresh(medium.view, qs.F32(), 1, plain, "plain-single");
+		checkAgainstFresh(medium.view, qs.F32(), 1, segp, "seg-single");
+
+		QueryParams xd;
+		xd.k = 4;
+		xd.exactness = Exactness::CrossDevice;
+		checkAgainstFresh(medium.view, qs.F32(), m, xd, "crossdevice-batch");
+		checkAgainstFresh(medium.view, qs.F32(), 1, plain, "perdevice-after-xd");
+	}
+	(void)degenSmall;
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -3961,6 +4137,7 @@ int main()
 	TestScratchBanks();
 	TestPinDrainLitmus();
 	TestPerRowBias();
+	TestWorkspaceReuseAcrossShapes();
 	TestCrossDevice();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",

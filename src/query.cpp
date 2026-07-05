@@ -539,14 +539,26 @@ Status QueryBatch(
 		{
 			return Status::OutOfMemory;
 		}
-		for (int32_t m = 0; m < queryCount; ++m)
+		// Pack the folded queries at THIS bank's stride, not the scratch buffer's
+		// internal one: the scratch grows monotonically (allocation-flat contract),
+		// so after serving a larger reservation QueryScratch(m) sits at a WIDER
+		// stride than bank.paddedDims - and every consumer below walks
+		// effectiveQueries by bank.paddedDims. Packing from the base keeps producer
+		// and consumers on one stride regardless of the workspace's history.
+		// (External bug report 2026-07-04: wrong hits on perfectly normal reuse;
+		// T25 pins this. paddedDims is a whole number of kAlignment blocks, so
+		// every packed query stays aligned.)
 		{
-			FoldSegmentsIntoQuery(
-				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
-				bank.paddedDims, params.segments, params.segmentCount,
-				workspace.QueryScratch(m));
+			float* foldedBase = workspace.QueryScratch(0);
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				FoldSegmentsIntoQuery(
+					paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+					bank.paddedDims, params.segments, params.segmentCount,
+					foldedBase + static_cast<int64_t>(m) * bank.paddedDims);
+			}
+			effectiveQueries = foldedBase;
 		}
-		effectiveQueries = workspace.QueryScratch(0);
 	}
 
 	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
@@ -810,14 +822,26 @@ Status QueryIntersect(
 		{
 			return Status::OutOfMemory;
 		}
-		for (int32_t m = 0; m < queryCount; ++m)
+		// Pack the folded queries at THIS bank's stride, not the scratch buffer's
+		// internal one: the scratch grows monotonically (allocation-flat contract),
+		// so after serving a larger reservation QueryScratch(m) sits at a WIDER
+		// stride than bank.paddedDims - and every consumer below walks
+		// effectiveQueries by bank.paddedDims. Packing from the base keeps producer
+		// and consumers on one stride regardless of the workspace's history.
+		// (External bug report 2026-07-04: wrong hits on perfectly normal reuse;
+		// T25 pins this. paddedDims is a whole number of kAlignment blocks, so
+		// every packed query stays aligned.)
 		{
-			FoldSegmentsIntoQuery(
-				paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
-				bank.paddedDims, params.segments, params.segmentCount,
-				workspace.QueryScratch(m));
+			float* foldedBase = workspace.QueryScratch(0);
+			for (int32_t m = 0; m < queryCount; ++m)
+			{
+				FoldSegmentsIntoQuery(
+					paddedQueries + static_cast<int64_t>(m) * bank.paddedDims,
+					bank.paddedDims, params.segments, params.segmentCount,
+					foldedBase + static_cast<int64_t>(m) * bank.paddedDims);
+			}
+			effectiveQueries = foldedBase;
 		}
-		effectiveQueries = workspace.QueryScratch(0);
 	}
 
 	XdQuery* xdSlots = nullptr;
