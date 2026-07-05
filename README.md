@@ -6,11 +6,69 @@ Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedd
 built for game runtimes. Dependency-free C++17 — the standard library and nothing else.
 CI-verified on Windows x64, Linux x64 (AVX2), and macOS arm64 (NEON); four compilers.
 
+In plainer terms: games are full of *find the best match* problems — the animation pose
+that best continues this motion, the NPC memory most relevant to what just happened, the
+item or sound or dialogue line closest to what the player typed, drew, or did. If you can
+turn your candidates into vectors of numbers (embeddings — any encoder model produces
+them, including small ones running offline in a content pipeline), SuperFAISS answers
+"which of my thousands of candidates is most similar to this one?" in a fraction of a
+millisecond. The answers are exact, not approximate, and the same query against the same
+bank returns the same result on every run and — in v2.2's opt-in mode — on every machine.
+That reliability is what lets you build actual gameplay on top of the answers.
+
 SuperFAISS is an **independent implementation**. It is **not a fork of, derived from, or
 affiliated with Meta's FAISS**; the name is nominative homage to the library that defined
 the category. If you need approximate indexes over billion-scale corpora on servers, use
 FAISS. If you need exact top-k over game-scale banks, in milliseconds, on a background
 thread, deterministically, on every platform your game ships on — that is what this is.
+
+## First query
+
+```cpp
+#include "superfaiss/superfaiss.h"
+using namespace superfaiss;
+
+// 1) Bake once: your float embeddings (count x dims) -> a padded, aligned bank.
+const int32_t count = 40000, dims = 128;
+const int32_t pd = PaddedDims(dims, Quantization::Float32);
+Allocator a = DefaultAllocator();                 // or route to your engine's allocator
+float* rows = static_cast<float*>(a.alloc(sizeof(float) * count * pd, kAlignment, a.user));
+PadRowsFloat32(myEmbeddings, count, dims, pd, rows);
+
+BankView bank;
+bank.rows = rows;      bank.count = count;                    bank.dims = dims;
+bank.paddedDims = pd;  bank.quant = Quantization::Float32;    bank.metric = Metric::Dot;
+
+// 2) Query: the 10 most similar rows, best first. Sub-millisecond at this scale --
+//    call it every frame, from any one thread.
+float* query = static_cast<float*>(a.alloc(sizeof(float) * pd, kAlignment, a.user));
+std::memset(query, 0, sizeof(float) * pd);        // pad lanes must be zero
+/* fill query[0 .. dims) */
+
+Workspace ws;                                     // reusable scratch; allocation-free once warm
+Hit hits[10];
+int32_t n = 0;
+QueryParams params;
+params.k = 10;
+Query(bank, query, params, ws, hits, &n);         // hits[i].index, hits[i].score
+```
+
+Int8 banks (4x smaller and faster) bake with `QuantizeRowsInt8`; Cosine banks
+normalize at bake with `NormalizeRows`. The `.wvbank` sidecar format and the
+reference reader/writer are in [FORMAT.md](docs/FORMAT.md).
+
+## Building
+
+Any C++17 compiler, no dependencies. `build.bat` (MSVC), or CMake:
+
+```
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests
+```
+(MSVC multi-config: `build/Release/superfaiss_tests.exe`; or use `build.bat`.)
+
+SIMD (SSE4.1 / AVX2+FMA / NEON, scalar fallback) is selected automatically; every
+path has a scalar mirror with the identical accumulation structure, and the test
+suite enforces that SIMD and mirror results are bit-identical on a device.
 
 ## What it does
 
@@ -18,59 +76,39 @@ thread, deterministically, on every platform your game ships on — that is what
   training, no surprises.
 - **float32 and int8 banks.** Symmetric per-vector int8 quantization is a 4x memory-bandwidth
   cut — flat scan is memory-bound, so it is also roughly a 4x speed win.
-- **Deterministic by construction.** The score/index comparator is a strict total order, so
-  identical bank + identical query produce bit-identical results regardless of thread count,
-  chunk scheduling, or call history, on a given device.
+- **Deterministic by construction.** Identical bank + identical query produce
+  bit-identical results on a device — regardless of thread count, chunk scheduling, or
+  call history ([DETERMINISM.md](docs/DETERMINISM.md)).
 - **Zero steady-state allocation.** Scratch comes from a caller-provided workspace; the
   allocator seam counts every allocation so you can assert zero in your own tests.
-- **Chunk-granular kernels.** The library is single-threaded by design and exposes
-  chunk-level scoring; your engine's scheduler (ParallelFor, task graph, job system) drives
-  the chunks. Determinism does not depend on who schedules what.
+- **Your scheduler, our kernels.** The library is single-threaded by design and exposes
+  chunk-level scoring; your engine's scheduler (ParallelFor, task graph, job system)
+  drives the chunks. Determinism does not depend on who schedules what.
 - **Batch queries.** M queries scored in one bank pass amortize the memory traffic — the
   economics that make per-tick entity queries cheap.
 - **Segmented queries and named channels (v2.0).** Score a weighted combination of
-  contiguous sub-ranges of the vector — "identity 1.0, appearance 0.2" — with exact
-  per-segment decomposition of every hit ("appearance matched, identity didn't"), and
-  true per-channel cosines on cosine banks. **Segments are a semantics feature, not a
-  speed feature**: a segmented scan is priced at approximately one full scan (for
-  dot-family scoring the weights fold into the query exactly, so it runs the plain V1
-  kernels at V1 speed; masking a range does not make the scan faster on this
-  row-interleaved layout — measured, not assumed). A degenerate one-segment query is
-  bit-identical to the whole-row scan.
-- **Per-row score bias (v2.1).** An optional caller-provided bias added to each row's
-  score IN-SCAN, before top-k selection — so the composed ranking is exact (a row
-  outside the similarity top-k that wins the composed score is unrecoverable after the
-  scan; post-weighting the returned top-k is approximate ranking). Two forms: a dense
-  count-length view (memory salience) and sparse `(index, bias)` pairs (motion
-  matching's continuing-pose reward — one biased row per query, effectively free:
-  measured +0.4% single / ~0% batch; the dense form measures +3.5% f32 / +1.9% int8).
-  Finite values only — `-inf` is not a mask; exclusion is a mask, bias is arithmetic.
-  Bias adds in the scored metric's own direction (a reward is negative on L2).
+  vector sub-ranges — "identity 1.0, appearance 0.2" — and decompose any hit into
+  exact per-channel contributions ("appearance matched, identity didn't"). A semantics
+  feature, not a speed feature: a segmented scan still costs about one full scan —
+  measured, not assumed ([API.md](docs/API.md)).
+- **Per-row score bias (v2.1).** A caller-provided bias added in-scan, before
+  selection, so the composed ranking is exact — sparse `(index, bias)` pairs for
+  motion matching's continuing-pose reward (effectively free) or a dense per-row view
+  for memory salience. Rules and measured costs in [API.md](docs/API.md).
 - **Cross-device bit-exactness (v2.2).** An opt-in query mode
-  (`Exactness::CrossDevice`, int8 banks) promising bit-identical scores AND hit order
-  across DIFFERENT machines — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
+  (`Exactness::CrossDevice`, int8 banks): bit-identical scores AND hit order across
+  DIFFERENT machines — x86 and ARM, Windows/Linux/macOS, any SIMD width — the
   property lockstep and rollback multiplayer, networked motion matching, and
-  server-side validation actually require. Scoring accumulates in integers
-  (associative, so reduction width cannot matter); the per-row epilogue is a
-  fixed-order double expression with an explicit subnormal floor (|score| < FLT_MIN
-  is exactly 0.0f on every machine — the FTZ/DAZ hole closed by contract, not by
-  hoping fixtures never hit it). **The claim runs as a test**: CI computes the
-  hit-list hash over committed fixture banks — including adversarial tiny-scale
-  banks aimed at the subnormal window — on Windows, Linux, and macOS-ARM, across
-  every kernel path each runner can force, and asserts them all equal a golden
-  pinned in the repo. Stated plainly: f32 banks stay per-device; query quantization
-  adds recall cost beyond row quantization (measured and reported per bank, suite
-  and importer both); cross-device scores are not equal to default-mode scores. The
-  integer path measures FASTER than the default int8 path (−18.5% single / −14.6%
-  batch at 100k×256), and Epic's PoseSearch offers no determinism contract of any
-  kind — this is the differentiating sell, and it re-earns itself on every commit.
+  server-side validation actually require. **The claim runs as a test**: CI asserts
+  a pinned hash over committed fixture banks — including adversarial banks aimed at
+  the mode's own weakest case — on Windows, Linux, and macOS-ARM, across every
+  kernel path each runner can force. It also measures FASTER than the default int8
+  scan. Scope and recall cost are stated plainly in
+  [DETERMINISM.md §2c](docs/DETERMINISM.md).
 - **Scratch banks (v2.0).** A fixed-capacity mutable bank for runtime-accumulated
-  vectors (NPC memory, session embeddings): single writer, lock-free wait-free readers,
-  atomic tombstone removal (deletion is exclusion), index-preserving `Grow`, `Freeze`
-  into a standard immutable bank (bit-identical, with an old-to-new index map), and
-  save/load through a caller-owned archive seam. Determinism extends to it as
-  determinism-given-history. A snapshot IS a `BankView`, so every query feature above
-  works on scratch content unchanged.
+  vectors (NPC memory, session embeddings): single writer, lock-free readers,
+  tombstone removal, `Freeze` into a standard immutable bank, save/load through an
+  archive seam. Every query feature above works on scratch content unchanged.
 
 ## What it deliberately is not
 
@@ -116,21 +154,6 @@ you are embedding this library anywhere, it is the worked example.
 
 Same answers on every path, bit for bit — that equivalence is test-enforced, not
 aspirational.
-
-## Building
-
-Any C++17 compiler. `build.bat` (MSVC), or CMake:
-
-```
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests
-```
-(MSVC multi-config: `build/Release/superfaiss_tests.exe`; or use `build.bat`.)
-
-SIMD: NEON on ARM/ARM64 and SSE4.1 on x86/x64 are selected at compile time, with a
-runtime cpuid upgrade to AVX2+FMA on x86 hardware that supports it, and a scalar
-fallback elsewhere. Every path has a scalar mirror with the identical accumulation
-(and, for AVX2, `std::fma`) structure, so SIMD and mirror results are bit-identical on
-a given device — enforced by the test suite.
 
 ## License
 
