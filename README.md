@@ -4,7 +4,8 @@
 
 Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding banks,
 built for game runtimes. Dependency-free C++17 — the standard library and nothing else.
-CI-verified on Windows x64, Linux x64 (AVX2), and macOS arm64 (NEON); four compilers.
+CI-verified on Windows x64, Linux x64, and macOS arm64 (NEON) — three compilers
+(MSVC, GCC, AppleClang) plus a ThreadSanitizer pass, on every push.
 
 In plainer terms: games are full of *find the best match* problems — the animation pose
 that best continues this motion, the NPC memory most relevant to what just happened, the
@@ -133,8 +134,9 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   The pooled weight sum is capped at 2^20 (the accumulator's proven
   overflow-free bound — over it is a rejection, not a wrap). The honesty number
   ships with the operator: pooled-query recall@10 vs a float64 pooled reference
-  measured 0.9930 / 0.9885 / 0.9895 (Dot / Cosine / L2, random int8 fixtures) at
-  first calibration.
+  measured 0.9930 / 0.9885 / 0.9895 (Dot / Cosine / L2 — 200 seeded 8-row pools
+  over the suite's 512×128 int8 fixtures, fixed recorded seed) at first
+  calibration; measure per bank before adopting, as with any quantized mode.
 
 ## What it deliberately is not
 
