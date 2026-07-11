@@ -111,6 +111,13 @@ void PadRowsFloat32(
 
 Status ValidateSourceRows(const float* rows, int32_t count, int32_t dims, int32_t* outBadRow)
 {
+	// Format geometry ceilings (see ValidateBank): checkable from the header
+	// alone, rejected before any payload-size arithmetic — an importer may gate
+	// on this before the payload even exists.
+	if (count > kMaxBankRows || dims > kMaxCrossDeviceDims)
+	{
+		return Status::BadFormat;
+	}
 	if (rows == nullptr || count < 0 || dims <= 0)
 	{
 		return Status::InvalidArgument;

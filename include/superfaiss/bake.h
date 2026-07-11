@@ -37,7 +37,10 @@ void PadRowsFloat32(
 	float* outRows);
 
 // Source-data validation for importers: every value finite. Returns the first offending
-// row in outBadRow if non-null.
+// row in outBadRow if non-null. Also enforces the format geometry ceilings
+// (count <= kMaxBankRows, dims <= kMaxCrossDeviceDims -> BadFormat) ahead of every
+// other check, so an importer may gate a header on it before the payload exists —
+// header-derived sizes must never enter byte arithmetic unbounded.
 Status ValidateSourceRows(const float* rows, int32_t count, int32_t dims, int32_t* outBadRow);
 
 // Per-channel inverse row norms for Cosine banks carrying channels (D-V2-1): baked

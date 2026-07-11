@@ -20,6 +20,14 @@ Status ValidateBank(const BankView& bank)
 	{
 		return Status::InvalidArgument;
 	}
+	// Format geometry ceilings: a header over the caps is rejected here, before
+	// any size arithmetic runs on its values (the scratch-archive load applies
+	// the same hard reject). Within the caps every byte-size term downstream
+	// stays below 2^47 — see kMaxBankRows.
+	if (bank.count > kMaxBankRows || bank.dims > kMaxCrossDeviceDims)
+	{
+		return Status::BadFormat;
+	}
 	if (bank.quant != Quantization::Float32 && bank.quant != Quantization::Int8)
 	{
 		return Status::BadFormat;

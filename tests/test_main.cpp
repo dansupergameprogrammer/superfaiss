@@ -520,6 +520,47 @@ static void TestValidation()
 	CHECK(ValidateQuery(padded.view, q6.F32()) == Status::Ok);
 	q6.F32()[7] = 1.0f;
 	CHECK(ValidateQuery(padded.view, q6.F32()) == Status::NonZeroPadding);
+
+	// V1x (test design A8, review M2 sibling) — immutable-format header caps:
+	// hostile header geometry is BadFormat at the validation gate, BEFORE any
+	// size arithmetic runs on header-derived values. No payload is allocated
+	// here: the reject must fire on the header fields alone.
+	{
+		AlignedBuf tiny(kAlignment * sizeof(float));
+		BankView h;
+		h.rows = tiny.F32();
+		h.count = 1;
+		h.dims = kMaxCrossDeviceDims + 16; // over the format's dims ceiling
+		h.paddedDims = PaddedDims(h.dims, Quantization::Float32);
+		h.quant = Quantization::Float32;
+		h.metric = Metric::Dot;
+		CHECK_MSG(ValidateBank(h) == Status::BadFormat, "over-cap dims not hard-rejected");
+
+		h.dims = INT32_MAX; // the PaddedDims signed-overflow window
+		h.paddedDims = PaddedDims(h.dims, Quantization::Float32);
+		CHECK_MSG(ValidateBank(h) == Status::BadFormat, "INT32_MAX dims not hard-rejected");
+
+		h.dims = kMaxCrossDeviceDims; // the ceiling itself is legal (inclusive bound)
+		h.paddedDims = PaddedDims(h.dims, Quantization::Float32);
+		CHECK_MSG(ValidateBank(h) == Status::Ok, "at-cap dims wrongly rejected");
+
+		h.dims = 8;
+		h.paddedDims = PaddedDims(h.dims, Quantization::Float32);
+		h.count = kMaxBankRows + 1; // over the format's row ceiling
+		CHECK_MSG(ValidateBank(h) == Status::BadFormat, "over-cap count not hard-rejected");
+
+		h.count = kMaxBankRows; // the ceiling itself is legal (inclusive bound)
+		CHECK_MSG(ValidateBank(h) == Status::Ok, "at-cap count wrongly rejected");
+
+		// The importer-side source gate carries the same caps, checkable from the
+		// header alone — rejected before any payload exists to point at.
+		CHECK_MSG(ValidateSourceRows(nullptr, kMaxBankRows + 1, 1, nullptr) == Status::BadFormat,
+			"source-rows over-cap count not hard-rejected");
+		CHECK_MSG(ValidateSourceRows(nullptr, 0, kMaxCrossDeviceDims + 16, nullptr) == Status::BadFormat,
+			"source-rows over-cap dims not hard-rejected");
+		CHECK_MSG(ValidateSourceRows(tiny.F32(), 0, kMaxCrossDeviceDims, nullptr) == Status::Ok,
+			"source-rows at-cap dims wrongly rejected");
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -134,6 +134,15 @@ enum class Exactness : uint8_t
 // wider banks return InvalidArgument in CrossDevice mode.
 inline constexpr int32_t kMaxCrossDeviceDims = 131072;
 
+// Immutable-format geometry ceiling: the largest row count a bank header may
+// declare (the dims ceiling is kMaxCrossDeviceDims, which lies on both
+// quantizations' 16-byte grids, so paddedDims inherits it). Validation rejects
+// over-cap headers as BadFormat BEFORE any size arithmetic runs on them: with
+// both caps in force every byte-size term — count * paddedDims * ElementSize
+// <= 2^28 * 2^17 * 4 = 2^47 — stays far from int64 overflow. Same ceiling the
+// scratch-archive load enforces (kMaxScratchArchiveRows).
+inline constexpr int32_t kMaxBankRows = 1 << 28;
+
 // One sparse bias entry (v2.1): a row index and the bias added to that row's score.
 struct BiasPair
 {
@@ -200,10 +209,15 @@ inline constexpr int32_t ElementSize(Quantization q)
 }
 
 // Row stride (in elements) that pads a logical dim count to a kAlignment-byte boundary.
+// Computed in int64 and saturated to INT32_MAX, so the helper is total for any int32
+// input: importers call it on raw header dims BEFORE validation, and a hostile value
+// must not open a signed-overflow window there. Validation rejects over-cap dims, so
+// a saturated result is never load-bearing.
 inline constexpr int32_t PaddedDims(int32_t dims, Quantization q)
 {
-	const int32_t elemsPerAlign = kAlignment / ElementSize(q);
-	return ((dims + elemsPerAlign - 1) / elemsPerAlign) * elemsPerAlign;
+	const int64_t elemsPerAlign = kAlignment / ElementSize(q);
+	const int64_t padded = ((dims + elemsPerAlign - 1) / elemsPerAlign) * elemsPerAlign;
+	return padded > INT32_MAX ? INT32_MAX : static_cast<int32_t>(padded);
 }
 
 inline constexpr int64_t RowBytes(const BankView& bank)
