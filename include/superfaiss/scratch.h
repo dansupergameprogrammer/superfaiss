@@ -41,6 +41,24 @@ struct ScratchArchive
 	void* user = nullptr;
 };
 
+// Recall-audit report (V2.3 plan section 20). MeasureScratchRecall fills one from a
+// seeded self-query sweep on a retention-enabled bank. The number is reproducible from
+// `seed`; `generation` stamps the bank's mutation state at measurement, so a later
+// append/remove renders the report stale (RecallReportStale). A recall@10 over a tiny
+// personal bank is mathematically valid and statistically uninformative — the report
+// says so through `informative` (false below kRecallInformativeRows live rows) and,
+// below kRecallMinRows, `k` is a recall@(liveRows-1) rather than @10.
+struct ScratchRecallReport
+{
+	float recall = 0.0f;       // hits / possible over the sweep, [0, 1]
+	int32_t k = 0;             // min(10, liveRows - 1) — the actual retrieval depth
+	int32_t sampleCount = 0;   // min(1000, liveRows) — self-queries drawn
+	int32_t liveRows = 0;      // published minus tombstoned at measurement
+	uint64_t seed = 0;         // the sampling seed, recorded for reproducibility
+	uint64_t generation = 0;   // bank mutation generation at measurement (staleness)
+	bool informative = false;  // false when liveRows < kRecallInformativeRows
+};
+
 class ScratchBank
 {
 public:
@@ -48,6 +66,14 @@ public:
 	~ScratchBank();
 	ScratchBank(const ScratchBank&) = delete;
 	ScratchBank& operator=(const ScratchBank&) = delete;
+
+	// Default seed for the recall sweep (parity with the importer's pinned seed, so a
+	// scratch audit and an import audit over the same rows draw the same self-queries).
+	static constexpr uint64_t kDefaultRecallSeed = 0x5EEDF00DCAFEBEEFull;
+	// A recall@k below this many live rows is a recall@(liveRows-1), not a true @10.
+	static constexpr int32_t kRecallMinRows = 11;
+	// Below this many live rows the number is marked statistically uninformative.
+	static constexpr int32_t kRecallInformativeRows = 100;
 
 	// Allocates the arena (rows + scales + tombstones + staging) in ONE allocation
 	// through the seam — zero steady-state allocation after Create. Capacity is the
@@ -57,6 +83,24 @@ public:
 		int32_t dims,
 		Metric metric,
 		Quantization quant,
+		const Allocator& allocator = DefaultAllocator())
+	{
+		return Create(capacity, dims, metric, quant, false, allocator);
+	}
+
+	// Retention overload (V2.3): when retainFloats is set, the arena additionally
+	// retains, beside every quantized row, the post-normalization/post-validation float
+	// row the quantizer consumed (the audit reference — for Cosine banks the unit-norm
+	// row). Retention is a bank property (RetainsFloats), never the shipping default,
+	// sized into the SAME single allocation (zero steady-state allocation preserved).
+	// It is what MeasureScratchRecall needs; the honest memory cost is RetainedRowBytes
+	// per row (~4.9x the quantized row at int8/256-dim, not 2x — 2x holds only on f32).
+	Status Create(
+		int32_t capacity,
+		int32_t dims,
+		Metric metric,
+		Quantization quant,
+		bool retainFloats,
 		const Allocator& allocator = DefaultAllocator());
 
 	// Releases the arena. Exclusive (no readers in flight). Safe on an empty bank.
@@ -124,6 +168,34 @@ public:
 	Metric GetMetric() const { return Metric_; }
 	Quantization GetQuantization() const { return Quant_; }
 
+	// True if the bank retains post-normalization float rows (set at Create). The
+	// descriptor field DescribeBank surfaces; the gate MeasureScratchRecall requires.
+	bool RetainsFloats() const { return Retain_; }
+
+	// Monotonic mutation generation: advances on every successful Append and every
+	// newly-set Remove (an idempotent re-Remove does not advance). A recall report
+	// stamps this; a stamp that no longer matches means the report is stale.
+	uint64_t Generation() const { return Generation_.load(std::memory_order_acquire); }
+
+	// The retained post-normalization float row at `index` (dims elements), or null if
+	// the bank does not retain or the index is out of the published range. This is the
+	// row the quantizer consumed: for Cosine banks the unit-norm row, for Dot/L2 the
+	// finite-validated input.
+	const float* RetainedRow(int32_t index) const;
+
+	// Per-row byte costs for the honest-budget statement (V2.3 plan section 20, B1):
+	// the quantized row (padded int8/f32 lanes plus the 4-byte int8 scale) and the
+	// retained float row (dims x 4, or 0 when retention is off).
+	int64_t QuantizedRowBytes() const
+	{
+		return static_cast<int64_t>(PaddedDims_) * ElementSize(Quant_) +
+			(Quant_ == Quantization::Int8 ? static_cast<int64_t>(sizeof(float)) : 0);
+	}
+	int64_t RetainedRowBytes() const
+	{
+		return Retain_ ? static_cast<int64_t>(Dims_) * sizeof(float) : 0;
+	}
+
 	// Exclusion-word count for a snapshot of `count` rows (QueryParams::excludeBits
 	// sizing: ceil(count/32)).
 	static int32_t TombstoneWords(int32_t count) { return (count + 31) / 32; }
@@ -148,7 +220,36 @@ public:
 	// outIndexMap, if non-null, receives Count() entries — old index -> compacted
 	// index, -1 for tombstoned rows. Freeze renumbers (W4): consumers remap their
 	// stored handles through the map as part of the freeze. Writer-side.
-	Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap) const;
+	//
+	// Recall re-measurement (V2.3): when outReport and recallWs are both non-null and
+	// the bank retains floats, the freeze measures recall over the compacted (live)
+	// rows at freeze time and writes it to *outReport — a fresh number for the
+	// graduated bank, never a stale one wearing a current face. The number INV-equals a
+	// direct MeasureScratchRecall of the same rows on the same seed. A non-retention
+	// Freeze leaves *outReport untouched: it produces no number to inherit.
+	Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap,
+		ScratchRecallReport* outReport = nullptr, Workspace* recallWs = nullptr,
+		uint64_t recallSeed = kDefaultRecallSeed) const;
+
+	// --- Recall audit (V2.3 plan section 20) ---
+
+	// Seeded recall@k self-query sweep on a retention-enabled bank: min(1000, liveRows)
+	// live rows are drawn as self-queries (the self row excluded), each scored two ways
+	// over the current snapshot — a double-precision float scan of the retained rows
+	// (the reference top-k) versus the bank's own quantized Exactness::CrossDevice scan
+	// — and recall is hits/possible at k = min(10, liveRows-1). Runs under the reader
+	// pin like any query; the workspace supplies all scratch, so a warm call allocates
+	// nothing. On a bank without retention this is a defined InvalidArgument, never a
+	// guessed number. Tombstoned rows are neither sampled nor counted.
+	Status MeasureScratchRecall(Workspace& workspace, ScratchRecallReport* outReport,
+		uint64_t seed = kDefaultRecallSeed);
+
+	// A report is stale once the bank has mutated past its stamped generation. Defined
+	// against the live bank: never reads a post-mutation report as silently current.
+	bool RecallReportStale(const ScratchRecallReport& report) const
+	{
+		return report.generation != Generation();
+	}
 
 	// --- Persistence (archive seam) ---
 
@@ -166,8 +267,11 @@ private:
 	Status AppendValidated(const float* row, int32_t* outIndex);
 	int64_t RowRegionBytes(int32_t capacity) const;
 	static int64_t ArenaBytes(
-		int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant);
+		int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant, bool retain);
 	void BindArena(uint8_t* arena, int32_t capacity);
+	// The recall sweep proper — assumes the arena is stable (caller holds the reader pin
+	// or the writer guard). Const: it only reads rows, retained floats, and tombstones.
+	Status MeasureRecallLocked(uint64_t seed, Workspace& ws, ScratchRecallReport* out) const;
 
 	Allocator Allocator_ = DefaultAllocator();
 	uint8_t* Arena_ = nullptr;
@@ -175,15 +279,18 @@ private:
 	float* Scales_ = nullptr;                    // int8 only
 	std::atomic<uint32_t>* Tombstones_ = nullptr;
 	float* Staging_ = nullptr;                   // one dims-wide row (normalize scratch)
+	float* Retained_ = nullptr;                  // capacity x dims, retention only
 	int32_t Capacity_ = 0;
 	int32_t Dims_ = 0;
 	int32_t PaddedDims_ = 0;
 	Metric Metric_ = Metric::Dot;
 	Quantization Quant_ = Quantization::Float32;
+	bool Retain_ = false;
 	std::atomic<int32_t> PublishedCount_{0};
 	std::atomic<int32_t> ReaderPins_{0};
 	std::atomic<bool> ExclusiveWaiting_{false};
 	std::atomic<int32_t> TombstonedCount_{0};
+	std::atomic<uint64_t> Generation_{0};
 	// Debug-build owner guard: asserts the single-writer contract, costs nothing on
 	// the reader side.
 	mutable std::atomic<bool> WriterBusy_{false};

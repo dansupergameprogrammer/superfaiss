@@ -3937,6 +3937,579 @@ static void TestCrossDevice()
 
 
 // ---------------------------------------------------------------------------
+// T-V2.3-R — scratch-bank recall audit (V2 plan section 20). Retention posture,
+// MeasureScratchRecall, generation/staleness, Freeze re-measure, persistence
+// version bump, and the S5 scratch x cross-device closure at battery level.
+
+namespace scratchv23
+{
+	// Calibration floor for the recall sweep (T-V2.3-R3, CAL). Pinned at the first
+	// calibration run on the reference fixtures as a FLOOR (not an exact value),
+	// space-version-scoped; 0 means 'not yet pinned' (the suite prints the measured
+	// numbers instead of asserting). The import analogue pins >= 0.90 on random int8.
+	static constexpr float kScratchRecallFloor = 0.90f;
+
+	static bool SameBits(float a, float b)
+	{
+		uint32_t x, y;
+		std::memcpy(&x, &a, 4);
+		std::memcpy(&y, &b, 4);
+		return x == y;
+	}
+
+	static void FillSeeded(ScratchBank& bank, int32_t n, int32_t dims, Rng& rng)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < n; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			int32_t idx = -1;
+			CHECK(bank.Append(row.data(), dims, &idx) == Status::Ok);
+			CHECK(idx == r);
+		}
+	}
+} // namespace scratchv23
+
+// R1, R2, R6, R7, R9: retention is an opt-in bank property; the retained reference is
+// the post-normalization row; retained floats serialize with a version bump; Grow
+// copies the arena index-preserving; the honest byte-cost is B1 exact.
+static void TestScratchRetention()
+{
+	using namespace scratchv23;
+	Workspace ws;
+
+	// --- R1: retention flag is opt-in and visible ---
+	std::printf("scratch retention (T-V2.3-R1): opt-in flag, descriptor-visible\n");
+	{
+		ScratchBank ret;
+		CHECK(ret.Create(512, 256, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		CHECK(ret.RetainsFloats() == true);
+
+		ScratchBank def;
+		CHECK(def.Create(512, 256, Metric::Dot, Quantization::Int8) == Status::Ok);
+		CHECK(def.RetainsFloats() == false);
+		CHECK(def.RetainedRowBytes() == 0);
+		// A default Create allocates no retention arena: an appended row has no twin.
+		std::vector<float> row(256, 0.25f);
+		int32_t idx = -1;
+		CHECK(def.Append(row.data(), 256, &idx) == Status::Ok);
+		CHECK(def.RetainedRow(0) == nullptr);
+	}
+
+	// --- R2: retained reference is the post-normalization row the quantizer consumed ---
+	std::printf("scratch retention (T-V2.3-R2): retained == post-normalization row\n");
+	{
+		Rng rng(0x2E7A1234ull);
+		const int32_t dims = 48;
+		ScratchBank cos;
+		CHECK(cos.Create(64, dims, Metric::Cosine, Quantization::Int8, true) == Status::Ok);
+		ScratchBank dot;
+		CHECK(dot.Create(64, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		std::vector<float> src(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 32; ++r)
+		{
+			for (auto& v : src)
+			{
+				v = rng.NextFloat();
+			}
+			int32_t idx = -1;
+			CHECK(cos.Append(src.data(), dims, &idx) == Status::Ok);
+			CHECK(dot.Append(src.data(), dims, &idx) == Status::Ok);
+
+			// Cosine: the retained row is the unit-norm row (importer parity).
+			std::vector<float> norm(src);
+			CHECK(NormalizeRows(norm.data(), 1, dims, nullptr) == Status::Ok);
+			const float* retCos = cos.RetainedRow(r);
+			CHECK(retCos != nullptr);
+			CHECK(std::memcmp(retCos, norm.data(),
+					static_cast<size_t>(dims) * sizeof(float)) == 0);
+
+			// Dot: the retained row is the finite-validated input, unchanged.
+			const float* retDot = dot.RetainedRow(r);
+			CHECK(retDot != nullptr);
+			CHECK(std::memcmp(retDot, src.data(),
+					static_cast<size_t>(dims) * sizeof(float)) == 0);
+		}
+		// A rejected append retains nothing: the count does not advance, so the slot
+		// is not published.
+		std::vector<float> zero(static_cast<size_t>(dims), 0.0f);
+		const int32_t before = cos.Count();
+		CHECK(cos.Append(zero.data(), dims, nullptr) == Status::ZeroNormRow);
+		CHECK(cos.Count() == before);
+		CHECK(cos.RetainedRow(before) == nullptr);
+	}
+
+	// --- R9: honest-budget byte cost equals B1 exactly ---
+	std::printf("scratch retention (T-V2.3-R9): memory cost == B1\n");
+	{
+		ScratchBank i8;
+		CHECK(i8.Create(4, 256, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		CHECK_MSG(i8.QuantizedRowBytes() == 260, "int8 quantized row %lld",
+			static_cast<long long>(i8.QuantizedRowBytes()));
+		CHECK_MSG(i8.RetainedRowBytes() == 1024, "int8 retained row %lld",
+			static_cast<long long>(i8.RetainedRowBytes()));
+		CHECK(i8.QuantizedRowBytes() + i8.RetainedRowBytes() == 1284); // 4.9x
+
+		ScratchBank f32;
+		CHECK(f32.Create(4, 256, Metric::Dot, Quantization::Float32, true) == Status::Ok);
+		CHECK_MSG(f32.QuantizedRowBytes() == 1024, "f32 quantized row %lld",
+			static_cast<long long>(f32.QuantizedRowBytes()));
+		CHECK(f32.RetainedRowBytes() == 1024);
+		CHECK(f32.QuantizedRowBytes() + f32.RetainedRowBytes() == 2048); // 2.0x
+	}
+
+	// --- R7: Grow copies the retention arena, index-preserving ---
+	std::printf("scratch retention (T-V2.3-R7): Grow preserves the retention arena\n");
+	{
+		const int32_t dims = 48;
+		Rng rng(0x6E0Full);
+		ScratchBank g;
+		CHECK(g.Create(32, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(g, 32, dims, rng);
+		CHECK(g.Remove(3) == Status::Ok);
+		CHECK(g.Remove(19) == Status::Ok);
+
+		// Snapshot the retained rows before Grow.
+		std::vector<float> preRetained;
+		for (int32_t r = 0; r < g.Count(); ++r)
+		{
+			const float* rr = g.RetainedRow(r);
+			CHECK(rr != nullptr);
+			preRetained.insert(preRetained.end(), rr, rr + dims);
+		}
+		ScratchRecallReport pre;
+		CHECK(g.MeasureScratchRecall(ws, &pre, 0x1234ull) == Status::Ok);
+
+		CHECK(g.Grow(64) == Status::Ok);
+		CHECK(g.Capacity() == 64);
+
+		for (int32_t r = 0; r < g.Count(); ++r)
+		{
+			const float* rr = g.RetainedRow(r);
+			CHECK(rr != nullptr);
+			CHECK(std::memcmp(rr, preRetained.data() + static_cast<size_t>(r) * dims,
+					static_cast<size_t>(dims) * sizeof(float)) == 0);
+		}
+		ScratchRecallReport post;
+		CHECK(g.MeasureScratchRecall(ws, &post, 0x1234ull) == Status::Ok);
+		CHECK(SameBits(pre.recall, post.recall)); // same seed + snapshot -> same bits
+	}
+
+	// --- R6: retained floats serialize; version bumps 1->2; hard-reject over the set ---
+	std::printf("scratch retention (T-V2.3-R6): serialize + version bump + hard-reject\n");
+	{
+		const int32_t dims = 48;
+		Rng rng(0x5A7E5ull);
+		ScratchBank s;
+		CHECK(s.Create(64, dims, Metric::Cosine, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(s, 50, dims, rng);
+		CHECK(s.Remove(7) == Status::Ok);
+		CHECK(s.Remove(11) == Status::Ok);
+		ScratchRecallReport r0;
+		CHECK(s.MeasureScratchRecall(ws, &r0, 0x99ull) == Status::Ok);
+
+		MemArchive ar;
+		CHECK(s.Save(ar.Writer()) == Status::Ok);
+		// A retention blob writes version 2 (uint32 at byte offset 4, little-endian).
+		CHECK_MSG(ar.bytes[4] == 2, "retention version byte %d", ar.bytes[4]);
+
+		ScratchBank loaded;
+		CHECK(loaded.Load(ar.Reader()) == Status::Ok);
+		CHECK(loaded.RetainsFloats());
+		CHECK(loaded.Count() == s.Count());
+		CHECK(loaded.LiveCount() == s.LiveCount());
+		ScratchRecallReport r1;
+		CHECK(loaded.MeasureScratchRecall(ws, &r1, 0x99ull) == Status::Ok);
+		CHECK(SameBits(r0.recall, r1.recall)); // round-trip bit-equal on the same seed
+		CHECK(r0.k == r1.k && r0.sampleCount == r1.sampleCount && r0.liveRows == r1.liveRows);
+
+		// A non-retention blob still writes version 1, and loads with retention absent.
+		ScratchBank plain;
+		Rng prng(0x5A7E5ull);
+		CHECK(plain.Create(64, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		FillSeeded(plain, 20, dims, prng);
+		MemArchive pa;
+		CHECK(plain.Save(pa.Writer()) == Status::Ok);
+		CHECK_MSG(pa.bytes[4] == 1, "non-retention version byte %d", pa.bytes[4]);
+		ScratchBank fromV1;
+		CHECK(fromV1.Load(pa.Reader()) == Status::Ok);
+		CHECK(!fromV1.RetainsFloats());
+		ScratchRecallReport rNo;
+		CHECK(fromV1.MeasureScratchRecall(ws, &rNo, 0x99ull) == Status::InvalidArgument);
+
+		// Version > 2 -> BadFormat, reject-over-degrade (the target bank unchanged).
+		MemArchive bad;
+		bad.bytes = ar.bytes;
+		bad.bytes[4] = 3;
+		CHECK(loaded.Load(bad.Reader()) == Status::BadFormat);
+		CHECK(loaded.RetainsFloats());
+		CHECK(loaded.Count() == s.Count());
+		// Version 0 -> BadFormat.
+		MemArchive zero;
+		zero.bytes = ar.bytes;
+		zero.bytes[4] = 0;
+		CHECK(loaded.Load(zero.Reader()) == Status::BadFormat);
+	}
+}
+
+// R3, R4, R5, R8: the measurement protocol (calibration), the measurement contract
+// (tombstones/generation/staleness/min-size), Freeze re-measurement, and the carried
+// contracts under retention.
+static void TestScratchRecall()
+{
+	using namespace scratchv23;
+	Workspace ws;
+	const uint64_t seed = ScratchBank::kDefaultRecallSeed;
+
+	// --- R3: MeasureScratchRecall protocol + calibration (CAL) ---
+	std::printf("scratch recall (T-V2.3-R3): float scan vs quantized cross-device scan\n");
+	{
+		int32_t metricTag = 0;
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			ScratchBank b;
+			CHECK(b.Create(512, 128, metric, Quantization::Int8, true) == Status::Ok);
+			Rng rng(0x0C0FFEEull + static_cast<uint64_t>(metricTag) * 0x1000ull);
+			FillSeeded(b, 512, 128, rng);
+			ScratchRecallReport rep;
+			CHECK(b.MeasureScratchRecall(ws, &rep, seed) == Status::Ok);
+			std::printf(
+				"  scratch recall@10 (metric %d): %.4f (n=%d, k=%d, informative=%d, seed=%016llx)\n",
+				metricTag, static_cast<double>(rep.recall), rep.sampleCount, rep.k,
+				rep.informative ? 1 : 0, static_cast<unsigned long long>(rep.seed));
+			CHECK(rep.k == 10);
+			CHECK(rep.sampleCount == 512);
+			CHECK(rep.liveRows == 512);
+			CHECK(rep.informative);
+			CHECK(rep.seed == seed);
+			CHECK(rep.recall >= 0.0f && rep.recall <= 1.0f);
+			if constexpr (kScratchRecallFloor > 0.0f)
+			{
+				CHECK_MSG(rep.recall >= kScratchRecallFloor,
+					"recall floor breached (metric %d): %.4f < %.4f", metricTag,
+					static_cast<double>(rep.recall),
+					static_cast<double>(kScratchRecallFloor));
+			}
+			++metricTag;
+		}
+	}
+
+	// --- R4: tombstones excluded, generation-stamped, stale-marked, min-size stated ---
+	std::printf("scratch recall (T-V2.3-R4): measurement contract\n");
+	{
+		const int32_t dims = 48;
+		Rng rng(0x4C0Aull);
+		ScratchBank b;
+		CHECK(b.Create(256, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(b, 200, dims, rng);
+		for (int32_t r = 0; r < 200; r += 9)
+		{
+			CHECK(b.Remove(r) == Status::Ok);
+		}
+		ScratchRecallReport rep;
+		CHECK(b.MeasureScratchRecall(ws, &rep, seed) == Status::Ok);
+		// Generation stamp + tombstones excluded from the sample space.
+		CHECK(rep.generation == b.Generation());
+		CHECK(!b.RecallReportStale(rep));
+		CHECK(rep.liveRows == b.LiveCount());
+		CHECK(rep.sampleCount == b.LiveCount()); // < 1000, so every live row is drawn
+		CHECK(rep.informative); // > 100 live rows
+
+		// An append after the report renders it stale.
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row)
+		{
+			v = rng.NextFloat();
+		}
+		CHECK(b.Append(row.data(), dims, nullptr) == Status::Ok);
+		CHECK(b.RecallReportStale(rep));
+
+		// A newly-set Remove advances the generation; an idempotent re-Remove does not.
+		ScratchRecallReport rep2;
+		CHECK(b.MeasureScratchRecall(ws, &rep2, seed) == Status::Ok);
+		CHECK(!b.RecallReportStale(rep2));
+		CHECK(b.Remove(1) == Status::Ok); // row 1 was live
+		CHECK(b.RecallReportStale(rep2));
+		ScratchRecallReport rep3;
+		CHECK(b.MeasureScratchRecall(ws, &rep3, seed) == Status::Ok);
+		const uint64_t g = b.Generation();
+		CHECK(b.Remove(1) == Status::Ok); // idempotent re-Remove
+		CHECK(b.Generation() == g);
+		CHECK(!b.RecallReportStale(rep3));
+
+		// Minimum-size statement: below kRecallMinRows the number is recall@(liveRows-1);
+		// below kRecallInformativeRows it is marked uninformative.
+		ScratchBank tiny;
+		Rng trng(0x7117ull);
+		CHECK(tiny.Create(16, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(tiny, 8, dims, trng);
+		ScratchRecallReport tr;
+		CHECK(tiny.MeasureScratchRecall(ws, &tr, seed) == Status::Ok);
+		CHECK(tr.liveRows == 8);
+		CHECK(tr.k == 7); // min(10, 8-1) — a recall@7, not @10
+		CHECK(!tr.informative);
+
+		ScratchBank mid;
+		Rng mrng(0x33aaull);
+		CHECK(mid.Create(128, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(mid, 40, dims, mrng);
+		ScratchRecallReport mr;
+		CHECK(mid.MeasureScratchRecall(ws, &mr, seed) == Status::Ok);
+		CHECK(mr.liveRows == 40);
+		CHECK(mr.k == 10);       // a true recall@10 ...
+		CHECK(!mr.informative);  // ... but still statistically uninformative
+		CHECK(mr.sampleCount == 40);
+	}
+
+	// --- R5: Freeze re-measures at freeze time ---
+	std::printf("scratch recall (T-V2.3-R5): Freeze re-measures the compacted rows\n");
+	{
+		const int32_t dims = 48;
+		const int32_t pd = PaddedDims(dims, Quantization::Int8);
+		Rng rng(0xF2EEull);
+		ScratchBank f;
+		CHECK(f.Create(160, dims, Metric::Cosine, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(f, 120, dims, rng);
+		CHECK(f.Remove(5) == Status::Ok);
+		CHECK(f.Remove(60) == Status::Ok);
+
+		ScratchRecallReport before;
+		CHECK(f.MeasureScratchRecall(ws, &before, seed) == Status::Ok);
+
+		// Mutate after the report: an append and a remove.
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row)
+		{
+			v = rng.NextFloat();
+		}
+		CHECK(f.Append(row.data(), dims, nullptr) == Status::Ok);
+		CHECK(f.Remove(9) == Status::Ok);
+		CHECK(f.RecallReportStale(before)); // the pre-mutation report is now stale
+
+		// A direct measure of the current rows is the freeze-time reference.
+		ScratchRecallReport direct;
+		CHECK(f.MeasureScratchRecall(ws, &direct, seed) == Status::Ok);
+
+		const int32_t live = f.FreezeLiveCount();
+		AlignedBuf frozenRows(static_cast<size_t>(live) * pd * sizeof(int8_t));
+		std::vector<float> frozenScales(static_cast<size_t>(live));
+		std::vector<int32_t> indexMap(static_cast<size_t>(f.Count()));
+		ScratchRecallReport frozen;
+		CHECK(f.Freeze(frozenRows.ptr, frozenScales.data(), indexMap.data(),
+				&frozen, &ws, seed) == Status::Ok);
+		// The frozen number is measured at freeze time (current generation), and
+		// INV-equals a direct measure of the same rows on the same seed.
+		CHECK(frozen.generation == f.Generation());
+		CHECK(!f.RecallReportStale(frozen));
+		CHECK(SameBits(frozen.recall, direct.recall));
+
+		// A non-retention Freeze produces no number: *outReport is left untouched.
+		ScratchBank nr;
+		Rng nrng(0xF2EEull);
+		CHECK(nr.Create(32, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		FillSeeded(nr, 16, dims, nrng);
+		ScratchRecallReport sentinel;
+		sentinel.generation = 0xDEADBEEFull;
+		sentinel.recall = -1.0f;
+		const int32_t nrLive = nr.FreezeLiveCount();
+		AlignedBuf nrRows(static_cast<size_t>(nrLive) * pd * sizeof(int8_t));
+		std::vector<float> nrScales(static_cast<size_t>(nrLive));
+		std::vector<int32_t> nrMap(static_cast<size_t>(nr.Count()));
+		CHECK(nr.Freeze(nrRows.ptr, nrScales.data(), nrMap.data(),
+				&sentinel, &ws, seed) == Status::Ok);
+		CHECK(sentinel.generation == 0xDEADBEEFull && sentinel.recall == -1.0f);
+	}
+
+	// --- R8: carried contracts hold under retention ---
+	std::printf("scratch recall (T-V2.3-R8): carried contracts\n");
+	{
+		const int32_t dims = 48;
+		// R8.4 reject-over-degrade: non-retention MeasureScratchRecall -> InvalidArgument.
+		ScratchBank nr;
+		Rng nrng(0x8D4ull);
+		CHECK(nr.Create(64, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		FillSeeded(nr, 32, dims, nrng);
+		ScratchRecallReport rj;
+		CHECK(nr.MeasureScratchRecall(ws, &rj, seed) == Status::InvalidArgument);
+
+		// R8.1 zero steady-state allocation: warm one measure, then flat.
+		ScratchBank b;
+		Rng rng(0x8A11ull);
+		CHECK(b.Create(256, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(b, 200, dims, rng);
+		ScratchRecallReport warm;
+		CHECK(b.MeasureScratchRecall(ws, &warm, seed) == Status::Ok);
+		const uint64_t before = AllocationCount();
+		for (int32_t i = 0; i < 8; ++i)
+		{
+			ScratchRecallReport r;
+			CHECK(b.MeasureScratchRecall(ws, &r, seed) == Status::Ok);
+		}
+		CHECK_MSG(AllocationCount() == before, "warm MeasureScratchRecall allocated");
+
+		// R8.3 determinism-given-history: identical history -> identical recall bits.
+		ScratchBank b1;
+		ScratchBank b2;
+		Rng r1(0x0777ull);
+		Rng r2(0x0777ull);
+		CHECK(b1.Create(128, dims, Metric::Cosine, Quantization::Int8, true) == Status::Ok);
+		CHECK(b2.Create(128, dims, Metric::Cosine, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(b1, 60, dims, r1);
+		FillSeeded(b2, 60, dims, r2);
+		CHECK(b1.Remove(3) == Status::Ok);
+		CHECK(b2.Remove(3) == Status::Ok);
+		ScratchRecallReport a;
+		ScratchRecallReport c;
+		CHECK(b1.MeasureScratchRecall(ws, &a, seed) == Status::Ok);
+		CHECK(b2.MeasureScratchRecall(ws, &c, seed) == Status::Ok);
+		CHECK(SameBits(a.recall, c.recall));
+		ScratchRecallReport again;
+		CHECK(b1.MeasureScratchRecall(ws, &again, seed) == Status::Ok);
+		CHECK(SameBits(a.recall, again.recall)); // same bank twice, same bits
+	}
+}
+
+// R10: S5 companion closure — a NON-shared-payload baked twin of a scratch snapshot,
+// with a tombstoned row and a Grow in its history, scores bit-identically to the
+// snapshot in CrossDevice mode across the forced-path sweep; the hit-list hash is
+// pinned beside kGoldenXdHash.
+static void TestScratchXdClosure()
+{
+	std::printf("scratch x cross-device closure (T-V2.3-R10)\n");
+	Workspace ws;
+
+	const int32_t dims = xdfix::kBankADims; // 48
+	const int32_t pd = PaddedDims(dims, Quantization::Int8);
+	const int32_t initialCap = 40;
+	const int32_t finalCount = 56;
+
+	ScratchBank scratch;
+	CHECK(scratch.Create(initialCap, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+	std::vector<float> row(static_cast<size_t>(dims));
+	auto appendFromFixture = [&](int32_t srcRow) {
+		for (int32_t i = 0; i < dims; ++i)
+		{
+			row[static_cast<size_t>(i)] = static_cast<float>(
+				xdfix::kBankARows[static_cast<size_t>(srcRow) * dims + i]);
+		}
+		int32_t idx = -1;
+		CHECK(scratch.Append(row.data(), dims, &idx) == Status::Ok);
+	};
+	for (int32_t r = 0; r < initialCap; ++r)
+	{
+		appendFromFixture(r);
+	}
+	// A Grow in the history, then append past the old capacity.
+	CHECK(scratch.Grow(64) == Status::Ok);
+	for (int32_t r = initialCap; r < finalCount; ++r)
+	{
+		appendFromFixture(r);
+	}
+	// >= 1 tombstoned row present in the comparison (a low, a middle, a post-Grow row).
+	CHECK(scratch.Remove(5) == Status::Ok);
+	CHECK(scratch.Remove(37) == Status::Ok);
+	CHECK(scratch.Remove(50) == Status::Ok);
+	CHECK(scratch.LiveCount() == finalCount - 3);
+
+	BankView snapView;
+	std::vector<uint32_t> tombs(static_cast<size_t>(ScratchBank::TombstoneWords(64)), 0u);
+	CHECK(scratch.Snapshot(&snapView, tombs.data()) == Status::Ok);
+	const int32_t count = snapView.count;
+
+	// The non-shared-payload twin: independent allocations, COPIED bytes (not a
+	// BankView aliasing the arena — that is the gap this closes).
+	AlignedBuf twinRows(static_cast<size_t>(count) * pd * sizeof(int8_t));
+	std::memcpy(twinRows.ptr, snapView.rows,
+		static_cast<size_t>(count) * pd * sizeof(int8_t));
+	std::vector<float> twinScales(static_cast<size_t>(count));
+	std::memcpy(twinScales.data(), snapView.scales,
+		static_cast<size_t>(count) * sizeof(float));
+	BankView twin = snapView;
+	twin.rows = twinRows.ptr;
+	twin.scales = twinScales.data();
+	CHECK(twin.rows != snapView.rows); // genuinely independent bytes
+	CHECK(ValidateBank(twin) == Status::Ok);
+
+	auto runBattery = [&]() -> uint64_t {
+		xd::BatteryHash hash;
+		AlignedBuf qbuf(sizeof(float) * static_cast<size_t>(pd));
+		for (int32_t qi = 0; qi < xdfix::kQueryCount; ++qi)
+		{
+			xd::LoadQuery(qi, pd, qbuf.F32());
+			QueryParams p;
+			p.k = 10;
+			p.exactness = Exactness::CrossDevice;
+			p.excludeBits = tombs.data();
+			Hit hitsSnap[10];
+			Hit hitsTwin[10];
+			int32_t nSnap = 0;
+			int32_t nTwin = 0;
+			CHECK(Query(snapView, qbuf.F32(), p, ws, hitsSnap, &nSnap) == Status::Ok);
+			CHECK(Query(twin, qbuf.F32(), p, ws, hitsTwin, &nTwin) == Status::Ok);
+			CHECK(nSnap == nTwin);
+			for (int32_t i = 0; i < nSnap; ++i)
+			{
+				uint32_t sb, tb;
+				std::memcpy(&sb, &hitsSnap[i].score, 4);
+				std::memcpy(&tb, &hitsTwin[i].score, 4);
+				CHECK_MSG(hitsSnap[i].index == hitsTwin[i].index && sb == tb,
+					"twin != snapshot: idx %d/%d bits %08x/%08x", hitsSnap[i].index,
+					hitsTwin[i].index, sb, tb);
+				// A tombstoned row is excluded identically in both.
+				CHECK(!IsExcluded(tombs.data(), hitsSnap[i].index));
+			}
+			xd::CheckFloor(hitsSnap, nSnap);
+			hash.Hits(hitsSnap, nSnap);
+		}
+		return hash.h;
+	};
+
+	// Forced-path sweep: scalar / SSE4.1 / AVX2 here; NEON/scalar on the ARM runner.
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+	uint64_t hashes[4] = {};
+	for (size_t i = 0; i < paths.size(); ++i)
+	{
+		detail::ForceXdSimdPath(paths[i]);
+		hashes[i] = runBattery();
+		detail::ClearForcedXdSimdPath();
+		if (i > 0)
+		{
+			CHECK_MSG(hashes[i] == hashes[0],
+				"scratch-xd forced path %d hash %llx != path %d hash %llx",
+				static_cast<int>(paths[i]),
+				static_cast<unsigned long long>(hashes[i]),
+				static_cast<int>(paths[0]),
+				static_cast<unsigned long long>(hashes[0]));
+		}
+	}
+	const uint64_t battery = runBattery(); // default dispatch matches the forced sweep
+	CHECK(battery == hashes[0]);
+	std::printf("scratch cross-device hash: %016llx (%d forced paths agree)\n",
+		static_cast<unsigned long long>(battery), static_cast<int>(paths.size()));
+	if constexpr (xdfix::kGoldenScratchXdHash != 0)
+	{
+		CHECK_MSG(battery == xdfix::kGoldenScratchXdHash,
+			"scratch cross-device hash %016llx != pinned golden %016llx",
+			static_cast<unsigned long long>(battery),
+			static_cast<unsigned long long>(xdfix::kGoldenScratchXdHash));
+	}
+}
+
+
+// ---------------------------------------------------------------------------
 // T25 — workspace reuse across shapes (external bug report, 2026-07-04): the
 // query-scratch buffer grows monotonically (allocation-flat contract), so its
 // internal stride can EXCEED the current bank's paddedDims after serving a
@@ -4225,6 +4798,9 @@ int main()
 	TestWorkspaceReuseAcrossShapes();
 	TestTrustBoundaryValidation();
 	TestCrossDevice();
+	TestScratchRetention();
+	TestScratchRecall();
+	TestScratchXdClosure();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
