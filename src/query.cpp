@@ -825,6 +825,188 @@ Status QueryBatch(
 	return Status::Ok;
 }
 
+Status QueryXdBatch(
+	const BankView& bank,
+	const XdQuery* queries,
+	int32_t queryCount,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCounts)
+{
+	if (outHits == nullptr || outCounts == nullptr || params.k < 0 || queryCount < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t m = 0; m < queryCount; ++m)
+	{
+		outCounts[m] = 0;
+	}
+	if (params.k == 0 || bank.count == 0 || queryCount == 0)
+	{
+		return Status::Ok;
+	}
+	if (queries == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+
+	// QueryXd's law set, applied per member: CrossDevice by construction, segments
+	// rejected, int8 bank under the dims ceiling, every payload validated (a Cosine
+	// bank rejects a zero self-dot member).
+	if (params.exactness != Exactness::CrossDevice || params.segments != nullptr ||
+		params.segmentCount != 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	for (int32_t m = 0; m < queryCount; ++m)
+	{
+		if (queries[m].q8 == nullptr || !(queries[m].scale >= 0.0) || queries[m].sqSum < 0)
+		{
+			return Status::InvalidArgument;
+		}
+		if (bank.metric == Metric::Cosine && queries[m].sqSum == 0)
+		{
+			return Status::ZeroNormQuery;
+		}
+	}
+
+	// Bias forms per query (the QueryBatch convention): params.bias carries
+	// queryCount entries; sparse entries pre-validate before any scan work.
+	FBiasForm biasStack[kSubBatchWidth];
+	FBiasForm* biasForms = nullptr;
+	int32_t maxPairs = 0;
+	if (params.bias != nullptr)
+	{
+		for (int32_t m = 0; m < queryCount; ++m)
+		{
+			FBiasForm form;
+			const Status biasStatus = ResolveBiasForm(&params.bias[m], form);
+			if (biasStatus != Status::Ok)
+			{
+				return biasStatus;
+			}
+			if (form.pairCount > 0)
+			{
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				const Status pairStatus = ValidateBiasPairs(bank, form.pairs,
+					form.pairCount, workspace.BiasBits());
+				if (pairStatus != Status::Ok)
+				{
+					return pairStatus;
+				}
+				maxPairs = form.pairCount > maxPairs ? form.pairCount : maxPairs;
+			}
+		}
+		if (static_cast<int64_t>(params.k) + maxPairs > INT32_MAX)
+		{
+			return Status::OutOfMemory;
+		}
+	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
+
+	const int32_t maxWidth = queryCount < kSubBatchWidth ? queryCount : kSubBatchWidth;
+	if (!workspace.Reserve(params.k + maxPairs, maxPairs > 0 ? 2 * maxWidth + 1 : maxWidth))
+	{
+		return Status::OutOfMemory;
+	}
+
+	bool nonFiniteBias = false;
+	int32_t candidateCounts[kSubBatchWidth];
+
+	for (int32_t base = 0; base < queryCount; base += kSubBatchWidth)
+	{
+		const int32_t width =
+			(queryCount - base) < kSubBatchWidth ? (queryCount - base) : kSubBatchWidth;
+		if (params.bias != nullptr)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				FBiasForm form;
+				(void)ResolveBiasForm(&params.bias[base + m], form); // validated above
+				biasStack[m] = form;
+			}
+			biasForms = biasStack;
+		}
+
+		// Chunk loop outermost — the bank streams once per batch — with the
+		// single-query CrossDevice kernel scoring each member inside the chunk, so
+		// batch results are bit-identical to queryCount QueryXd calls by construction
+		// (the QueryBatch CrossDevice structure, on caller-quantized payloads).
+		TopK topks[kSubBatchWidth];
+		for (int32_t m = 0; m < width; ++m)
+		{
+			const int32_t pairs = biasForms != nullptr ? biasForms[m].pairCount : 0;
+			topks[m].Init(workspace.HeapStorage(m), params.k + pairs, scoring.metric);
+		}
+		const int32_t chunks = ChunkCount(scoring);
+		for (int32_t c = 0; c < chunks; ++c)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				ScoreChunkXd(scoring, queries[base + m], c, params.excludeBits,
+					topks[m], biasForms != nullptr ? biasForms[m].dense : nullptr,
+					&nonFiniteBias);
+			}
+		}
+		for (int32_t m = 0; m < width; ++m)
+		{
+			const bool bSparse = biasForms != nullptr && biasForms[m].pairCount > 0;
+			if (bSparse)
+			{
+				candidateCounts[m] = topks[m].Finalize(workspace.HeapStorage(width + m));
+			}
+			else
+			{
+				outCounts[base + m] = topks[m].Finalize(
+					outHits + static_cast<int64_t>(base + m) * params.k);
+			}
+		}
+		if (nonFiniteBias)
+		{
+			return Status::NonFiniteQuery;
+		}
+
+		// Sparse composition per member (bits rebuilt per query, the QueryBatch
+		// pattern; the CrossDevice rescore path runs on the member's own payload).
+		if (biasForms != nullptr)
+		{
+			for (int32_t m = 0; m < width; ++m)
+			{
+				if (biasForms[m].pairCount == 0)
+				{
+					continue;
+				}
+				if (!workspace.ReserveBiasBits(bank.count))
+				{
+					return Status::OutOfMemory;
+				}
+				uint32_t* bits = workspace.BiasBits();
+				for (int32_t p = 0; p < biasForms[m].pairCount; ++p)
+				{
+					const int32_t row = biasForms[m].pairs[p].index;
+					bits[row >> 5] |= 1u << (row & 31);
+				}
+				outCounts[base + m] = SelectWithSparseBias(scoring,
+					workspace.HeapStorage(width + m), candidateCounts[m], biasForms[m],
+					bits, nullptr, nullptr, params, false, &queries[base + m],
+					workspace.HeapStorage(2 * maxWidth), // shared selection slot
+					outHits + static_cast<int64_t>(base + m) * params.k);
+			}
+		}
+	}
+	return Status::Ok;
+}
+
 Status QueryIntersect(
 	const BankView& bank,
 	const float* paddedQueries,

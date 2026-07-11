@@ -5167,6 +5167,192 @@ static void TestPoolXdSweep()
 	}
 }
 
+// T-V2.4-P12 — batch composition closure (plan section 21 "composes with ... batch"):
+// QueryXdBatch over M pre-quantized pooled queries bit-equals the same members run
+// through single QueryXd — every count, hit index, and score bit — across the
+// forced-path sweep, with per-query bias (dense and sparse members) in the batch and
+// an adversarial tiny-scale pooled member included. The batch is not hashed
+// separately: bitwise equality to the already-pinned singles covers it, so
+// kGoldenPoolXdHash is untouched by this entry.
+static void TestPoolXdBatch()
+{
+	std::printf("pooling (T-V2.4-P12): batch == singles, bitwise\n");
+	Workspace batchWs;
+	Workspace singleWs;
+
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank bankB(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+		xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+
+	// The adversarial tiny-scale bank (the P3 fixture, rebuilt from the same
+	// committed constants) so a flush-window pooled member rides the batch too.
+	AlignedBuf advRows(static_cast<size_t>(8) * 16);
+	float advScales[8];
+	{
+		const int8_t pattern[16] = {127, -80, 33, -127, 5, 91, -64, 17,
+			-2, 118, -45, 77, -101, 26, -9, 54};
+		for (int32_t r = 0; r < 8; ++r)
+		{
+			for (int32_t j = 0; j < 16; ++j)
+			{
+				advRows.I8()[r * 16 + j] =
+					static_cast<int8_t>(pattern[(j + r) & 15] - (r & 3));
+			}
+		}
+		const uint32_t bits[8] = {0x00000007u, 0x00000123u, 0x00800000u,
+			0x00000350u, 0x000fffffu, 0x00400000u, 0x00000001u, 0x007fffffu};
+		for (int32_t r = 0; r < 8; ++r)
+		{
+			std::memcpy(&advScales[r], &bits[r], 4);
+		}
+	}
+	BankView adv;
+	adv.rows = advRows.ptr;
+	adv.scales = advScales;
+	adv.count = 8;
+	adv.dims = 16;
+	adv.paddedDims = 16;
+	adv.quant = Quantization::Int8;
+	adv.metric = Metric::Dot;
+
+	const BankView* banks[4] = {&bankA.view, &bankB.view, &bankC.view, &adv};
+
+	// Batch == singles under every forced path, per bank.
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+
+	for (size_t pathI = 0; pathI < paths.size(); ++pathI)
+	{
+		detail::ForceXdSimdPath(paths[pathI]);
+		for (int32_t b = 0; b < 4; ++b)
+		{
+			const BankView& bank = *banks[b];
+			// Five pooled members over distinct index subsets (bounded by the
+			// smallest bank's 8 rows for the adversarial case), one weighted.
+			const int32_t sets[5][4] = {
+				{0, 2, 3, 5}, {1, 4, 6, 7}, {0, 1, 2, 3}, {2, 5, 6, 7}, {0, 3, 4, 6}};
+			const int32_t setW[4] = {3, 1, 5, 2};
+			const int32_t batchN = 5;
+
+			AlignedBuf image0(static_cast<size_t>(bank.paddedDims));
+			AlignedBuf image1(static_cast<size_t>(bank.paddedDims));
+			AlignedBuf image2(static_cast<size_t>(bank.paddedDims));
+			AlignedBuf image3(static_cast<size_t>(bank.paddedDims));
+			AlignedBuf image4(static_cast<size_t>(bank.paddedDims));
+			AlignedBuf* images[5] = {&image0, &image1, &image2, &image3, &image4};
+			XdQuery queries[5];
+			for (int32_t m = 0; m < batchN; ++m)
+			{
+				double scale = 0.0;
+				int64_t sqSum = 0;
+				CHECK(MakeCentroidCrossDevice(bank, sets[m], 4,
+						m == 2 ? setW : nullptr, nullptr,
+						images[m]->I8(), &scale, &sqSum) == Status::Ok);
+				queries[m] = XdQuery{images[m]->I8(), scale, sqSum};
+			}
+
+			// Per-query bias, the QueryBatch convention: member 0 dense (with a
+			// subnormal value in it), member 1 sparse pairs, members 2..4 unbiased.
+			std::vector<float> dense(static_cast<size_t>(bank.count), 0.0f);
+			for (int32_t r = 0; r < bank.count; ++r)
+			{
+				const uint32_t bits = (r % 3 == 0) ? 0x00000007u : 0x3c23d70au;
+				std::memcpy(&dense[static_cast<size_t>(r)], &bits, 4);
+			}
+			const BiasPair pairs[2] = {{1, 0.5f}, {6, -0.25f}};
+			RowBias biases[5];
+			biases[0].dense = dense.data();
+			biases[1].pairs = pairs;
+			biases[1].pairCount = 2;
+
+			// A shared exclusion mask (every third row).
+			std::vector<uint32_t> exclude(
+				static_cast<size_t>((bank.count + 31) / 32), 0u);
+			for (int32_t r = 0; r < bank.count; r += 3)
+			{
+				exclude[static_cast<size_t>(r >> 5)] |= 1u << (r & 31);
+			}
+
+			QueryParams p;
+			p.k = 6;
+			p.exactness = Exactness::CrossDevice;
+			p.excludeBits = exclude.data();
+			p.bias = biases;
+
+			Hit batchHits[5 * 6];
+			int32_t batchCounts[5] = {};
+			CHECK(QueryXdBatch(bank, queries, batchN, p, batchWs,
+					batchHits, batchCounts) == Status::Ok);
+
+			for (int32_t m = 0; m < batchN; ++m)
+			{
+				QueryParams sp = p;
+				sp.bias = &biases[m]; // the member's own bias, single-query form
+				Hit single[6];
+				int32_t n = 0;
+				CHECK(QueryXd(bank, queries[m], sp, singleWs, single, &n) == Status::Ok);
+				CHECK_MSG(n == batchCounts[m], "bank %d member %d: batch %d single %d",
+					b, m, batchCounts[m], n);
+				for (int32_t i = 0; i < n && i < batchCounts[m]; ++i)
+				{
+					const Hit& bh = batchHits[static_cast<int64_t>(m) * p.k + i];
+					uint32_t bb, sb;
+					std::memcpy(&bb, &bh.score, 4);
+					std::memcpy(&sb, &single[i].score, 4);
+					CHECK_MSG(bh.index == single[i].index && bb == sb,
+						"bank %d member %d hit %d: batch %d/%08x single %d/%08x",
+						b, m, i, bh.index, bb, single[i].index, sb);
+					CHECK(!IsExcluded(exclude.data(), bh.index));
+				}
+				xd::CheckFloor(batchHits + static_cast<int64_t>(m) * p.k, batchCounts[m]);
+			}
+		}
+		detail::ClearForcedXdSimdPath();
+	}
+
+	// Defined rejections, the QueryXd law set applied to the batch form.
+	{
+		AlignedBuf q8(static_cast<size_t>(bankA.view.paddedDims));
+		double scale = 0.0;
+		int64_t sqSum = 0;
+		const int32_t idx[4] = {0, 2, 3, 5};
+		CHECK(MakeCentroidCrossDevice(bankA.view, idx, 4, nullptr, nullptr,
+				q8.I8(), &scale, &sqSum) == Status::Ok);
+		XdQuery one{q8.I8(), scale, sqSum};
+		Hit hits[6];
+		int32_t counts[1] = {};
+		QueryParams p;
+		p.k = 6;
+		p.exactness = Exactness::PerDevice;
+		CHECK(QueryXdBatch(bankA.view, &one, 1, p, batchWs, hits, counts) ==
+			Status::InvalidArgument);
+		p.exactness = Exactness::CrossDevice;
+		const QuerySegment seg[1] = {{0, 16, 1.0f}};
+		p.segments = seg;
+		p.segmentCount = 1;
+		CHECK(QueryXdBatch(bankA.view, &one, 1, p, batchWs, hits, counts) ==
+			Status::InvalidArgument);
+		p.segments = nullptr;
+		p.segmentCount = 0;
+		CHECK(QueryXdBatch(bankA.view, nullptr, 1, p, batchWs, hits, counts) ==
+			Status::InvalidArgument);
+		// Empty batch is a defined no-op.
+		CHECK(QueryXdBatch(bankA.view, &one, 0, p, batchWs, hits, counts) == Status::Ok);
+	}
+}
+
 // P9 (pooled-query recall vs the float64 pooled reference — the FAI-3 honesty
 // number, calibration entry) and P11 (carried contracts: zero steady-state
 // allocation, reader-pin composition, determinism-given-history).
@@ -5673,6 +5859,7 @@ int main()
 	TestPoolCentroidXd();
 	TestPoolDefinedBehavior();
 	TestPoolXdSweep();
+	TestPoolXdBatch();
 	TestPoolRecallAndContracts();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",

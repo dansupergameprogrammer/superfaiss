@@ -65,4 +65,21 @@ Status QueryXd(
 	Hit* outHits,
 	int32_t* outCount);
 
+// M pre-quantized CrossDevice queries in one bank pass: the chunk loop is outermost,
+// so each chunk's rows are scored against every query while cache-resident — the
+// memory traffic of one scan amortized across the batch (the QueryBatch structure;
+// the single-query CrossDevice kernel scores inside the chunk, so batch results are
+// bit-identical to queryCount QueryXd calls by construction). Law set is QueryXd's:
+// CrossDevice only, segments rejected, per-query payload validated. Per-query bias
+// follows QueryBatch's convention — params.bias carries queryCount entries. outHits
+// holds queryCount * params.k entries (query-major); outCounts holds queryCount.
+Status QueryXdBatch(
+	const BankView& bank,
+	const XdQuery* queries,
+	int32_t queryCount,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCounts);
+
 } // namespace superfaiss
