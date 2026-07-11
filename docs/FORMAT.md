@@ -56,7 +56,7 @@ An importer must reject, with a specific diagnostic and no partial output:
 header geometry over the format ceilings (`dims` > 131,072 or `count` > 2^28) —
 rejected on the header fields alone, **before any payload size is computed from
 them** (`ValidateBank`/`ValidateSourceRows` enforce this as `BadFormat`; within
-the ceilings every byte-size term stays below 2^47, so the arithmetic cannot
+the ceilings every byte-size term stays at most 2^47, so the arithmetic cannot
 overflow); payload size disagreeing with the header; any non-finite value;
 duplicate or wrongly-counted ids; a zero-norm row when `metric` is `cosine`;
 unknown `schemaVersion`, `metric`, or `dtype`; a malformed `channels` table
