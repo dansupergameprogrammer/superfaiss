@@ -347,6 +347,107 @@ Status Query(
 	return Status::Ok;
 }
 
+Status QueryXd(
+	const BankView& bank,
+	const XdQuery& query,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCount)
+{
+	if (outHits == nullptr || outCount == nullptr || params.k < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outCount = 0;
+	if (params.k == 0 || bank.count == 0)
+	{
+		return Status::Ok;
+	}
+
+	// A pre-quantized query is CrossDevice by construction: the mode is required, the
+	// bank laws are the CrossDevice laws, and segments are not accepted (segment
+	// validation is defined against the float query the caller does not have).
+	if (params.exactness != Exactness::CrossDevice || params.segments != nullptr ||
+		params.segmentCount != 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	// The query payload itself: an image, a finite non-negative scale. A Cosine bank
+	// rejects a zero-norm query under any override — the bank's own validation law,
+	// applied to the integer self-dot (zero self-dot == all-zero image).
+	if (query.q8 == nullptr || !(query.scale >= 0.0) || query.sqSum < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (bank.metric == Metric::Cosine && query.sqSum == 0)
+	{
+		return Status::ZeroNormQuery;
+	}
+
+	FBiasForm bias;
+	const Status biasStatus = ResolveBiasForm(params.bias, bias);
+	if (biasStatus != Status::Ok)
+	{
+		return biasStatus;
+	}
+	if (bias.pairCount > 0)
+	{
+		if (static_cast<int64_t>(params.k) + bias.pairCount > INT32_MAX ||
+			!workspace.ReserveBiasBits(bank.count))
+		{
+			return Status::OutOfMemory;
+		}
+		const Status pairStatus =
+			ValidateBiasPairs(bank, bias.pairs, bias.pairCount, workspace.BiasBits());
+		if (pairStatus != Status::Ok)
+		{
+			return pairStatus;
+		}
+	}
+
+	BankView scoring = bank;
+	scoring.metric = ScoringMetric(bank, params);
+
+	const int32_t scanK = params.k + bias.pairCount;
+	if (!workspace.Reserve(scanK, bias.pairCount > 0 ? 3 : 1))
+	{
+		return Status::OutOfMemory;
+	}
+
+	// The scan: the same CrossDevice chunk kernel, the same fixed-order double
+	// epilogue and subnormal floor Query runs in this mode — on the caller's bytes.
+	TopK topk;
+	topk.Init(workspace.HeapStorage(0), scanK, scoring.metric);
+	bool nonFiniteBias = false;
+	const int32_t chunks = ChunkCount(scoring);
+	for (int32_t c = 0; c < chunks; ++c)
+	{
+		ScoreChunkXd(scoring, query, c, params.excludeBits, topk,
+			bias.dense, &nonFiniteBias);
+	}
+	if (nonFiniteBias)
+	{
+		return Status::NonFiniteQuery; // the finite-only bias law (fused check)
+	}
+
+	if (bias.pairCount > 0)
+	{
+		const int32_t candidateCount = topk.Finalize(workspace.HeapStorage(1));
+		*outCount = SelectWithSparseBias(scoring, workspace.HeapStorage(1),
+			candidateCount, bias, workspace.BiasBits(), nullptr, nullptr, params,
+			false, &query, workspace.HeapStorage(2), outHits);
+		return Status::Ok;
+	}
+
+	*outCount = topk.Finalize(outHits);
+	return Status::Ok;
+}
+
 // Width of one amortized sub-batch: TopK views for the sub-batch live on the stack.
 // Batches wider than this are processed as consecutive sub-batches; correctness is
 // unchanged (batch ≡ singles), the cache amortization simply resets per sub-batch.

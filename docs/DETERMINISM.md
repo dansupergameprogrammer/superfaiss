@@ -127,6 +127,17 @@ Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
 after the `Remove`, and a snapshot, once taken, is immutable — querying it
 twice is bit-identical regardless of concurrent writer activity.
 
+## 2d. Integer-domain pooling (v2.4): a versioned composition operator
+
+`MakeCentroidCrossDevice` pools int8 rows into a quantized CrossDevice query with
+order-free int64 accumulation and a direct integer-domain requantization (no float
+norm reduction exists on the path). Given identical row bytes, scales, indices, and
+weights, its product — image, scale, self-dot — is bit-identical on any machine, and
+`QueryXd` executes exactly those bytes. **It is a versioned composition operator: any
+change to its accumulation, epilogue, or quantization is a space-version change for
+consumers** — embedding-space version machinery (stamping, mismatch rejection) lives
+consumer-side; treat a change here exactly like re-baking the space.
+
 ## 3. Embedder obligations
 
 1. **Do not let your compiler contract the float math.** Implicit FMA contraction in

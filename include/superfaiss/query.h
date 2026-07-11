@@ -46,4 +46,23 @@ Status QueryIntersect(
 	Hit* outHits,
 	int32_t* outCount);
 
+// Exact top-k for a PRE-QUANTIZED CrossDevice query (v2.4): the query enters as the
+// XdQuery payload itself (int8 image + scale + self-dot — MakeCentroidCrossDevice's
+// product), so the executed query is bit-for-bit the caller's quantized bytes; no
+// float round-trip, no requantization. CrossDevice-only by construction:
+// params.exactness must be CrossDevice, the bank must be Int8 with paddedDims <=
+// kMaxCrossDeviceDims, and a Cosine bank rejects a zero self-dot query (ZeroNormQuery,
+// the bank's own validation law). Composes with exclusion, ScoreAs, and both bias
+// forms exactly as Query does in CrossDevice mode — the same kernels, the same
+// epilogue, the same subnormal floor. Segments are not accepted on a pre-quantized
+// query (InvalidArgument): segment validation is defined against the float query the
+// caller does not have. Allocation-free once `workspace` is warm for this k.
+Status QueryXd(
+	const BankView& bank,
+	const XdQuery& query,
+	const QueryParams& params,
+	Workspace& workspace,
+	Hit* outHits,
+	int32_t* outCount);
+
 } // namespace superfaiss

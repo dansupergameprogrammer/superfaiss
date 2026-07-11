@@ -4510,6 +4510,875 @@ static void TestScratchXdClosure()
 
 
 // ---------------------------------------------------------------------------
+// T-V2.4-P — integer-domain pooling (V2 plan section 21): MakeCentroidCrossDevice
+// pools int8 rows into a quantized CrossDevice query (image + scale + self-dot),
+// executed bit-for-bit by QueryXd. References are independent test-side routines;
+// the golden pooling hash is pinned beside kGoldenXdHash.
+
+namespace pool
+{
+	// Calibration floor for pooled-query recall (T-V2.4-P9, CAL). Pinned at the first
+	// calibration run as a FLOOR (not an exact value), space-version-scoped; 0 means
+	// 'not yet pinned' (the suite prints the measured numbers instead of asserting).
+	static constexpr float kPoolRecallFloor = 0.90f;
+
+	// DAZ-proof scale decode, test-side (independent of detail::FloatBitsToDouble):
+	// subnormal scales decode from the bit pattern via integer math.
+	inline double DecodeScale(float s)
+	{
+		uint32_t b;
+		std::memcpy(&b, &s, 4);
+		if ((b & 0x7f800000u) != 0)
+		{
+			return static_cast<double>(s);
+		}
+		const double m = static_cast<double>(static_cast<int32_t>(b & 0x7fffffu)) *
+			1.4012984643248171e-45; // 2^-149
+		return (b >> 31) != 0 ? -m : m;
+	}
+
+	// Independent float64 value reference (P1): the pooled mean, plain double loops —
+	// sum(v_rj * scale_r * w_r) / sum(w_r) per dim. Not the operator's code path.
+	inline void RefPoolF64(const BankView& bank, const int32_t* idx, int32_t n,
+		const int32_t* w, double* outRef)
+	{
+		double sumW = 0.0;
+		for (int32_t i = 0; i < n; ++i)
+		{
+			sumW += w != nullptr ? static_cast<double>(w[i]) : 1.0;
+		}
+		for (int32_t j = 0; j < bank.dims; ++j)
+		{
+			outRef[j] = 0.0;
+		}
+		for (int32_t i = 0; i < n; ++i)
+		{
+			const int32_t row = idx[i];
+			const double wi = w != nullptr ? static_cast<double>(w[i]) : 1.0;
+			const double s = DecodeScale(bank.scales[row]);
+			const int8_t* r = static_cast<const int8_t*>(bank.rows) +
+				static_cast<int64_t>(row) * bank.paddedDims;
+			for (int32_t j = 0; j < bank.dims; ++j)
+			{
+				outRef[j] += static_cast<double>(r[j]) * s * wi;
+			}
+		}
+		for (int32_t j = 0; j < bank.dims; ++j)
+		{
+			outRef[j] /= sumW;
+		}
+	}
+
+	// Independent normalize-then-quantize bit reference (P2, FAI-6), recoded from the
+	// contract, not from compose.cpp. PROOF OBLIGATION (stated): normalize-then-
+	// quantize forms n_j = acc_j / L (L = the pooled vector's norm, a positive
+	// constant) and quantizes q_j = RHE(n_j * 127 / max|n|); the positive factor 1/L
+	// cancels in the EXACT rational — (acc_j / L) * 127 / (maxAcc / L) ==
+	// acc_j * 127 / maxAcc — before any rounding happens, so this reference evaluates
+	// the normalization symbolically (exact cancellation) and rounds the exact
+	// rational with its own integer round-half-even. Any correctly-rounded evaluation
+	// of normalize-then-quantize yields these bits; a mismatch against the operator
+	// is an operator defect, not float noise.
+	struct RefPoolBits
+	{
+		std::vector<int8_t> q8;
+		double scale = 0.0;
+		int64_t sqSum = 0;
+	};
+
+	inline Status RefNormThenQuant(const BankView& bank, const int32_t* idx, int32_t n,
+		const int32_t* w, const uint32_t* excludeBits, RefPoolBits& out)
+	{
+		// Max included decoded scale and weight sum (independent loops).
+		double maxScale = 0.0;
+		int64_t sumW = 0;
+		int32_t included = 0;
+		for (int32_t i = 0; i < n; ++i)
+		{
+			if (IsExcluded(excludeBits, idx[i]))
+			{
+				continue;
+			}
+			++included;
+			sumW += w != nullptr ? w[i] : 1;
+			const double s = DecodeScale(bank.scales[idx[i]]);
+			if (s > maxScale)
+			{
+				maxScale = s;
+			}
+		}
+		if (included == 0)
+		{
+			return Status::InvalidArgument;
+		}
+		if (maxScale == 0.0)
+		{
+			return Status::ZeroNormQuery;
+		}
+		// Integer accumulation with the contract's multiplier: w * RHE(ratio * 2^24).
+		// std::nearbyint under the default rounding mode (round-to-nearest-even, the
+		// library-wide assumption) IS round-half-even — an independent evaluation of
+		// the same correctly-rounded quantity.
+		std::vector<int64_t> acc(static_cast<size_t>(bank.dims), 0);
+		for (int32_t i = 0; i < n; ++i)
+		{
+			const int32_t row = idx[i];
+			if (IsExcluded(excludeBits, row))
+			{
+				continue;
+			}
+			const double ratio = DecodeScale(bank.scales[row]) / maxScale;
+			const int64_t m = (w != nullptr ? w[i] : 1) *
+				static_cast<int64_t>(std::nearbyint(ratio * 16777216.0));
+			const int8_t* r = static_cast<const int8_t*>(bank.rows) +
+				static_cast<int64_t>(row) * bank.paddedDims;
+			for (int32_t j = 0; j < bank.dims; ++j)
+			{
+				acc[static_cast<size_t>(j)] += static_cast<int64_t>(r[j]) * m;
+			}
+		}
+		int64_t maxAcc = 0;
+		for (int32_t j = 0; j < bank.dims; ++j)
+		{
+			const int64_t mag = acc[static_cast<size_t>(j)] < 0
+				? -acc[static_cast<size_t>(j)] : acc[static_cast<size_t>(j)];
+			if (mag > maxAcc)
+			{
+				maxAcc = mag;
+			}
+		}
+		if (maxAcc == 0)
+		{
+			return Status::ZeroNormQuery;
+		}
+		// Quantize the exact rational acc*127/maxAcc, round-half-even (own integer
+		// implementation — the normalization factor has already cancelled exactly).
+		out.q8.assign(static_cast<size_t>(bank.paddedDims), 0);
+		out.sqSum = 0;
+		for (int32_t j = 0; j < bank.dims; ++j)
+		{
+			const int64_t num = acc[static_cast<size_t>(j)] * 127;
+			const bool neg = num < 0;
+			const uint64_t a = neg ? static_cast<uint64_t>(-num) : static_cast<uint64_t>(num);
+			const uint64_t d = static_cast<uint64_t>(maxAcc);
+			uint64_t q = a / d;
+			const uint64_t rem = a % d;
+			if (2 * rem > d || (2 * rem == d && (q & 1) != 0))
+			{
+				++q;
+			}
+			const int64_t v = neg ? -static_cast<int64_t>(q) : static_cast<int64_t>(q);
+			out.q8[static_cast<size_t>(j)] = static_cast<int8_t>(v);
+			out.sqSum += v * v;
+		}
+		out.scale = (static_cast<double>(maxAcc) / static_cast<double>(sumW * 127)) *
+			maxScale * (1.0 / 16777216.0);
+		return Status::Ok;
+	}
+
+	inline bool SameDoubleBits(double a, double b)
+	{
+		uint64_t x, y;
+		std::memcpy(&x, &a, 8);
+		std::memcpy(&y, &b, 8);
+		return x == y;
+	}
+} // namespace pool
+
+// P1 (float64 value reference), P2 (normalize-then-quantize bit identity, FAI-6),
+// P4 (baked ≡ runtime twin on the quantized representation), P6 (weighted-all-equal
+// ≡ unweighted, bitwise).
+static void TestPoolCentroidXd()
+{
+	std::printf("pooling (T-V2.4-P1/P2/P4/P6): references and twins\n");
+
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank bankB(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+		xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+	const BankView* banks[3] = {&bankA.view, &bankB.view, &bankC.view};
+
+	// PoolRowsRef: fixed index/weight sets over the committed fixture banks (indices
+	// bounded by the smallest bank, kBankC's 48 rows).
+	const int32_t idx[10] = {0, 3, 5, 17, 21, 33, 40, 44, 46, 47};
+	const int32_t mixedW[10] = {1, 4, 2, 9, 1, 3, 7, 2, 5, 1};
+	const int32_t equalW[10] = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+
+	for (int32_t b = 0; b < 3; ++b)
+	{
+		const BankView& bank = *banks[b];
+		AlignedBuf q8(static_cast<size_t>(bank.paddedDims));
+		double scale = 0.0;
+		int64_t sqSum = 0;
+		CHECK(MakeCentroidCrossDevice(bank, idx, 10, nullptr, nullptr,
+				q8.I8(), &scale, &sqSum) == Status::Ok);
+
+		// P1 — value: dequantized output within the quantizer's tolerance of the
+		// independent float64 pooled mean. Bound: half a quantization step plus the
+		// fixed-point multiplier rounding (<= 0.5 per row on the 2^24 grid).
+		{
+			std::vector<double> ref(static_cast<size_t>(bank.dims));
+			pool::RefPoolF64(bank, idx, 10, nullptr, ref.data());
+			double maxScale = 0.0;
+			for (int32_t i = 0; i < 10; ++i)
+			{
+				const double s = pool::DecodeScale(bank.scales[idx[i]]);
+				if (s > maxScale)
+				{
+					maxScale = s;
+				}
+			}
+			const double tol = 0.5 * scale + 127.0 * maxScale / 33554432.0 /* 2^25 */;
+			for (int32_t j = 0; j < bank.dims; ++j)
+			{
+				const double got = static_cast<double>(q8.I8()[j]) * scale;
+				CHECK_MSG(std::fabs(got - ref[static_cast<size_t>(j)]) <= tol,
+					"bank %d dim %d: pooled %.9g ref %.9g tol %.3g", b, j, got,
+					ref[static_cast<size_t>(j)], tol);
+			}
+			// The set's float mean has a non-unit norm (the FAI-6 case is real here).
+			double norm = 0.0;
+			for (int32_t j = 0; j < bank.dims; ++j)
+			{
+				norm += ref[static_cast<size_t>(j)] * ref[static_cast<size_t>(j)];
+			}
+			CHECK(std::fabs(std::sqrt(norm) - 1.0) > 1e-6);
+		}
+
+		// P2 — bit: the operator's direct integer requantization equals the
+		// normalize-then-quantize reference byte for byte (FAI-6).
+		{
+			pool::RefPoolBits ref;
+			CHECK(pool::RefNormThenQuant(bank, idx, 10, nullptr, nullptr, ref) == Status::Ok);
+			CHECK(std::memcmp(q8.I8(), ref.q8.data(),
+					static_cast<size_t>(bank.paddedDims)) == 0);
+			CHECK(pool::SameDoubleBits(scale, ref.scale));
+			CHECK(sqSum == ref.sqSum);
+		}
+
+		// P4 — twin on the quantized representation: the bake-side entry point is a
+		// second call to the same operator; over identical rows (here an independent
+		// copied-bytes payload stands in for the baked side) the product is
+		// byte-identical — one operator, two entry points, no second math.
+		{
+			AlignedBuf bakedQ8(static_cast<size_t>(bank.paddedDims));
+			double bakedScale = 0.0;
+			int64_t bakedSq = 0;
+			CHECK(MakeCentroidCrossDevice(bank, idx, 10, nullptr, nullptr,
+					bakedQ8.I8(), &bakedScale, &bakedSq) == Status::Ok);
+			CHECK(std::memcmp(q8.I8(), bakedQ8.I8(),
+					static_cast<size_t>(bank.paddedDims)) == 0);
+			CHECK(pool::SameDoubleBits(scale, bakedScale) && sqSum == bakedSq);
+
+			AlignedBuf twinRows(static_cast<size_t>(bank.count) * bank.paddedDims);
+			std::memcpy(twinRows.ptr, bank.rows,
+				static_cast<size_t>(bank.count) * bank.paddedDims);
+			std::vector<float> twinScales(bank.scales, bank.scales + bank.count);
+			BankView twin = bank;
+			twin.rows = twinRows.ptr;
+			twin.scales = twinScales.data();
+			AlignedBuf twinQ8(static_cast<size_t>(bank.paddedDims));
+			double twinScale = 0.0;
+			int64_t twinSq = 0;
+			CHECK(MakeCentroidCrossDevice(twin, idx, 10, nullptr, nullptr,
+					twinQ8.I8(), &twinScale, &twinSq) == Status::Ok);
+			CHECK(std::memcmp(q8.I8(), twinQ8.I8(),
+					static_cast<size_t>(bank.paddedDims)) == 0);
+			CHECK(pool::SameDoubleBits(scale, twinScale) && sqSum == twinSq);
+		}
+
+		// P6 — all-equal weights bit-equal unweighted (the common factor cancels
+		// under symmetric quantization AND in the scale's exact rational).
+		{
+			AlignedBuf wQ8(static_cast<size_t>(bank.paddedDims));
+			double wScale = 0.0;
+			int64_t wSq = 0;
+			CHECK(MakeCentroidCrossDevice(bank, idx, 10, equalW, nullptr,
+					wQ8.I8(), &wScale, &wSq) == Status::Ok);
+			CHECK(std::memcmp(q8.I8(), wQ8.I8(),
+					static_cast<size_t>(bank.paddedDims)) == 0);
+			CHECK(pool::SameDoubleBits(scale, wScale));
+			CHECK(sqSum == wSq);
+		}
+
+		// Mixed weights still match both references (P1/P2 under weighting).
+		{
+			AlignedBuf wQ8(static_cast<size_t>(bank.paddedDims));
+			double wScale = 0.0;
+			int64_t wSq = 0;
+			CHECK(MakeCentroidCrossDevice(bank, idx, 10, mixedW, nullptr,
+					wQ8.I8(), &wScale, &wSq) == Status::Ok);
+			pool::RefPoolBits ref;
+			CHECK(pool::RefNormThenQuant(bank, idx, 10, mixedW, nullptr, ref) == Status::Ok);
+			CHECK(std::memcmp(wQ8.I8(), ref.q8.data(),
+					static_cast<size_t>(bank.paddedDims)) == 0);
+			CHECK(pool::SameDoubleBits(wScale, ref.scale) && wSq == ref.sqSum);
+
+			std::vector<double> vref(static_cast<size_t>(bank.dims));
+			pool::RefPoolF64(bank, idx, 10, mixedW, vref.data());
+			double maxScale = 0.0;
+			for (int32_t i = 0; i < 10; ++i)
+			{
+				const double s = pool::DecodeScale(bank.scales[idx[i]]);
+				if (s > maxScale)
+				{
+					maxScale = s;
+				}
+			}
+			const double tol = 0.5 * wScale + 127.0 * maxScale / 33554432.0;
+			for (int32_t j = 0; j < bank.dims; ++j)
+			{
+				const double got = static_cast<double>(wQ8.I8()[j]) * wScale;
+				CHECK(std::fabs(got - vref[static_cast<size_t>(j)]) <= tol);
+			}
+		}
+	}
+}
+
+// P5 (tombstone exclusion, empty set, zero-norm — defined behavior) and P7 (overflow
+// at the pinned FAI-5 bound, both sides).
+static void TestPoolDefinedBehavior()
+{
+	std::printf("pooling (T-V2.4-P5/P7): defined rejections and the overflow bound\n");
+
+	// P5.1 — tombstoned rows excluded by the snapshot view: pooling the full index
+	// range with the snapshot's tombstone words equals pooling the live rows only.
+	{
+		Rng rng(0xB00Cull);
+		const int32_t dims = 32;
+		const int32_t count = 24;
+		ScratchBank scratch;
+		CHECK(scratch.Create(count, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < count; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(scratch.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		CHECK(scratch.Remove(2) == Status::Ok);
+		CHECK(scratch.Remove(11) == Status::Ok);
+		CHECK(scratch.Remove(23) == Status::Ok);
+		BankView snap;
+		std::vector<uint32_t> tombs(
+			static_cast<size_t>(ScratchBank::TombstoneWords(count)), 0u);
+		CHECK(scratch.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+		std::vector<int32_t> all(static_cast<size_t>(count));
+		std::vector<int32_t> live;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			all[static_cast<size_t>(r)] = r;
+			if (!IsExcluded(tombs.data(), r))
+			{
+				live.push_back(r);
+			}
+		}
+		AlignedBuf a(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf b(static_cast<size_t>(snap.paddedDims));
+		double sa = 0.0, sb = 0.0;
+		int64_t qa = 0, qb = 0;
+		CHECK(MakeCentroidCrossDevice(snap, all.data(), count, nullptr, tombs.data(),
+				a.I8(), &sa, &qa) == Status::Ok);
+		CHECK(MakeCentroidCrossDevice(snap, live.data(),
+				static_cast<int32_t>(live.size()), nullptr, nullptr,
+				b.I8(), &sb, &qb) == Status::Ok);
+		CHECK(std::memcmp(a.I8(), b.I8(), static_cast<size_t>(snap.paddedDims)) == 0);
+		CHECK(pool::SameDoubleBits(sa, sb) && qa == qb);
+
+		// P5.2 — empty row set → InvalidArgument, never a zero vector; a selection
+		// whose every row is excluded is the same emptiness.
+		CHECK(MakeCentroidCrossDevice(snap, all.data(), 0, nullptr, nullptr,
+				a.I8(), &sa, &qa) == Status::InvalidArgument);
+		const int32_t dead[3] = {2, 11, 23};
+		CHECK(MakeCentroidCrossDevice(snap, dead, 3, nullptr, tombs.data(),
+				a.I8(), &sa, &qa) == Status::InvalidArgument);
+	}
+
+	// P5.3 — zero-norm on the INTEGER accumulator: antipodal rows at equal scale
+	// cancel exactly → ZeroNormQuery (parity with MakeCentroid's rejection).
+	{
+		const int32_t dims = 16;
+		AlignedBuf rows(static_cast<size_t>(2) * dims);
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			rows.I8()[j] = static_cast<int8_t>(j - 7);
+			rows.I8()[dims + j] = static_cast<int8_t>(-(j - 7));
+		}
+		const float scales[2] = {0.5f, 0.5f};
+		BankView v;
+		v.rows = rows.ptr;
+		v.scales = scales;
+		v.count = 2;
+		v.dims = dims;
+		v.paddedDims = dims;
+		v.quant = Quantization::Int8;
+		v.metric = Metric::Dot;
+		const int32_t both[2] = {0, 1};
+		AlignedBuf q8(static_cast<size_t>(dims));
+		double s = 0.0;
+		int64_t sq = 0;
+		CHECK(MakeCentroidCrossDevice(v, both, 2, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::ZeroNormQuery);
+
+		// All-zero scales: every row dequantizes to zero → ZeroNormQuery too.
+		const float zeroScales[2] = {0.0f, 0.0f};
+		v.scales = zeroScales;
+		CHECK(MakeCentroidCrossDevice(v, both, 2, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::ZeroNormQuery);
+
+		// Remaining defined rejections: f32 bank (CrossDevice is int8-only),
+		// non-positive weight, out-of-range index.
+		v.scales = scales;
+		BankView f32 = v;
+		f32.quant = Quantization::Float32;
+		CHECK(MakeCentroidCrossDevice(f32, both, 2, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::InvalidArgument);
+		const int32_t zeroW[2] = {1, 0};
+		CHECK(MakeCentroidCrossDevice(v, both, 2, zeroW, nullptr,
+				q8.I8(), &s, &sq) == Status::InvalidArgument);
+		const int32_t bad[2] = {0, 2};
+		CHECK(MakeCentroidCrossDevice(v, bad, 2, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::InvalidArgument);
+	}
+
+	// P7 — the FAI-5 bound, both sides. Max passing: sum(w) == kMaxPooledRows of
+	// worst-case all-+-127 rows at equal (max) scale accumulates without overflow and
+	// equals the scalar expectation; first failing: one more is InvalidArgument. The
+	// pool reuses row INDICES (a 2^20-entry index array over a 4-row bank).
+	{
+		const int32_t dims = 16;
+		AlignedBuf rows(static_cast<size_t>(4) * dims);
+		for (int32_t r = 0; r < 4; ++r)
+		{
+			for (int32_t j = 0; j < dims; ++j)
+			{
+				// Alternating sign per dim, identical across rows: every accumulator
+				// hits the worst-case magnitude sum(w) * 127 * 2^24.
+				rows.I8()[r * dims + j] = static_cast<int8_t>((j & 1) ? -127 : 127);
+			}
+		}
+		const float scales[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		BankView v;
+		v.rows = rows.ptr;
+		v.scales = scales;
+		v.count = 4;
+		v.dims = dims;
+		v.paddedDims = dims;
+		v.quant = Quantization::Int8;
+		v.metric = Metric::Dot;
+
+		const int32_t maxRows = static_cast<int32_t>(kMaxPooledRows);
+		std::vector<int32_t> idx(static_cast<size_t>(maxRows) + 1);
+		for (size_t i = 0; i < idx.size(); ++i)
+		{
+			idx[i] = static_cast<int32_t>(i & 3);
+		}
+		AlignedBuf q8(static_cast<size_t>(dims));
+		double s = 0.0;
+		int64_t sq = 0;
+		CHECK(MakeCentroidCrossDevice(v, idx.data(), maxRows, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::Ok);
+		// Scalar expectation at the bound: every |acc_j| equals maxAcc, so the image
+		// is exactly +-127 per dim and the scale is exactly 1.0 (2^20*127*2^24 over
+		// 2^20*127, on the 2^24 grid) — any int64 wrap would break both.
+		for (int32_t j = 0; j < dims; ++j)
+		{
+			CHECK(q8.I8()[j] == ((j & 1) ? -127 : 127));
+		}
+		CHECK(pool::SameDoubleBits(s, 1.0));
+		CHECK(sq == static_cast<int64_t>(dims) * 127 * 127);
+
+		// First failing, unweighted: maxPooledRows + 1 rows.
+		CHECK(MakeCentroidCrossDevice(v, idx.data(), maxRows + 1, nullptr, nullptr,
+				q8.I8(), &s, &sq) == Status::InvalidArgument);
+
+		// Same bound through the weighted form: sum(w) == bound passes, + 1 rejects.
+		const int32_t idx4[4] = {0, 1, 2, 3};
+		const int32_t wAt[4] = {maxRows / 4, maxRows / 4, maxRows / 4, maxRows / 4};
+		CHECK(MakeCentroidCrossDevice(v, idx4, 4, wAt, nullptr,
+				q8.I8(), &s, &sq) == Status::Ok);
+		const int32_t wOver[4] = {maxRows / 4, maxRows / 4, maxRows / 4, maxRows / 4 + 1};
+		CHECK(MakeCentroidCrossDevice(v, idx4, 4, wOver, nullptr,
+				q8.I8(), &s, &sq) == Status::InvalidArgument);
+	}
+}
+
+// P3 (cross-ISA bit-identity with the forced-path sweep, adversarial tiny-scale
+// included) and P8 (golden pooled-query hash, capture at first green).
+static void TestPoolXdSweep()
+{
+	std::printf("pooling (T-V2.4-P3/P8): forced-path sweep and the golden hash\n");
+	Workspace ws;
+
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank bankB(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+		xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+	const BankView* banks[3] = {&bankA.view, &bankB.view, &bankC.view};
+
+	// PoolAdversarialTinyScale: committed in-test constants — subnormal and
+	// FLT_MIN-neighborhood per-row scales push epilogue products into the flush
+	// window (the section 19.2 S1 pattern applied to pooling).
+	AlignedBuf advRows(static_cast<size_t>(8) * 16);
+	float advScales[8];
+	{
+		const int8_t pattern[16] = {127, -80, 33, -127, 5, 91, -64, 17,
+			-2, 118, -45, 77, -101, 26, -9, 54};
+		for (int32_t r = 0; r < 8; ++r)
+		{
+			for (int32_t j = 0; j < 16; ++j)
+			{
+				advRows.I8()[r * 16 + j] =
+					static_cast<int8_t>(pattern[(j + r) & 15] - (r & 3));
+			}
+		}
+		const uint32_t bits[8] = {0x00000007u, 0x00000123u, 0x00800000u,
+			0x00000350u, 0x000fffffu, 0x00400000u, 0x00000001u, 0x007fffffu};
+		for (int32_t r = 0; r < 8; ++r)
+		{
+			std::memcpy(&advScales[r], &bits[r], 4);
+		}
+	}
+	BankView adv;
+	adv.rows = advRows.ptr;
+	adv.scales = advScales;
+	adv.count = 8;
+	adv.dims = 16;
+	adv.paddedDims = 16;
+	adv.quant = Quantization::Int8;
+	adv.metric = Metric::Dot;
+
+	const int32_t idxA[10] = {0, 3, 5, 17, 21, 33, 40, 44, 46, 47};
+	const int32_t mixedW[10] = {1, 4, 2, 9, 1, 3, 7, 2, 5, 1};
+	const int32_t idxAdv[6] = {0, 2, 3, 5, 6, 7};
+
+	// The battery under the current dispatch: pooled products (image bytes, scale
+	// bits, self-dot) and their QueryXd hit lists, hashed.
+	auto runBattery = [&]() -> uint64_t {
+		xd::BatteryHash hash;
+		Hit hits[10];
+		int32_t n = 0;
+		for (int32_t b = 0; b < 3; ++b)
+		{
+			const BankView& bank = *banks[b];
+			for (int32_t variant = 0; variant < 2; ++variant)
+			{
+				AlignedBuf q8(static_cast<size_t>(bank.paddedDims));
+				double scale = 0.0;
+				int64_t sqSum = 0;
+				CHECK(MakeCentroidCrossDevice(bank, idxA, 10,
+						variant == 0 ? nullptr : mixedW, nullptr,
+						q8.I8(), &scale, &sqSum) == Status::Ok);
+				hash.Bytes(q8.I8(), static_cast<size_t>(bank.paddedDims));
+				hash.Bytes(&scale, 8);
+				hash.Bytes(&sqSum, 8);
+
+				XdQuery xq{q8.I8(), scale, sqSum};
+				QueryParams p;
+				p.k = 10;
+				p.exactness = Exactness::CrossDevice;
+				CHECK(QueryXd(bank, xq, p, ws, hits, &n) == Status::Ok);
+				xd::CheckFloor(hits, n);
+				hash.Hits(hits, n);
+
+				// With exclusion: mask the pooled members themselves.
+				std::vector<uint32_t> exclude(
+					static_cast<size_t>((bank.count + 31) / 32), 0u);
+				for (int32_t i = 0; i < 10; ++i)
+				{
+					exclude[static_cast<size_t>(idxA[i] >> 5)] |= 1u << (idxA[i] & 31);
+				}
+				p.excludeBits = exclude.data();
+				CHECK(QueryXd(bank, xq, p, ws, hits, &n) == Status::Ok);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					CHECK(!IsExcluded(exclude.data(), hits[i].index));
+				}
+				xd::CheckFloor(hits, n);
+				hash.Hits(hits, n);
+			}
+		}
+		// Adversarial tiny-scale pool: the flush window under pooling (P3 INV; part
+		// of the same battery so the sweep covers it).
+		{
+			AlignedBuf q8(static_cast<size_t>(adv.paddedDims));
+			double scale = 0.0;
+			int64_t sqSum = 0;
+			CHECK(MakeCentroidCrossDevice(adv, idxAdv, 6, nullptr, nullptr,
+					q8.I8(), &scale, &sqSum) == Status::Ok);
+			hash.Bytes(q8.I8(), static_cast<size_t>(adv.paddedDims));
+			hash.Bytes(&scale, 8);
+			hash.Bytes(&sqSum, 8);
+			XdQuery xq{q8.I8(), scale, sqSum};
+			QueryParams p;
+			p.k = 8;
+			p.exactness = Exactness::CrossDevice;
+			CHECK(QueryXd(adv, xq, p, ws, hits, &n) == Status::Ok);
+			xd::CheckFloor(hits, n);
+			hash.Hits(hits, n);
+		}
+		return hash.h;
+	};
+
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+	uint64_t hashes[4] = {};
+	for (size_t i = 0; i < paths.size(); ++i)
+	{
+		detail::ForceXdSimdPath(paths[i]);
+		hashes[i] = runBattery();
+		detail::ClearForcedXdSimdPath();
+		if (i > 0)
+		{
+			CHECK_MSG(hashes[i] == hashes[0],
+				"pool forced path %d hash %llx != path %d hash %llx",
+				static_cast<int>(paths[i]),
+				static_cast<unsigned long long>(hashes[i]),
+				static_cast<int>(paths[0]),
+				static_cast<unsigned long long>(hashes[0]));
+		}
+	}
+	const uint64_t battery = runBattery(); // default dispatch matches the sweep
+	CHECK(battery == hashes[0]);
+	std::printf("pooled-query cross-device hash: %016llx (%d forced paths agree)\n",
+		static_cast<unsigned long long>(battery), static_cast<int>(paths.size()));
+	if constexpr (xdfix::kGoldenPoolXdHash != 0)
+	{
+		CHECK_MSG(battery == xdfix::kGoldenPoolXdHash,
+			"pooled-query hash %016llx != pinned golden %016llx",
+			static_cast<unsigned long long>(battery),
+			static_cast<unsigned long long>(xdfix::kGoldenPoolXdHash));
+	}
+}
+
+// P9 (pooled-query recall vs the float64 pooled reference — the FAI-3 honesty
+// number, calibration entry) and P11 (carried contracts: zero steady-state
+// allocation, reader-pin composition, determinism-given-history).
+static void TestPoolRecallAndContracts()
+{
+	std::printf("pooling (T-V2.4-P9/P11): recall cost and carried contracts\n");
+	Workspace ws;
+
+	// --- P9: recall@10 of the pooled CrossDevice query vs the float64 pooled
+	// reference's top-10, seeded protocol (B2), per metric. ---
+	{
+		const uint64_t seed = 0x5EEDF00DCAFEBEEFull;
+		int32_t metricTag = 0;
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			Rng bankRng(0x9001ull + static_cast<uint64_t>(metricTag));
+			TestBank bank(bankRng, 512, 128, Quantization::Int8, metric);
+			Rng sampleRng(seed);
+			const int32_t samples = 200;
+			int64_t hitsTotal = 0;
+			int64_t possible = 0;
+			for (int32_t s = 0; s < samples; ++s)
+			{
+				int32_t idx[8];
+				for (int32_t i = 0; i < 8; ++i)
+				{
+					idx[i] = sampleRng.NextIndex(bank.view.count);
+				}
+				AlignedBuf q8(static_cast<size_t>(bank.view.paddedDims));
+				double scale = 0.0;
+				int64_t sqSum = 0;
+				const Status ps = MakeCentroidCrossDevice(bank.view, idx, 8, nullptr,
+					nullptr, q8.I8(), &scale, &sqSum);
+				if (ps == Status::ZeroNormQuery)
+				{
+					continue; // antipodal draw: defined, not sampled
+				}
+				CHECK(ps == Status::Ok);
+
+				// Reference: the float64 pooled mean scored in double against the
+				// same dequantized rows the kernel scores (refRows), top-10 in the
+				// library's total order.
+				std::vector<double> refQ(static_cast<size_t>(bank.view.dims));
+				pool::RefPoolF64(bank.view, idx, 8, nullptr, refQ.data());
+				std::vector<RefHit> ref;
+				for (int32_t r = 0; r < bank.view.count; ++r)
+				{
+					const double* row =
+						bank.refRows.data() + static_cast<size_t>(r) * bank.view.dims;
+					double score = 0.0;
+					if (metric == Metric::L2)
+					{
+						for (int32_t j = 0; j < bank.view.dims; ++j)
+						{
+							const double d = refQ[static_cast<size_t>(j)] - row[j];
+							score += d * d;
+						}
+					}
+					else
+					{
+						for (int32_t j = 0; j < bank.view.dims; ++j)
+						{
+							score += refQ[static_cast<size_t>(j)] * row[j];
+						}
+					}
+					ref.push_back({r, score});
+				}
+				std::sort(ref.begin(), ref.end(), [&](const RefHit& a, const RefHit& b) {
+					return RefBetter(a, b, metric);
+				});
+
+				XdQuery xq{q8.I8(), scale, sqSum};
+				QueryParams p;
+				p.k = 10;
+				p.exactness = Exactness::CrossDevice;
+				Hit hits[10];
+				int32_t n = 0;
+				CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+				for (int32_t i = 0; i < n; ++i)
+				{
+					for (int32_t j = 0; j < 10; ++j)
+					{
+						if (hits[i].index == ref[static_cast<size_t>(j)].index)
+						{
+							++hitsTotal;
+							break;
+						}
+					}
+				}
+				possible += 10;
+			}
+			const double recall =
+				static_cast<double>(hitsTotal) / static_cast<double>(possible);
+			std::printf(
+				"  pooled recall@10 (metric %d): %.4f (samples=%d, seed=%016llx)\n",
+				metricTag, recall, samples, static_cast<unsigned long long>(seed));
+			if constexpr (pool::kPoolRecallFloor > 0.0f)
+			{
+				CHECK_MSG(recall >= static_cast<double>(pool::kPoolRecallFloor),
+					"pooled recall floor breached (metric %d): %.4f < %.4f", metricTag,
+					recall, static_cast<double>(pool::kPoolRecallFloor));
+			}
+			++metricTag;
+		}
+	}
+
+	// --- P11: carried contracts. ---
+	{
+		Rng rng(0xA110Cull);
+		TestBank bank(rng, 256, 64, Quantization::Int8, Metric::Dot);
+		const int32_t idx[6] = {1, 20, 63, 100, 180, 255};
+		AlignedBuf q8(static_cast<size_t>(bank.view.paddedDims));
+		double scale = 0.0;
+		int64_t sqSum = 0;
+		Hit hits[10];
+		int32_t n = 0;
+		QueryParams p;
+		p.k = 10;
+		p.exactness = Exactness::CrossDevice;
+
+		// Zero steady-state allocation: warm one pool+query cycle, then flat across
+		// both counters (the operator itself is stack-only by construction).
+		CHECK(MakeCentroidCrossDevice(bank.view, idx, 6, nullptr, nullptr,
+				q8.I8(), &scale, &sqSum) == Status::Ok);
+		XdQuery xq{q8.I8(), scale, sqSum};
+		CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+		const uint64_t allocs = AllocationCount();
+		const uint64_t growth = ws.GrowthCount();
+		for (int32_t i = 0; i < 16; ++i)
+		{
+			CHECK(MakeCentroidCrossDevice(bank.view, idx, 6, nullptr, nullptr,
+					q8.I8(), &scale, &sqSum) == Status::Ok);
+			CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+		}
+		CHECK_MSG(AllocationCount() == allocs, "warm pooling allocated");
+		CHECK(ws.GrowthCount() == growth);
+
+		// Reader-pin composition + determinism-given-history: two identical scratch
+		// histories, pooled under the pin, produce byte-identical products.
+		ScratchBank s1;
+		ScratchBank s2;
+		Rng r1(0xD17Aull);
+		Rng r2(0xD17Aull);
+		const int32_t dims = 32;
+		CHECK(s1.Create(32, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		CHECK(s2.Create(32, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 24; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = r1.NextFloat();
+			}
+			CHECK(s1.Append(row.data(), dims, nullptr) == Status::Ok);
+			for (auto& v : row)
+			{
+				v = r2.NextFloat();
+			}
+			CHECK(s2.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		CHECK(s1.Remove(5) == Status::Ok);
+		CHECK(s2.Remove(5) == Status::Ok);
+
+		auto poolPinned = [&](ScratchBank& sb, int8_t* outQ8, double* outS,
+							  int64_t* outSq) {
+			CHECK(sb.TryPinReader());
+			BankView snap;
+			std::vector<uint32_t> tombs(
+				static_cast<size_t>(ScratchBank::TombstoneWords(sb.Capacity())), 0u);
+			CHECK(sb.Snapshot(&snap, tombs.data()) == Status::Ok);
+			std::vector<int32_t> all(static_cast<size_t>(snap.count));
+			for (int32_t r = 0; r < snap.count; ++r)
+			{
+				all[static_cast<size_t>(r)] = r;
+			}
+			CHECK(MakeCentroidCrossDevice(snap, all.data(), snap.count, nullptr,
+					tombs.data(), outQ8, outS, outSq) == Status::Ok);
+			sb.UnpinReader();
+		};
+		const int32_t pd = PaddedDims(dims, Quantization::Int8);
+		AlignedBuf qa(static_cast<size_t>(pd));
+		AlignedBuf qb(static_cast<size_t>(pd));
+		double sa = 0.0, sb2 = 0.0;
+		int64_t ka = 0, kb = 0;
+		poolPinned(s1, qa.I8(), &sa, &ka);
+		poolPinned(s2, qb.I8(), &sb2, &kb);
+		CHECK(std::memcmp(qa.I8(), qb.I8(), static_cast<size_t>(pd)) == 0);
+		CHECK(pool::SameDoubleBits(sa, sb2) && ka == kb);
+
+		// QueryXd defined rejections: PerDevice mode, segments, f32 bank, zero
+		// self-dot on a Cosine bank.
+		QueryParams bad = p;
+		bad.exactness = Exactness::PerDevice;
+		CHECK(QueryXd(bank.view, xq, bad, ws, hits, &n) == Status::InvalidArgument);
+		const QuerySegment seg[1] = {{0, 16, 1.0f}};
+		bad = p;
+		bad.segments = seg;
+		bad.segmentCount = 1;
+		CHECK(QueryXd(bank.view, xq, bad, ws, hits, &n) == Status::InvalidArgument);
+		Rng frng(0xF32ull);
+		TestBank fbank(frng, 16, 32, Quantization::Float32, Metric::Dot);
+		CHECK(QueryXd(fbank.view, xq, p, ws, hits, &n) == Status::InvalidArgument);
+		Rng crng(0xC05ull);
+		TestBank cbank(crng, 16, 64, Quantization::Int8, Metric::Cosine);
+		AlignedBuf zq(static_cast<size_t>(cbank.view.paddedDims));
+		XdQuery zero{zq.I8(), 0.0, 0};
+		CHECK(QueryXd(cbank.view, zero, p, ws, hits, &n) == Status::ZeroNormQuery);
+	}
+}
+
+
+// ---------------------------------------------------------------------------
 // T25 — workspace reuse across shapes (external bug report, 2026-07-04): the
 // query-scratch buffer grows monotonically (allocation-flat contract), so its
 // internal stride can EXCEED the current bank's paddedDims after serving a
@@ -4801,6 +5670,10 @@ int main()
 	TestScratchRetention();
 	TestScratchRecall();
 	TestScratchXdClosure();
+	TestPoolCentroidXd();
+	TestPoolDefinedBehavior();
+	TestPoolXdSweep();
+	TestPoolRecallAndContracts();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
