@@ -52,7 +52,10 @@ Status QueryIntersect(
 // float round-trip, no requantization. CrossDevice-only by construction:
 // params.exactness must be CrossDevice, the bank must be Int8 with paddedDims <=
 // kMaxCrossDeviceDims, and a Cosine bank rejects a zero self-dot query (ZeroNormQuery,
-// the bank's own validation law). Composes with exclusion, ScoreAs, and both bias
+// the bank's own validation law). The payload validates at the boundary: the scale
+// must be FINITE and non-negative, and the self-dot is recomputed from the image and
+// must match — a desynced payload is InvalidArgument, never a repaired or silently
+// wrong ranking. Composes with exclusion, ScoreAs, and both bias
 // forms exactly as Query does in CrossDevice mode — the same kernels, the same
 // epilogue, the same subnormal floor. Segments are not accepted on a pre-quantized
 // query (InvalidArgument): segment validation is defined against the float query the

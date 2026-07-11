@@ -127,6 +127,12 @@ Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
 after the `Remove`, and a snapshot, once taken, is immutable — querying it
 twice is bit-identical regardless of concurrent writer activity.
 
+One quiescence caveat (v2.3): `MeasureScratchRecall` sweeps many self-queries
+under a reader pin, not exclusivity, so its number is well-defined — and
+reproducible given history — only when no writer runs concurrently; a racing
+append/remove yields a safe but non-reproducible number (atomic value reads,
+never undefined behavior).
+
 ## 2d. Integer-domain pooling (v2.4): a versioned composition operator
 
 `MakeCentroidCrossDevice` pools int8 rows into a quantized CrossDevice query with

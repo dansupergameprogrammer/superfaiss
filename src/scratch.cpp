@@ -112,6 +112,10 @@ namespace
 	// still writes 1, and this reader accepts both. Version 0 or > 2 is a hard reject.
 	constexpr uint32_t kScratchVersion = 2;
 	constexpr uint32_t kScratchVersionRetain = 2; // retained floats present in the blob
+	// Archive geometry ceiling (review M2): the largest row capacity a load will
+	// entertain. With paddedDims capped at kMaxCrossDeviceDims, every ArenaBytes
+	// term stays below 2^49 — far from int64 overflow.
+	constexpr int32_t kMaxScratchArchiveRows = 1 << 28;
 
 	struct ScratchHeader
 	{
@@ -611,6 +615,18 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	{
 		return Status::BadFormat;
 	}
+	// The archive is an untrusted medium (review M2, the T-062 idiom): bound the
+	// geometry BEFORE any byte-size arithmetic — the arena math multiplies the
+	// caller-controlled capacity and dims, and an unbounded pair is signed int64
+	// overflow (UB), not merely a failed allocation. paddedDims is capped at the
+	// widest bank the library proves (kMaxCrossDeviceDims); capacity at 2^28 rows
+	// keeps every ArenaBytes term below 2^49. Absurd geometry is a format defect —
+	// a hard BadFormat, never an allocator outcome.
+	if (header.paddedDims > kMaxCrossDeviceDims ||
+		header.capacity > kMaxScratchArchiveRows)
+	{
+		return Status::BadFormat;
+	}
 
 	// Build the incoming state in a fresh bank so a bad archive leaves this one
 	// unchanged (reject-over-degrade).
@@ -692,6 +708,13 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	// Validated: adopt the incoming arena wholesale (its region pointers included —
 	// re-binding would re-zero the tombstones just loaded). Exclusive by contract,
 	// so the swap is not observed mid-flight.
+	// A Load is the ultimate mutation (review S1): the generation advances PAST
+	// every stamp this instance ever issued — never backward, never a collision.
+	// Resetting it to the loaded count would re-issue an append-only bank's exact
+	// stamp (generation == count there), letting a recall report taken before the
+	// Load read as current against freshly-loaded rows. Captured before Destroy()
+	// zeroes it.
+	const uint64_t priorGeneration = Generation_.load(std::memory_order_relaxed);
 	Destroy();
 	Allocator_ = incoming.Allocator_;
 	Arena_ = incoming.Arena_;
@@ -708,7 +731,7 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	Retain_ = incoming.Retain_;
 	PublishedCount_.store(header.count, std::memory_order_release);
 	TombstonedCount_.store(tombstoned, std::memory_order_relaxed);
-	Generation_.store(static_cast<uint64_t>(header.count), std::memory_order_release);
+	Generation_.store(priorGeneration + 1, std::memory_order_release);
 	incoming.Arena_ = nullptr; // ownership moved; incoming's dtor now no-ops
 	return Status::Ok;
 }

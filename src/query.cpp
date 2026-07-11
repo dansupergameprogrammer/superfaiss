@@ -1,5 +1,7 @@
 #include "superfaiss/query.h"
 
+#include <cmath>
+
 #include "superfaiss/kernels.h"
 #include "superfaiss/topk.h"
 #include "superfaiss/validate.h"
@@ -9,6 +11,30 @@ namespace superfaiss
 
 namespace
 {
+	// Pre-quantized payload integrity (v2.4 review S2/M1 — the T-062 trust-boundary
+	// class): no field of a caller-provided XdQuery may make scores or rankings
+	// ill-defined or silently wrong. The scale must be FINITE and non-negative —
+	// the bare `>= 0.0` test admits +inf, which poisons Dot/L2 scores with NaN and
+	// defeats the mode's entire product promise. The self-dot must be the image's
+	// own: it feeds the L2 epilogue's Sum(q_i^2) term, and a lying value silently
+	// corrupts rankings. Recomputing it is O(paddedDims) — noise beside the scan it
+	// precedes; a mismatch is a desynced payload and a hard rejection (the payload
+	// IS the operator's product; anything else is corrupt), never a repair.
+	bool XdPayloadValid(const XdQuery& query, int32_t paddedDims)
+	{
+		if (query.q8 == nullptr || !(query.scale >= 0.0) || !std::isfinite(query.scale) ||
+			query.sqSum < 0)
+		{
+			return false;
+		}
+		int64_t sq = 0;
+		for (int32_t i = 0; i < paddedDims; ++i)
+		{
+			sq += static_cast<int64_t>(query.q8[i]) * query.q8[i];
+		}
+		return sq == query.sqSum;
+	}
+
 	// Weight folding (T-050 W1 bench clause, taken and recorded in plan section 10):
 	// for dot-family scoring, sum_s w_s * sum_{j in s} r_j q_j == sum_j r_j (w(j) q_j)
 	// exactly, so segmented dot/cosine scans fold the segment weights into a query
@@ -377,10 +403,11 @@ Status QueryXd(
 	{
 		return Status::InvalidArgument;
 	}
-	// The query payload itself: an image, a finite non-negative scale. A Cosine bank
-	// rejects a zero-norm query under any override — the bank's own validation law,
-	// applied to the integer self-dot (zero self-dot == all-zero image).
-	if (query.q8 == nullptr || !(query.scale >= 0.0) || query.sqSum < 0)
+	// The query payload itself: an image, a finite non-negative scale, a self-dot
+	// verified against the image (XdPayloadValid — integrity first, so a zero
+	// sqSum below genuinely means an all-zero image). A Cosine bank then rejects a
+	// zero-norm query under any override — the bank's own validation law.
+	if (!XdPayloadValid(query, bank.paddedDims))
 	{
 		return Status::InvalidArgument;
 	}
@@ -865,7 +892,9 @@ Status QueryXdBatch(
 	}
 	for (int32_t m = 0; m < queryCount; ++m)
 	{
-		if (queries[m].q8 == nullptr || !(queries[m].scale >= 0.0) || queries[m].sqSum < 0)
+		// Integrity first, per member (XdPayloadValid) — one bad member rejects
+		// the batch before any scan work.
+		if (!XdPayloadValid(queries[m], bank.paddedDims))
 		{
 			return Status::InvalidArgument;
 		}

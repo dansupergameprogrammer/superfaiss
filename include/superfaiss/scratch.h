@@ -241,6 +241,10 @@ public:
 	// pin like any query; the workspace supplies all scratch, so a warm call allocates
 	// nothing. On a bank without retention this is a defined InvalidArgument, never a
 	// guessed number. Tombstoned rows are neither sampled nor counted.
+	// Quiescence precondition (review M3): the number is well-defined when no writer
+	// runs concurrently. The sweep holds a reader pin, not exclusivity, so a racing
+	// Append/Remove yields a SAFE but non-reproducible number (atomic value reads,
+	// never UB) — determinism-given-history holds only over a quiescent bank.
 	Status MeasureScratchRecall(Workspace& workspace, ScratchRecallReport* outReport,
 		uint64_t seed = kDefaultRecallSeed);
 

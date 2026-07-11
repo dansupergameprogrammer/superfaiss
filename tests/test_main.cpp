@@ -4152,6 +4152,73 @@ static void TestScratchRetention()
 		zero.bytes = ar.bytes;
 		zero.bytes[4] = 0;
 		CHECK(loaded.Load(zero.Reader()) == Status::BadFormat);
+
+		// Absurd geometry (review M2, the T-062 idiom): a crafted header with an
+		// unbounded capacity is BadFormat BEFORE any byte-size arithmetic — a
+		// hard format rejection, not an allocator outcome.
+		MemArchive huge;
+		huge.bytes = ar.bytes;
+		const uint32_t absurdCapacity = 0x7FFFFFFFu; // capacity: int32 at offset 8
+		std::memcpy(huge.bytes.data() + 8, &absurdCapacity, 4);
+		CHECK_MSG(loaded.Load(huge.Reader()) == Status::BadFormat,
+			"absurd archive capacity not hard-rejected");
+		CHECK(loaded.Count() == s.Count()); // reject-over-degrade held
+	}
+
+	// --- R6 extension (review S1/S-1): staleness across Save/Load. A Load is the
+	// ultimate mutation — a report taken before it must read STALE after it, and the
+	// generation never goes backward and never collides with a previously-issued
+	// stamp on the same bank instance. The append-only same-count case is the
+	// collision trap: an append-only bank's generation equals its row count, and a
+	// Load that resets the generation to the loaded count re-issues exactly that
+	// stamp (the flagship's belief-store-across-save-games scenario).
+	std::printf("scratch retention (T-V2.3-R6x): staleness across Save/Load\n");
+	{
+		const int32_t dims = 48;
+		Rng rng(0x10ADFull);
+		ScratchBank b;
+		CHECK(b.Create(64, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
+		FillSeeded(b, 40, dims, rng); // append-only: no removes, generation == count
+
+		ScratchRecallReport before;
+		CHECK(b.MeasureScratchRecall(ws, &before, 0x51A1Eull) == Status::Ok);
+		CHECK(!b.RecallReportStale(before));
+		const uint64_t stampedGen = b.Generation();
+
+		// The same-count collision case: save, then load the SAME blob back into
+		// the same bank object. Same rows, same count — but the report describes
+		// pre-load state, so it must read stale, never silently current.
+		MemArchive blob;
+		CHECK(b.Save(blob.Writer()) == Status::Ok);
+		CHECK(b.Load(blob.Reader()) == Status::Ok);
+		CHECK_MSG(b.RecallReportStale(before),
+			"pre-load report reads CURRENT after a same-count Load");
+		// Monotonic, collision-free: the post-load generation exceeds every stamp
+		// this instance ever issued.
+		CHECK_MSG(b.Generation() > stampedGen,
+			"generation went backward/collided across Load: %llu -> %llu",
+			static_cast<unsigned long long>(stampedGen),
+			static_cast<unsigned long long>(b.Generation()));
+
+		// The mutated case: report, save, mutate, load the pre-mutation blob back
+		// — the report must be stale against the restored (pre-mutation) rows too.
+		ScratchRecallReport mid;
+		CHECK(b.MeasureScratchRecall(ws, &mid, 0x51A1Eull) == Status::Ok);
+		CHECK(!b.RecallReportStale(mid));
+		MemArchive blob2;
+		CHECK(b.Save(blob2.Writer()) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims), 0.25f);
+		CHECK(b.Append(row.data(), dims, nullptr) == Status::Ok);
+		CHECK(b.RecallReportStale(mid)); // stale by the append
+		CHECK(b.Load(blob2.Reader()) == Status::Ok);
+		CHECK_MSG(b.RecallReportStale(mid),
+			"pre-save report reads CURRENT after restoring the pre-mutation blob");
+
+		// A report taken after the Load is current — the staleness is about the
+		// boundary, not a permanently-poisoned bank.
+		ScratchRecallReport fresh;
+		CHECK(b.MeasureScratchRecall(ws, &fresh, 0x51A1Eull) == Status::Ok);
+		CHECK(!b.RecallReportStale(fresh));
 	}
 }
 
@@ -5560,6 +5627,64 @@ static void TestPoolRecallAndContracts()
 		AlignedBuf zq(static_cast<size_t>(cbank.view.paddedDims));
 		XdQuery zero{zq.I8(), 0.0, 0};
 		CHECK(QueryXd(cbank.view, zero, p, ws, hits, &n) == Status::ZeroNormQuery);
+
+		// --- Adversarial payloads (review S2/M1, Japp S-2): no field of a
+		// caller-provided XdQuery may make scores or rankings ill-defined or
+		// silently wrong. The contract is a FINITE non-negative scale and a
+		// self-dot that IS the image's — anything else is InvalidArgument, single
+		// and batch alike. The honest pipeline never emits these; a hand-edited or
+		// corrupted payload is the threat model (the T-062 class).
+		{
+			const int64_t honestSq = xq.sqSum;
+			const double inf = std::numeric_limits<double>::infinity();
+			const double nan = std::numeric_limits<double>::quiet_NaN();
+
+			// Non-finite and negative scales.
+			XdQuery adv = xq;
+			adv.scale = inf;
+			CHECK_MSG(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument,
+				"+inf scale admitted (single)");
+			adv.scale = nan;
+			CHECK(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument);
+			adv.scale = -1.0;
+			CHECK(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument);
+
+			// A lying self-dot: too high, too low, and zero-on-nonzero-image.
+			adv = xq;
+			adv.sqSum = honestSq + 1;
+			CHECK_MSG(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument,
+				"inflated sqSum admitted (single)");
+			adv.sqSum = honestSq > 0 ? honestSq - 1 : 1;
+			CHECK(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument);
+			adv.sqSum = 0; // nonzero image with a zero self-dot: a desynced payload,
+			               // an integrity rejection — never ZeroNormQuery
+			CHECK_MSG(QueryXd(bank.view, adv, p, ws, hits, &n) == Status::InvalidArgument,
+				"zero sqSum on a nonzero image admitted (single)");
+
+			// The batch mirrors every rejection per member: one bad member rejects
+			// the batch (validation-before-work, the QueryBatch discipline).
+			XdQuery pair[2] = {xq, xq};
+			Hit bHits[2 * 10];
+			int32_t bCounts[2] = {};
+			CHECK(QueryXdBatch(bank.view, pair, 2, p, ws, bHits, bCounts) == Status::Ok);
+			pair[1].scale = inf;
+			CHECK_MSG(QueryXdBatch(bank.view, pair, 2, p, ws, bHits, bCounts) ==
+					Status::InvalidArgument, "+inf scale admitted (batch)");
+			pair[1].scale = nan;
+			CHECK(QueryXdBatch(bank.view, pair, 2, p, ws, bHits, bCounts) ==
+				Status::InvalidArgument);
+			pair[1] = xq;
+			pair[1].sqSum = honestSq + 1;
+			CHECK_MSG(QueryXdBatch(bank.view, pair, 2, p, ws, bHits, bCounts) ==
+					Status::InvalidArgument, "inflated sqSum admitted (batch)");
+			pair[1].sqSum = 0;
+			CHECK(QueryXdBatch(bank.view, pair, 2, p, ws, bHits, bCounts) ==
+				Status::InvalidArgument);
+
+			// The honest payload still executes after all of the above (the
+			// adversarial rejections leave the valid path untouched).
+			CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+		}
 	}
 }
 
