@@ -2,8 +2,14 @@
 
 [![tests](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml/badge.svg)](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml)
 
-Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding banks,
-built for game runtimes. Dependency-free C++17 — the standard library and nothing else.
+Fast, deterministic, allocation-free k-nearest-neighbor search for game runtimes —
+over banks you bake in your pipeline or grow at play time. One bank answers many
+questions: score the whole vector or any weighted slice of it, decompose every hit's
+score channel by channel, fold gameplay state into the ranking, pool rows into new
+queries, carry memory across save games — and measure what quantization actually
+costs you, per bank, as a stored number. Exact, bit-reproducible per device, and
+(opt-in) bit-identical across machines. Dependency-free C++17 — the standard library
+and nothing else.
 CI-verified on Windows x64, Linux x64, and macOS arm64 (NEON) — three compilers
 (MSVC, GCC, AppleClang) plus a ThreadSanitizer pass, on every push.
 
@@ -16,6 +22,13 @@ them, including small ones running offline in a content pipeline), SuperFAISS an
 millisecond. The answers are exact, not approximate, and the same query against the same
 bank returns the same result on every run and — in v2.2's opt-in mode — on every machine.
 That reliability is what lets you build actual gameplay on top of the answers.
+
+And you won't outgrow it: the same bank that answers "most similar overall" also
+answers the narrower questions that arrive next — "most similar *in identity*,
+ignoring appearance" (a weighted slice of the vector, with an exact per-channel
+breakdown of why each hit ranked), or "what does this NPC remember that's relevant
+right now?" over a memory that grows during play and survives a save game. One
+bank, one library, more questions over time.
 
 SuperFAISS is an **independent implementation**. It is **not a fork of, derived from, or
 affiliated with Meta's FAISS**; the name is nominative homage to the library that defined
@@ -182,6 +195,19 @@ you are embedding this library anywhere, it is the worked example.
 
 Same answers on every path, bit for bit — that equivalence is test-enforced, not
 aspirational.
+
+## The original pitch
+
+v1.0's opening pitch, word for word:
+
+> Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding
+> banks, built for game runtimes. Dependency-free C++17 — the standard library and
+> nothing else.
+
+Every word still holds — the library just answers more questions now. The banks no
+longer have to be baked (scratch banks grow at play time and persist), and one bank
+now serves weighted slices, per-channel decomposition, in-scan bias, pooled queries,
+and honest recall numbers alongside the plain top-k it started with.
 
 ## License
 
