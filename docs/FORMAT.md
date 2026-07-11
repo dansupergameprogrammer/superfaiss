@@ -107,19 +107,28 @@ file, save-game blob, network; the bank owns the format):
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `0x42535346` |
-| version | u32 | `1` |
-| capacity | i32 | arena capacity restored on load |
+| version | u32 | `1`, or `2` when the bank retains floats (v2.3) |
+| capacity | i32 | arena capacity restored on load; `<= 2^28` |
 | count | i32 | published rows; `0 <= count <= capacity` |
 | dims | i32 | logical dims |
-| paddedDims | i32 | must equal `PaddedDims(dims, quant)` |
+| paddedDims | i32 | must equal `PaddedDims(dims, quant)`; `<= 131072` |
 | metric, quant | u8, u8 | enum values; 6 reserved bytes follow |
 | rows | payload | `count x paddedDims` elements, baked layout (section 2) |
 | scales | f32[count] | int8 banks only |
 | tombstones | u32[ceil(count/32)] | bit set = removed row |
+| retained floats | f32[count x dims] | **version 2 only** (v2.3 recall audit): the post-normalization source rows, index-aligned with `rows` |
 
-Load is reject-over-degrade: a bad magic/version, inconsistent header,
-truncated payload, tombstone bit at or above `count`, or content that fails
-bank-data validation rejects the archive and leaves the existing bank
+Versioning (v2.3): a bank created with float retention writes version 2 and
+appends the retained rows; a bank without retention still writes version 1,
+byte-identical to pre-v2.3. The reader accepts versions 1 and 2 — a version-1
+blob loads with retention absent (defined) — and hard-rejects anything else
+(`BadFormat`), the standing old-reader/new-data law.
+
+Load is reject-over-degrade: a bad magic/version, inconsistent or out-of-bounds
+header geometry (the capacity/paddedDims ceilings above are checked before any
+allocation arithmetic — an absurd header is a format defect, not an allocator
+outcome), truncated payload, tombstone bit at or above `count`, or content that
+fails bank-data validation rejects the archive and leaves the existing bank
 unchanged. Byte order is the host's; archives are save-game-grade state, not a
 cross-endian interchange format (the `.wvbank` sidecar is the interchange).
 

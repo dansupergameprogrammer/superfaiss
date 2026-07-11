@@ -93,7 +93,12 @@ Why it holds:
   included) from committed fixture banks — including adversarial tiny-scale banks
   whose scale products straddle the subnormal window — under every kernel path the
   hardware can force, and asserts it equals a golden pinned in the repo. Windows,
-  Linux, and macOS-ARM runners all assert the same pin on every push.
+  Linux, and macOS-ARM runners all assert the same pin on every push. Two sibling
+  batteries carry their own pins the same way: the scratch × cross-device battery
+  (v2.3 — a copied-bytes baked twin of a scratch snapshot, tombstones and a `Grow`
+  in its history, scoring bit-identically to the snapshot) and the pooled-query
+  battery (v2.4 — `MakeCentroidCrossDevice` payloads and their `QueryXd` hit lists
+  over the committed fixtures).
 
 Scope and cost, stated plainly:
 

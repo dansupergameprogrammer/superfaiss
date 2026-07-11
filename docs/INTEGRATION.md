@@ -45,7 +45,18 @@ if your platform has a C++17 toolchain, the library compiles.
   (append/remove/snapshot/query are allocation-free; `Grow` is an explicit,
   caller-initiated reallocation). Persistence goes through the caller-owned
   `ScratchArchive` seam — your save system provides the read/write callbacks, the
-  bank owns the format.
+  bank owns the format. The v2.3 float-retention posture sizes into the same
+  single arena — budget `4 × dims` extra bytes per row when you opt in (~4.9× an
+  int8 256-dim row; it is a dev/audit posture, not a shipping default) — and
+  `MeasureScratchRecall` takes a caller-provided `Workspace` like any query:
+  pool one, and a warm sweep allocates nothing. Call it writer-side, on a
+  quiescent bank (the number racing a writer is safe but not reproducible).
+- **Pre-quantized query payloads (v2.4) are caller-staged.** The
+  `MakeCentroidCrossDevice` output buffer (`outQ8`) must be 16-byte-aligned like
+  any query buffer; if you persist or marshal the payload (an asset, a network
+  message), re-stage the image into aligned memory before handing it to
+  `QueryXd`/`QueryXdBatch` — copying preserves the bytes, and the executed query
+  is bit-for-bit the stored payload.
 
 ## 3. Threading seam
 

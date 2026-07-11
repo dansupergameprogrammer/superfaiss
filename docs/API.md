@@ -91,7 +91,10 @@ Helpers: `PaddedDims(dims, quant)`, `ElementSize(quant)`, `RowBytes(bank)`,
 `BankBytes(bank)`, `ChunkRows(bank)`, `ChunkCount(bank)`, `IsExcluded(bits, index)`,
 `ScoringMetric(bank, params)` (the metric hits are actually ordered by).
 Constants: `kAlignment` (16), `kChunkBytes` (64 KiB), `kMaxSegments` / `kMaxChannels`
-(8), `kMaxCrossDeviceDims` (131072, v2.2), `kSchemaVersion` (version.h).
+(8), `kMaxCrossDeviceDims` (131072, v2.2), `kSchemaVersion` (version.h);
+`kPoolScaleFracBits` (24) and `kMaxPooledRows` (2^20) in compose.h (v2.4);
+`ScratchBank::kDefaultRecallSeed`, `kRecallMinRows` (11), and
+`kRecallInformativeRows` (100) in scratch.h (v2.3).
 
 ## validate.h — the gates
 
@@ -138,6 +141,12 @@ Status QueryBatch(const BankView&, const float* paddedQueries, int32_t queryCoun
 
 Status QueryIntersect(const BankView&, const float* paddedQueries, int32_t queryCount,
                       const QueryParams&, Workspace&, Hit* outHits, int32_t* outCount);
+
+// v2.4: execute a PRE-QUANTIZED CrossDevice query (the XdQuery payload) directly.
+Status QueryXd     (const BankView&, const XdQuery&, const QueryParams&,
+                    Workspace&, Hit* outHits, int32_t* outCount);
+Status QueryXdBatch(const BankView&, const XdQuery* queries, int32_t queryCount,
+                    const QueryParams&, Workspace&, Hit* outHits, int32_t* outCounts);
 ```
 
 Exact top-k, serial chunk loop, allocation-free once the `Workspace` is warm. `Query`
@@ -147,6 +156,21 @@ using pair kernels that share row loads — per-query results are bit-identical 
 `Query`. `QueryIntersect` (v1.1) ranks by each row's WORST score against the member
 queries (true AND semantics — every returned row clears the fused score against every
 query) in one bank pass; `queryCount == 1` degenerates to `Query` bit-identically.
+
+**Pre-quantized queries (v2.4):** `QueryXd`/`QueryXdBatch` take the `XdQuery`
+payload itself — `MakeCentroidCrossDevice`'s product — so the executed query is
+bit-for-bit the caller's quantized bytes: no float round-trip, no
+requantization. Law set: `params.exactness` must be `CrossDevice`, int8 banks
+only, segments rejected (`InvalidArgument` — segment validation is defined
+against a float query the caller does not have); exclusion, `ScoreAs`, and
+both bias forms compose exactly as `Query` does in CrossDevice mode. The batch
+keeps the chunk-outermost structure with the single-query kernel inside, so
+batch results are **bit-identical to N single calls by construction**. The
+payload validates at the boundary: the scale must be finite and non-negative,
+and the self-dot is recomputed from the image and must match — a desynced
+payload (a hand-edited or corrupted asset) is `InvalidArgument`, never a
+repaired or silently wrong ranking. A Cosine bank rejects a genuinely
+zero-norm payload as `ZeroNormQuery`.
 
 Per-hit explanation (v2.0, `kernels.h`): `DecomposeRowScore(bank, query, rowIndex,
 segments, count, outContributions)` — per-segment contributions that sum bit-exactly
@@ -180,7 +204,11 @@ float DecomposeRowScore(const BankView&, const float* paddedQuery, int32_t rowIn
                         const QuerySegment*, int32_t count, float* outContributions);
 
 // v2.2 cross-device kernel entries (integer accumulation + double epilogue):
-struct XdQuery { const int8_t* q8; double scale; int64_t sqSum; };
+struct XdQuery {                 // the pre-quantized query payload
+    const int8_t* q8;            //   int8 image on the padded grid, 16-aligned
+    double scale;                //   per-query dequant scale (double; no float round-trip)
+    int64_t sqSum;               //   integer self-dot Sum(q_i^2) — the L2 epilogue term
+};
 void  QuantizeQueryXd(const float* paddedQuery, int32_t paddedDims,
                       int8_t* outQ8, double* outScale, int64_t* outSqSum);
 void  ScoreChunkXd(...);              // whole-row CrossDevice chunk scorer
@@ -196,7 +224,7 @@ serial `Query` in any list order (see [DETERMINISM.md](DETERMINISM.md)). Kernels
 re-validate; gate inputs first. `ActiveSimdPath()` reports Scalar/SSE/AVX2/NEON.
 `detail::*Mirror` functions expose the scalar mirrors for equality testing.
 
-## compose.h — query construction (v1.1)
+## compose.h — query construction (v1.1, integer-domain pooling v2.4)
 
 ```cpp
 Status MakeCentroid (const BankView&, const int32_t* rowIndices, int32_t rowCount,
@@ -204,6 +232,15 @@ Status MakeCentroid (const BankView&, const int32_t* rowIndices, int32_t rowCoun
 Status MakeDirection(const float* paddedA, const float* paddedB, int32_t dims,
                      int32_t paddedDims, float* outPaddedQuery);  // normalize(a - b)
 float  Margin(const Hit& better, const Hit& runnerUp, Metric scoredAs);
+
+// v2.4: pool int8 rows into a QUANTIZED cross-device query (the XdQuery payload).
+Status MakeCentroidCrossDevice(const BankView&, const int32_t* rowIndices,
+                               int32_t rowCount,
+                               const int32_t* weights,      // null = unweighted;
+                                                            //   else one positive int per row
+                               const uint32_t* excludeBits, // e.g. snapshot tombstones
+                               int8_t* outQ8,               // paddedDims bytes, 16-aligned
+                               double* outScale, int64_t* outSqSum);
 ```
 
 Pure, allocation-free, deterministic (serial double-precision accumulation).
@@ -212,6 +249,27 @@ renormalizes, and a zero-norm mean (antipodal members cancelling) is rejected, n
 silently renormalized. `MakeDirection` builds the axis-projection query ("most a-like
 relative to b"); score it with `ScoreAs::Dot` on L2 banks. `Margin` is the score gap
 to the runner-up in the scored metric's better-direction — pass `ScoringMetric()`.
+
+**Integer-domain pooling (v2.4):** `MakeCentroid` pools in float — fine for
+presentation, but float summation order is where cross-device identity breaks.
+`MakeCentroidCrossDevice` pools in the integer domain instead: each row's scale
+ratio requantizes to a fixed-point multiplier (`kPoolScaleFracBits` = 24
+fractional bits, round-half-even in integer math), per-dim contributions
+accumulate in int64 — exact and order-free — and the accumulator requantizes
+directly to the int8 image (no float mean, no norm reduction: symmetric
+per-query quantization is invariant to positive scaling, so the result is
+definitionally identical to normalize-then-quantize). Given identical rows,
+scales, indices, and weights, the payload is bit-identical on every machine.
+Weights fold by exact integer multiply, so all-equal weights produce the
+bit-identical unweighted payload. Laws: int8 banks only
+(`paddedDims <= kMaxCrossDeviceDims`); the pooled weight sum (= row count when
+unweighted) is capped at `kMaxPooledRows` (2^20) — the accumulator's proven
+overflow-free bound; over it is `InvalidArgument`, never a silent wrap. An
+empty (or fully-excluded) selection is `InvalidArgument`, never a zero vector;
+an all-zero integer accumulator (antipodal members cancelling) is
+`ZeroNormQuery` — the check the omitted normalization would have performed.
+This operator is a versioned composition operator for embedding-space
+consumers (DETERMINISM.md §2d).
 
 ## pca.h — inspection projections (v1.1)
 
@@ -229,22 +287,48 @@ iteration, no dims^2 matrix, no allocation, deterministic (fixed seed vector, se
 row-order accumulation). The projection-visualizer substrate; a degenerate direction
 yields a zero component rather than an error.
 
-## scratch.h — mutable banks (v2.0)
+## scratch.h — mutable banks (v2.0, recall audit v2.3)
 
 ```cpp
 class ScratchBank {              // single writer, lock-free readers
     Status Create(int32_t capacity, int32_t dims, Metric, Quantization,
                   const Allocator& = DefaultAllocator());   // ONE arena allocation
+    Status Create(int32_t capacity, int32_t dims, Metric, Quantization,
+                  bool retainFloats, const Allocator& = ...); // v2.3 retention overload
     Status Append(const float* row, int32_t dims, int32_t* outIndex);
     Status Remove(int32_t index);                 // atomic tombstone; idempotent
     Status Snapshot(BankView* outView, uint32_t* outTombstones) const;
     Status Grow(int32_t newCapacity);             // EXCLUSIVE; preserves indices
     int32_t FreezeLiveCount() const;
-    Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap) const;
+    Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap,
+                  ScratchRecallReport* outReport = nullptr,   // v2.3: fresh number
+                  Workspace* recallWs = nullptr,              //   over the compacted rows
+                  uint64_t recallSeed = kDefaultRecallSeed) const;
     Status Save(const ScratchArchive&) const;     // writer-side
     Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE
     int32_t Count(); int32_t LiveCount(); int32_t Capacity();
     static int32_t TombstoneWords(int32_t count);
+
+    // v2.3 recall audit:
+    bool     RetainsFloats() const;               // the Create flag, read back
+    const float* RetainedRow(int32_t index) const;// the post-normalization row, or null
+    int64_t  QuantizedRowBytes() const;           // honest-budget getters:
+    int64_t  RetainedRowBytes() const;            //   0 when retention is off
+    uint64_t Generation() const;                  // monotonic mutation counter
+    Status   MeasureScratchRecall(Workspace&, ScratchRecallReport* out,
+                                  uint64_t seed = kDefaultRecallSeed);
+    bool     RecallReportStale(const ScratchRecallReport&) const;
+};
+struct ScratchRecallReport {     // v2.3
+    float    recall;             // hits / possible over the sweep, [0, 1]
+    int32_t  k;                  // min(10, liveRows-1) — below 11 live rows this
+                                 //   is a recall@(liveRows-1), and the field says so
+    int32_t  sampleCount;        // min(1000, liveRows) self-queries drawn
+    int32_t  liveRows;
+    uint64_t seed;               // recorded so the number is reproducible
+    uint64_t generation;         // the bank's mutation state at measurement
+    bool     informative;        // false below liveRows = 100 (kRecallInformativeRows):
+                                 //   mathematically valid, statistically uninformative
 };
 struct ScratchArchive { bool(*write)(void*, const void*, size_t); bool(*read)(void*, void*, size_t); void* user; };
 ```
@@ -255,11 +339,49 @@ Deletion is exclusion: OR (or pass) the snapshot's tombstone words as
 match; Cosine normalizes and rejects zero-norm; int8 quantizes per-row), writes
 the row, then publishes the count with a store-release — readers never see a
 partial row. Removal is snapshot-consistent, not mid-scan-preemptive. `Grow`
-preserves indices (saved indices are the consumer contract); `Freeze` compacts
-and renumbers, returning the old→new map so consumers remap stored handles.
-Zero steady-state allocation: everything lives in the arena from `Create`.
-Archive format: [FORMAT.md](FORMAT.md) section 3; concurrency guarantees:
-[DETERMINISM.md](DETERMINISM.md) section 2b.
+preserves indices (saved indices are the consumer contract) and copies the
+retention arena in the same reallocation; `Freeze` compacts and renumbers,
+returning the old→new map so consumers remap stored handles. Zero steady-state
+allocation: everything lives in the arena from `Create` (retention included —
+`ArenaBytes` simply grows). Archive format: [FORMAT.md](FORMAT.md) section 3;
+concurrency guarantees: [DETERMINISM.md](DETERMINISM.md) section 2b.
+
+**Recall audit (v2.3):** the import-time recall-honesty pattern, extended to the
+mutable half. `Create(..., retainFloats = true)` — opt-in, never the default —
+retains the post-normalization float row the quantizer consumed (on Cosine
+banks, the unit-norm row) beside each quantized row; rejected appends retain
+nothing. `MeasureScratchRecall` then runs a seeded self-query sweep over the
+current snapshot: a double-precision scan of the retained rows (the reference
+top-k) versus the bank's own quantized `Exactness::CrossDevice` scan (a
+float32 retention bank, which has no cross-device mode, audits its own
+per-device scan — defined, trivially high), recall@k with the sample
+discipline in the report struct above. It runs under the reader
+pin like any query, allocates nothing once the workspace is warm, and on a
+non-retention bank returns `InvalidArgument` — a defined rejection, never a
+guessed number. The number is well-defined when no writer runs concurrently; a
+racing append/remove yields a safe but non-reproducible number.
+
+**Staleness:** `Generation()` advances on every successful `Append`, every
+newly-set `Remove` (idempotent re-removes do not advance), and past every prior
+stamp on `Load` (a load is the ultimate mutation). A report whose stamped
+generation no longer matches reads as stale through `RecallReportStale` — never
+silently current. `Freeze` on a retention bank can produce a fresh report
+measured over the compacted rows at freeze time (pass `outReport` + a
+workspace); a non-retention freeze produces none — no stale number wearing a
+current face.
+
+**Memory cost, stated plainly:** retention adds `4 × dims` bytes per row. At
+256 dims that turns an int8 row from 260 into 1284 bytes (~4.9×) and a float32
+row from 1024 into 2048 (2.0×) — `QuantizedRowBytes()`/`RetainedRowBytes()`
+report the exact split. A dev/audit posture, not a shipping default.
+
+**Persistence:** a retention bank's `Save` writes archive version 2 with the
+retained floats appended; a non-retention bank still writes version 1,
+byte-identical to pre-v2.3. `Load` accepts versions 1 and 2 (a v1 blob loads
+with retention absent — defined), hard-rejects anything else as `BadFormat`,
+and bounds the archive geometry before any allocation arithmetic
+(`paddedDims <= kMaxCrossDeviceDims`, capacity <= 2^28 rows — absurd headers
+are a format defect, not an allocator outcome).
 
 ## alloc.h — memory policy
 

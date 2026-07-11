@@ -109,6 +109,32 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   vectors (NPC memory, session embeddings): single writer, lock-free readers,
   tombstone removal, `Freeze` into a standard immutable bank, save/load through an
   archive seam. Every query feature above works on scratch content unchanged.
+- **Scratch-bank recall audit (v2.3).** The recall-honesty pattern, extended to the
+  mutable half: an opt-in float-retention posture (set at `Create`, never the
+  default) keeps the post-normalization row beside each quantized row, and
+  `MeasureScratchRecall` reports the bank's own cross-device recall against that
+  retained reference — seeded and reproducible, with the sample count, a
+  generation stamp, and an informativeness marking on the report. Any later
+  append, remove, or load marks the report stale, never silently current;
+  `Freeze` can re-measure over the compacted rows at freeze time. The memory
+  cost is stated plainly: an int8 256-dim row grows from 260 to 1284 bytes
+  (~4.9×) — the 2× intuition holds only on float32 banks — which is why it is a
+  dev/audit posture, not a shipping default. Retained floats serialize (the
+  scratch archive bumps to version 2 for retention blobs; version-1 blobs still
+  load, and still write, unchanged).
+- **Integer-domain pooling (v2.4).** `MakeCentroidCrossDevice` pools int8 rows
+  into a **quantized** cross-device query: per-dim contributions accumulate in
+  int64 — exact and order-free, so the pooled payload is bit-identical on every
+  machine given the same rows — and requantize directly in the integer domain
+  (no float mean, no norm reduction; symmetric quantization makes the explicit
+  normalization mathematically inert). `QueryXd`/`QueryXdBatch` execute the
+  payload's exact bytes; optional integer salience weights fold into the same
+  multiply, and all-equal weights produce the bit-identical unweighted result.
+  The pooled weight sum is capped at 2^20 (the accumulator's proven
+  overflow-free bound — over it is a rejection, not a wrap). The honesty number
+  ships with the operator: pooled-query recall@10 vs a float64 pooled reference
+  measured 0.9930 / 0.9885 / 0.9895 (Dot / Cosine / L2, random int8 fixtures) at
+  first calibration.
 
 ## What it deliberately is not
 
