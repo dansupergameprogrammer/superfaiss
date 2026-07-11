@@ -7,7 +7,8 @@ over banks you bake in your pipeline or grow at play time. One bank answers many
 questions: score the whole vector or any weighted slice of it, decompose every hit's
 score channel by channel, fold gameplay state into the ranking, pool rows into new
 queries, carry memory across save games — and measure what quantization actually
-costs you, per bank, as a stored number. Exact, bit-reproducible per device, and
+costs you: recall audited per bank, with the mutable banks carrying their own
+stored, staleness-tracked number. Exact, bit-reproducible per device, and
 (opt-in) bit-identical across machines. Dependency-free C++17 — the standard library
 and nothing else.
 CI-verified on Windows x64, Linux x64, and macOS arm64 (NEON) — three compilers
@@ -198,16 +199,18 @@ aspirational.
 
 ## The original pitch
 
-v1.0's opening pitch, word for word:
+The first two sentences of v1.0's README — the product pitch, word for word:
 
 > Fast, deterministic, allocation-free k-nearest-neighbor search over baked embedding
 > banks, built for game runtimes. Dependency-free C++17 — the standard library and
 > nothing else.
 
-Every word still holds — the library just answers more questions now. The banks no
+Both sentences still hold — the library just answers more questions now. The banks no
 longer have to be baked (scratch banks grow at play time and persist), and one bank
 now serves weighted slices, per-channel decomposition, in-scan bias, pooled queries,
-and honest recall numbers alongside the plain top-k it started with.
+and honest recall numbers alongside the plain top-k it started with. (v1.0's opener
+also had a third, CI-status sentence; the current version of that line lives at the
+top of this README, kept accurate rather than quoted.)
 
 ## License
 
