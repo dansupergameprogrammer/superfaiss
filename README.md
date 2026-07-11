@@ -6,7 +6,7 @@ Fast, deterministic, allocation-free k-nearest-neighbor search for game runtimes
 over banks you bake in your pipeline or grow at play time. One bank answers many
 questions: score the whole vector or any weighted slice of it, decompose every hit's
 score channel by channel, fold gameplay state into the ranking, pool rows into new
-queries, carry memory across save games — and measure what quantization actually
+queries, grow and persist banks at runtime — and measure what quantization actually
 costs you: recall audited per bank, with the mutable banks carrying their own
 stored, staleness-tracked number. Exact, bit-reproducible per device, and
 (opt-in) bit-identical across machines. Dependency-free C++17 — the standard library
@@ -27,8 +27,8 @@ That reliability is what lets you build actual gameplay on top of the answers.
 And you won't outgrow it: the same bank that answers "most similar overall" also
 answers the narrower questions that arrive next — "most similar *in identity*,
 ignoring appearance" (a weighted slice of the vector, with an exact per-channel
-breakdown of why each hit ranked), or "what does this NPC remember that's relevant
-right now?" over a memory that grows during play and survives a save game. One
+breakdown of why each hit ranked), or the same questions over a bank
+that grows during play and survives a save game. One
 bank, one library, more questions over time.
 
 SuperFAISS is an **independent implementation**. It is **not a fork of, derived from, or
