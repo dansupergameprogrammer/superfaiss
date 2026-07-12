@@ -93,12 +93,14 @@ Why it holds:
   included) from committed fixture banks — including adversarial tiny-scale banks
   whose scale products straddle the subnormal window — under every kernel path the
   hardware can force, and asserts it equals a golden pinned in the repo. Windows,
-  Linux, and macOS-ARM runners all assert the same pin on every push. Two sibling
+  Linux, and macOS-ARM runners all assert the same pin on every push. Three sibling
   batteries carry their own pins the same way: the scratch × cross-device battery
   (v2.3 — a copied-bytes baked twin of a scratch snapshot, tombstones and a `Grow`
-  in its history, scoring bit-identically to the snapshot) and the pooled-query
+  in its history, scoring bit-identically to the snapshot), the pooled-query
   battery (v2.4 — `MakeCentroidCrossDevice` payloads and their `QueryXd` hit lists
-  over the committed fixtures).
+  over the committed fixtures), and the analytics battery (v2.5 — `ScoreXdPair`,
+  set-to-set distance, nearest-neighbour divergence, and spread over the committed
+  fixtures, the cosine pair's `sqrt` limb included; see §2e).
 
 Scope and cost, stated plainly:
 
@@ -148,6 +150,33 @@ weights, its product — image, scale, self-dot — is bit-identical on any mach
 change to its accumulation, epilogue, or quantization is a space-version change for
 consumers** — embedding-space version machinery (stamping, mismatch rejection) lives
 consumer-side; treat a change here exactly like re-baking the space.
+
+## 2e. Bank analytics (v2.5): versioned composition operators
+
+The v2.5 analytics score int8 CrossDevice banks with the same integer accumulation and
+fixed-order double epilogue as the query path: `ScoreXdPair` (the query-vs-query pair
+score the others rest on), `CentroidDistanceCrossDevice` (set-to-set distance — drift over
+checkpoints is this operator between two checkpoints' row sets), `MeanNNCrossDevice` /
+`MaxNNCrossDevice` (directed nearest-neighbour set divergence), and `SpreadCrossDevice`
+(within-bank centroid-dispersion). Given identical bank bytes, scales, indices, and
+exclusion words, each scalar is bit-identical on any machine — the mean accumulates in
+fixed ascending row-index order, the max is order-free. **They are versioned composition
+operators, exactly as §2d: any change to a reduction's accumulation, epilogue, or
+quantization is a space-version change for consumers.**
+
+One new arithmetic operation enters the epilogue here, and it carries a build condition.
+The cosine distance is `1 − crossDot / sqrt(a.selfDot · b.selfDot)` — the one operation
+outside the `{+,−,×,÷}` epilogue the other cross-device math uses. Its cross-device identity
+requires a **true, IEEE-754 correctly-rounded `sqrt`: no `rsqrt` approximation, no fast-math
+reciprocal-square-root substitution.** The §3.1 obligation (build with `-ffp-contract=off` /
+`/fp:precise`, never fast-math) is what enforces it — fast-math is the setting that would
+substitute an `rsqrt` and diverge cosine scores across machines, and `-ffp-contract=off`
+alone does not stop that substitution. The core suite proves the result: the analytics
+battery carries its own pinned hash (`kGoldenAnalyticsXdHash`), asserted bit-identical across
+the CI matrix and across MSVC / GCC / AppleClang, the cosine pair (with its `sqrt`) included.
+
+`ProjectionReport` (v2.5) is per-device float only — an offline authoring/inspection tool
+with no cross-device claim — and stands outside this contract.
 
 ## 3. Embedder obligations
 
