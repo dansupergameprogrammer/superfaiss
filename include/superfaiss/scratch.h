@@ -253,6 +253,36 @@ public:
 		ScratchRecallReport* outReport = nullptr, Workspace* recallWs = nullptr,
 		uint64_t recallSeed = kDefaultRecallSeed) const;
 
+	// Channel-aware Freeze (V3.0, plan section 23.4): as Freeze above (compacts live
+	// rows into outRows/outScales, fills outIndexMap old->new), and ADDITIONALLY emits
+	// the per-channel inverse sub-norms RE-DERIVED over the compacted (live) rows into
+	// outChannelInvNorms (FreezeLiveCount() * GetChannelCount() floats). Compaction
+	// renumbers, so the graduated channel-carrying baked payload's sub-norms follow the
+	// surviving rows (exactly as recall is re-measured at freeze). Valid only on a Cosine
+	// bank that carries a channel table; on a non-channel or non-Cosine bank it is
+	// InvalidArgument (use the base Freeze). The channel table itself is read back via
+	// GetChannels()/GetChannelCount() for building the graduated BankView.
+	Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap,
+		float* outChannelInvNorms, ScratchRecallReport* outReport = nullptr,
+		Workspace* recallWs = nullptr, uint64_t recallSeed = kDefaultRecallSeed) const;
+
+	// The fixed channel table set at Create (V3.0), or null / 0 for a single-space bank.
+	// A caller graduating a channel scratch bank attaches these to the frozen BankView.
+	int32_t GetChannelCount() const { return ChannelCount_; }
+	const ChannelInfo* GetChannels() const { return ChannelCount_ > 0 ? Channels_ : nullptr; }
+
+	// Channel-aware Freeze that also re-measures per-channel recall over the compacted
+	// (live) rows at freeze time (V3.0, D-V3-7). As the channel-aware Freeze above, and
+	// additionally fills outRecallReports[c] (reportCount == GetChannelCount() entries)
+	// with the per-channel recall@k measured over the surviving rows -- a fresh number
+	// for the graduated bank, never a stale one (the §20 freeze-re-measure rule, per
+	// channel). Requires a retention-enabled Cosine bank that carries a channel table and
+	// a workspace; InvalidArgument otherwise (a non-retention bank has no float reference
+	// to scan; use the base channel-aware Freeze for the no-recall path).
+	Status FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap,
+		float* outChannelInvNorms, ScratchRecallReport* outRecallReports, int32_t reportCount,
+		Workspace& recallWs, uint64_t recallSeed = kDefaultRecallSeed) const;
+
 	// --- Recall audit (V2.3 plan section 20) ---
 
 	// Seeded recall@k self-query sweep on a retention-enabled bank: min(1000, liveRows)
@@ -268,6 +298,19 @@ public:
 	// Append/Remove yields a SAFE but non-reproducible number (atomic value reads,
 	// never UB) — determinism-given-history holds only over a quiescent bank.
 	Status MeasureScratchRecall(Workspace& workspace, ScratchRecallReport* outReport,
+		uint64_t seed = kDefaultRecallSeed);
+
+	// Per-channel recall mode (V3.0, D-V3-7): on a retention-enabled Cosine bank that
+	// carries a channel table, measures recall@k PER CHANNEL over each channel's
+	// sub-range (the channel-scoped self-query vs the double-precision reference
+	// restricted to that channel's elements), filling outReports[c] for c in
+	// [0, GetChannelCount()). reportCount must equal GetChannelCount(). Runs under the
+	// reader pin like any query; the workspace supplies all scratch. InvalidArgument on a
+	// non-retention bank (no float reference) or a bank with no channel table (use the
+	// whole-vector MeasureScratchRecall). Tombstoned rows are neither sampled nor counted,
+	// exactly as the whole-vector routine.
+	Status MeasureScratchRecallPerChannel(Workspace& workspace,
+		ScratchRecallReport* outReports, int32_t reportCount,
 		uint64_t seed = kDefaultRecallSeed);
 
 	// A report is stale once the bank has mutated past its stamped generation. Defined

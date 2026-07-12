@@ -692,6 +692,48 @@ Status ScratchBank::Freeze(void* outRows, float* outScales, int32_t* outIndexMap
 	return Status::Ok;
 }
 
+// SCAFFOLD (Curie, slot-3 red suite, plan section 23.9): the channel-aware Freeze
+// overload is declared in scratch.h so the slot-3 suite compiles and links against the
+// real interface the plan specifies (section 23.4), but its body -- compacting the live
+// rows AND re-deriving the per-channel inverse sub-norms over the surviving (compacted)
+// rows -- is not implemented here. It unconditionally returns BadAlignment, a status no
+// section 23.8 slot-3 cell expects (Ok on a valid channel Cosine bank; InvalidArgument on
+// a non-channel bank), so every test against this overload fails at a specific runtime
+// assertion for the one true reason -- channel-aware Freeze does not exist yet -- never at
+// compile or link time. Hastings replaces this body with the real implementation (section
+// 23.4); this comment is removed with it.
+Status ScratchBank::Freeze(void* /*outRows*/, float* /*outScales*/,
+	int32_t* /*outIndexMap*/, float* /*outChannelInvNorms*/,
+	ScratchRecallReport* /*outReport*/, Workspace* /*recallWs*/,
+	uint64_t /*recallSeed*/) const
+{
+	return Status::BadAlignment;
+}
+
+// SCAFFOLD (Curie, slot-3 red suite, D-V3-7): the per-channel recall surfaces
+// (FreezeWithRecall + MeasureScratchRecallPerChannel) are declared in scratch.h so the
+// slot-3 recall suite compiles and links against the real interface (plan section 23.4
+// item b, section 23.9 slot-3 gate), but their bodies -- the seeded per-channel recall
+// sweep over each channel's sub-range, and the freeze-time per-channel re-measure -- are
+// not implemented. Both unconditionally return BadAlignment, a status no slot-3 cell
+// expects (Ok on a valid retention+channel Cosine bank; InvalidArgument on a
+// non-retention or non-channel bank), so every recall cell fails at a specific runtime
+// assertion for the one true reason. Hastings replaces both bodies with the real
+// implementation; these comments are removed with them.
+Status ScratchBank::FreezeWithRecall(void* /*outRows*/, float* /*outScales*/,
+	int32_t* /*outIndexMap*/, float* /*outChannelInvNorms*/,
+	ScratchRecallReport* /*outRecallReports*/, int32_t /*reportCount*/,
+	Workspace& /*recallWs*/, uint64_t /*recallSeed*/) const
+{
+	return Status::BadAlignment;
+}
+
+Status ScratchBank::MeasureScratchRecallPerChannel(Workspace& /*workspace*/,
+	ScratchRecallReport* /*outReports*/, int32_t /*reportCount*/, uint64_t /*seed*/)
+{
+	return Status::BadAlignment;
+}
+
 Status ScratchBank::Save(const ScratchArchive& archive) const
 {
 	if (!IsCreated() || archive.write == nullptr)
