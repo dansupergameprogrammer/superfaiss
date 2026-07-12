@@ -382,6 +382,46 @@ Status SpreadCrossDevice(
 	return Status::Ok;
 }
 
+// SCAFFOLD (Curie, slot-4 red suite, plan section 23.9): the four channel-scoped Tier-2
+// operators are declared in analytics.h so the slot-4 suite compiles and links against the
+// interface the plan specifies (section 23.5), but their bodies -- pooling/scoring over
+// [channel.offset, +length), the Dot/L2 sub-range integer path and the Cosine per-channel
+// sub-norm path -- are not implemented. All four unconditionally return BadAlignment, a
+// status no section 23.8 slot-4 cell expects (Ok on a valid channel bank; InvalidArgument
+// on a no-table / out-of-range channel; ZeroNormQuery on a zero-norm Cosine channel), so
+// every REF/FEAT/composition/determinism cell fails at a specific runtime assertion for the
+// one true reason -- the operators do not exist yet -- never at compile or link time.
+// Hastings replaces these bodies with the real section-23.5 implementation; this comment is
+// removed with them.
+Status CentroidDistanceCrossDeviceChannel(
+	const BankView&, const int32_t*, int32_t, const int32_t*, const uint32_t*,
+	const BankView&, const int32_t*, int32_t, const int32_t*, const uint32_t*,
+	Metric, int32_t, int8_t*, int8_t*, float*)
+{
+	return Status::BadAlignment;
+}
+
+Status MeanNNCrossDeviceChannel(
+	const BankView&, const uint32_t*, const BankView&, const uint32_t*, int32_t,
+	XdQuery*, Hit*, int32_t*, Workspace&, float*)
+{
+	return Status::BadAlignment;
+}
+
+Status MaxNNCrossDeviceChannel(
+	const BankView&, const uint32_t*, const BankView&, const uint32_t*, int32_t,
+	XdQuery*, Hit*, int32_t*, Workspace&, float*)
+{
+	return Status::BadAlignment;
+}
+
+Status SpreadCrossDeviceChannel(
+	const BankView&, const int32_t*, int32_t, const uint32_t*, Reduce, int32_t,
+	int8_t*, float*)
+{
+	return Status::BadAlignment;
+}
+
 Status ProjectionReport(const BankView& bank, const float* paddedDirection,
 	const uint32_t* groupBits, float* outProjections, float* outSeparation)
 {

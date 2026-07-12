@@ -9626,6 +9626,762 @@ static void TestScratchChannelPerChannelRecall()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T-V3 (slot 4) -- Tier-2 channel-scoped analytics (SuperFAISS_V2_Plan.md
+// section 23.5; section 23.9 slot-4 gate; section 23.8 dims 3/4/6/8/10) plus
+// the two D-V3-8 concurrency storms. Authored red-first by Curie on the green
+// slot-3 base. Reuses the slot-2/3 helpers (MakeChannelScratchBank,
+// ScratchChannelFixture) and the analytics/forced-path conventions of the
+// shipped V2.5 suite.
+//
+// SCAFFOLD (Curie, not the feature): the four channel-scoped operators
+// (CentroidDistance/MeanNN/MaxNN/Spread ...Channel) are declared in analytics.h
+// and stubbed in analytics.cpp to return Status::BadAlignment -- a status no
+// slot-4 cell expects -- so every REF/FEAT/composition/determinism/rejection
+// cell fails at a specific runtime assertion for the one true reason. Storm (a)
+// (channel-query-only) needs no scaffold: it exercises the already-green slot-2
+// channel query, so it goes GREEN immediately (a coverage patch owed by D-V3-8).
+// Hastings implements the real section-23.5 operators.
+
+namespace
+{
+	// A whole-vector int8 bank holding one channel's lanes repacked contiguously:
+	// row r of the repack = the source row's [offset, offset+length) int8 bytes, with
+	// the SAME per-row scale, paddedDims' = length. The channel-scoped statistic over
+	// channel c EQUALS the shipped whole-vector operator run on this repack -- a bit-exact
+	// REF for the Dot/L2 families (pure sub-range integer accumulation + the shipped
+	// linear epilogue; no sqrt). NOT used for Cosine (the channel-scoped cosine arithmetic
+	// -- precomputed channelInvNorms vs a recomputed sub-range sqrt -- is unpinned in
+	// section 23.5, routed as finding C-4; the Cosine achievement rides the FEAT +
+	// forced-path instead).
+	struct ChannelRepack
+	{
+		AlignedBuf rows;
+		std::vector<float> scales;
+		BankView view;
+
+		ChannelRepack(const BankView& src, const ChannelInfo& ch)
+			: rows(static_cast<size_t>(src.count > 0 ? src.count : 1) * ch.length)
+		{
+			scales.resize(static_cast<size_t>(src.count));
+			const int8_t* srow = static_cast<const int8_t*>(src.rows);
+			int8_t* drow = rows.I8();
+			for (int32_t r = 0; r < src.count; ++r)
+			{
+				std::memcpy(drow + static_cast<size_t>(r) * ch.length,
+					srow + static_cast<int64_t>(r) * src.paddedDims + ch.offset,
+					static_cast<size_t>(ch.length));
+				scales[static_cast<size_t>(r)] = src.scales[r];
+			}
+			view.rows = rows.ptr;
+			view.scales = scales.data();
+			view.count = src.count;
+			view.dims = ch.length;
+			view.paddedDims = ch.length; // ch.length is a multiple of the int8 grid (16)
+			view.quant = Quantization::Int8;
+			view.metric = src.metric;
+		}
+	};
+
+	// Dequantize one row's channel sub-vector to doubles (scale * int8) -- the FEAT input,
+	// exactly what the kernel dots, computed by hand (never via an operator).
+	void DequantChannelSub(const BankView& v, int32_t r, const ChannelInfo& ch,
+		std::vector<double>& out)
+	{
+		out.assign(static_cast<size_t>(ch.length), 0.0);
+		const int8_t* row = static_cast<const int8_t*>(v.rows) +
+			static_cast<int64_t>(r) * v.paddedDims;
+		const double scale = v.scales[r];
+		for (int32_t j = 0; j < ch.length; ++j)
+		{
+			out[static_cast<size_t>(j)] = scale * row[ch.offset + j];
+		}
+	}
+
+	// Float64 unweighted mean of the dequantized channel sub-vectors of the given rows.
+	std::vector<double> F64ChannelCentroid(const BankView& v, const int32_t* idx,
+		int32_t n, const ChannelInfo& ch)
+	{
+		std::vector<double> c(static_cast<size_t>(ch.length), 0.0);
+		std::vector<double> row;
+		int32_t used = 0;
+		for (int32_t i = 0; i < n; ++i)
+		{
+			DequantChannelSub(v, idx[i], ch, row);
+			for (int32_t j = 0; j < ch.length; ++j)
+			{
+				c[static_cast<size_t>(j)] += row[static_cast<size_t>(j)];
+			}
+			++used;
+		}
+		if (used > 0)
+		{
+			for (auto& x : c)
+			{
+				x /= static_cast<double>(used);
+			}
+		}
+		return c;
+	}
+
+	// Float64 distance in the operator's distance sense (Dot: similarity; L2: squared
+	// distance; Cosine: 1 - cos), over two channel sub-vectors.
+	double F64ChannelDist(const std::vector<double>& a, const std::vector<double>& b,
+		Metric metric)
+	{
+		double cross = 0.0, na = 0.0, nb = 0.0;
+		for (size_t i = 0; i < a.size(); ++i)
+		{
+			cross += a[i] * b[i];
+			na += a[i] * a[i];
+			nb += b[i] * b[i];
+		}
+		if (metric == Metric::L2)
+		{
+			return (na + nb) - 2.0 * cross;
+		}
+		if (metric == Metric::Cosine)
+		{
+			return (na > 0.0 && nb > 0.0) ? 1.0 - cross / std::sqrt(na * nb) : 0.0;
+		}
+		return cross; // Dot similarity
+	}
+
+	// The FEAT nearest of one source sub-vector over a target bank's channel sub-vectors,
+	// in the distance sense the reduction uses. Dot: the MAX similarity (nearest = most
+	// similar); L2 / Cosine: the MIN distance.
+	double F64ChannelNearest(const std::vector<double>& srcSub, const BankView& target,
+		const ChannelInfo& ch, Metric metric)
+	{
+		std::vector<double> t;
+		bool have = false;
+		double best = 0.0;
+		for (int32_t r = 0; r < target.count; ++r)
+		{
+			DequantChannelSub(target, r, ch, t);
+			const double d = F64ChannelDist(srcSub, t, metric);
+			const bool better = !have || (metric == Metric::Dot ? d > best : d < best);
+			if (better)
+			{
+				best = d;
+			}
+			have = true;
+		}
+		return best;
+	}
+
+	// Slot-4 FEAT CAL bands (Curie, proposed; pin at first calibration): loose enough to
+	// absorb int8 row quantization AND centroid re-quantization (the T-V2.5-3 band shape).
+	double ChannelFeatTol(double ref)
+	{
+		return 0.35 * std::fabs(ref) + 0.10;
+	}
+} // namespace
+
+// T-V3-A1 -- REF (Dot/L2 repack, bit-exact) + FEAT (all metrics, definition-grounded)
+// for the four channel-scoped operators, per metric, per channel (dim 10).
+static void TestChannelScopedAnalyticsRefFeat()
+{
+	Rng rng(0x7A4A1ull);
+	const int32_t dims = 64;
+	const int32_t count = 48;
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		// Two channel scratch banks (source/A and target/B) with the SAME channel table.
+		ScratchChannelFixture srcFx;
+		ScratchChannelFixture tgtFx;
+		MakeChannelScratchBank(srcFx, rng, count, dims, metric, Quantization::Int8);
+		MakeChannelScratchBank(tgtFx, rng, count, dims, metric, Quantization::Int8);
+		if (srcFx.createStatus != Status::Ok || tgtFx.createStatus != Status::Ok)
+		{
+			continue;
+		}
+		BankView src, tgt;
+		std::vector<uint32_t> srcTombs(ScratchBank::TombstoneWords(count), 0u);
+		std::vector<uint32_t> tgtTombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(srcFx.bank.Snapshot(&src, srcTombs.data()) == Status::Ok);
+		CHECK(tgtFx.bank.Snapshot(&tgt, tgtTombs.data()) == Status::Ok);
+
+		const int32_t idxA[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t idxB[6] = {2, 7, 12, 20, 25, 31};
+		std::vector<int32_t> allRows(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i)
+		{
+			allRows[static_cast<size_t>(i)] = i;
+		}
+
+		for (int32_t c = 0; c < static_cast<int32_t>(srcFx.channels.size()); ++c)
+		{
+			const ChannelInfo& ch = srcFx.channels[static_cast<size_t>(c)];
+			const bool linear = metric != Metric::Cosine; // Dot/L2 have the bit-exact repack REF
+
+			// --- CentroidDistance channel ---
+			{
+				AlignedBuf sA(static_cast<size_t>(src.paddedDims));
+				AlignedBuf sB(static_cast<size_t>(src.paddedDims));
+				float cd = 0.0f;
+				const Status s = CentroidDistanceCrossDeviceChannel(
+					src, idxA, 6, nullptr, nullptr, src, idxB, 6, nullptr, nullptr,
+					metric, c, sA.I8(), sB.I8(), &cd);
+				CHECK_MSG(s == Status::Ok,
+					"CentroidDistance channel failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(s));
+				if (s == Status::Ok)
+				{
+					if (linear)
+					{
+						ChannelRepack rp(src, ch);
+						AlignedBuf rA(static_cast<size_t>(rp.view.paddedDims));
+						AlignedBuf rB(static_cast<size_t>(rp.view.paddedDims));
+						float ref = 0.0f;
+						CHECK(CentroidDistanceCrossDevice(rp.view, idxA, 6, nullptr, nullptr,
+								   rp.view, idxB, 6, nullptr, nullptr, metric, rA.I8(), rB.I8(),
+								   &ref) == Status::Ok);
+						CHECK_MSG(cd == ref,
+							"CentroidDistance channel REF mismatch (metric=%d ch=%d): %.9g != %.9g",
+							static_cast<int>(metric), c, static_cast<double>(cd),
+							static_cast<double>(ref));
+					}
+					const std::vector<double> ca = F64ChannelCentroid(src, idxA, 6, ch);
+					const std::vector<double> cb = F64ChannelCentroid(src, idxB, 6, ch);
+					const double fref = F64ChannelDist(ca, cb, metric);
+					CHECK_MSG(std::fabs(static_cast<double>(cd) - fref) <= ChannelFeatTol(fref),
+						"CentroidDistance channel FEAT (metric=%d ch=%d): op %.6g f64 %.6g",
+						static_cast<int>(metric), c, static_cast<double>(cd), fref);
+				}
+			}
+
+			// --- Spread channel ---
+			{
+				AlignedBuf cs(static_cast<size_t>(src.paddedDims));
+				float sp = 0.0f;
+				const Status s = SpreadCrossDeviceChannel(src, allRows.data(), count, nullptr,
+					Reduce::Mean, c, cs.I8(), &sp);
+				CHECK_MSG(s == Status::Ok,
+					"Spread channel failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(s));
+				if (s == Status::Ok)
+				{
+					if (linear)
+					{
+						ChannelRepack rp(src, ch);
+						AlignedBuf rcs(static_cast<size_t>(rp.view.paddedDims));
+						float ref = 0.0f;
+						CHECK(SpreadCrossDevice(rp.view, allRows.data(), count, nullptr,
+								   Reduce::Mean, rcs.I8(), &ref) == Status::Ok);
+						CHECK_MSG(sp == ref,
+							"Spread channel REF mismatch (metric=%d ch=%d): %.9g != %.9g",
+							static_cast<int>(metric), c, static_cast<double>(sp),
+							static_cast<double>(ref));
+					}
+					// FEAT: float64 dispersion over the channel sub-range about the f64 centroid.
+					const std::vector<double> cen = F64ChannelCentroid(src, allRows.data(), count, ch);
+					std::vector<double> row;
+					double acc = 0.0;
+					for (int32_t r = 0; r < count; ++r)
+					{
+						DequantChannelSub(src, r, ch, row);
+						acc += F64ChannelDist(row, cen, metric);
+					}
+					const double fref = acc / static_cast<double>(count);
+					CHECK_MSG(std::fabs(static_cast<double>(sp) - fref) <= ChannelFeatTol(fref),
+						"Spread channel FEAT (metric=%d ch=%d): op %.6g f64 %.6g",
+						static_cast<int>(metric), c, static_cast<double>(sp), fref);
+				}
+			}
+
+			// --- MeanNN / MaxNN channel (source -> target) ---
+			{
+				std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+				std::vector<Hit> hbuf(static_cast<size_t>(count));
+				std::vector<int32_t> nbuf(static_cast<size_t>(count));
+				Workspace ws;
+				float mn = 0.0f, mx = 0.0f;
+				const Status sMean = MeanNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &mn);
+				const Status sMax = MaxNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &mx);
+				CHECK_MSG(sMean == Status::Ok,
+					"MeanNN channel failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(sMean));
+				CHECK_MSG(sMax == Status::Ok,
+					"MaxNN channel failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(sMax));
+				if (sMean == Status::Ok && sMax == Status::Ok)
+				{
+					if (linear)
+					{
+						ChannelRepack rsrc(src, ch);
+						ChannelRepack rtgt(tgt, ch);
+						std::vector<XdQuery> q2(static_cast<size_t>(count));
+						std::vector<Hit> h2(static_cast<size_t>(count));
+						std::vector<int32_t> n2(static_cast<size_t>(count));
+						Workspace ws2;
+						float refMean = 0.0f, refMax = 0.0f;
+						CHECK(MeanNNCrossDevice(rsrc.view, nullptr, rtgt.view, nullptr,
+								   q2.data(), h2.data(), n2.data(), ws2, &refMean) == Status::Ok);
+						CHECK(MaxNNCrossDevice(rsrc.view, nullptr, rtgt.view, nullptr,
+								   q2.data(), h2.data(), n2.data(), ws2, &refMax) == Status::Ok);
+						CHECK_MSG(mn == refMean,
+							"MeanNN channel REF mismatch (metric=%d ch=%d): %.9g != %.9g",
+							static_cast<int>(metric), c, static_cast<double>(mn),
+							static_cast<double>(refMean));
+						CHECK_MSG(mx == refMax,
+							"MaxNN channel REF mismatch (metric=%d ch=%d): %.9g != %.9g",
+							static_cast<int>(metric), c, static_cast<double>(mx),
+							static_cast<double>(refMax));
+					}
+					// FEAT: float64 nearest over the channel sub-range, mean and max.
+					std::vector<double> sub;
+					double sum = 0.0, fmax = 0.0;
+					bool have = false;
+					for (int32_t r = 0; r < count; ++r)
+					{
+						DequantChannelSub(src, r, ch, sub);
+						const double nn = F64ChannelNearest(sub, tgt, ch, metric);
+						sum += nn;
+						if (!have || nn > fmax)
+						{
+							fmax = nn;
+						}
+						have = true;
+					}
+					const double frefMean = sum / static_cast<double>(count);
+					CHECK_MSG(std::fabs(static_cast<double>(mn) - frefMean) <=
+								  ChannelFeatTol(frefMean),
+						"MeanNN channel FEAT (metric=%d ch=%d): op %.6g f64 %.6g",
+						static_cast<int>(metric), c, static_cast<double>(mn), frefMean);
+					CHECK_MSG(std::fabs(static_cast<double>(mx) - fmax) <= ChannelFeatTol(fmax),
+						"MaxNN channel FEAT (metric=%d ch=%d): op %.6g f64 %.6g",
+						static_cast<int>(metric), c, static_cast<double>(mx), fmax);
+				}
+			}
+		}
+	}
+}
+
+// T-V3-A2 -- per-channel determinism (dim 6, section 23.7/section 22.5): each
+// channel-scoped Cosine operator crosses the forced-path sweep bit-identical (the
+// per-channel cosine sqrt limb is exercised). Red until slot 4: the operators stub before
+// producing a value.
+static void TestChannelScopedAnalyticsDeterminism()
+{
+	Rng rng(0xD37E4Dull);
+	const int32_t dims = 64;
+	const int32_t count = 48;
+
+	ScratchChannelFixture fx;
+	MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	if (fx.createStatus != Status::Ok)
+	{
+		return;
+	}
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+	std::vector<int32_t> rows(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i)
+	{
+		rows[static_cast<size_t>(i)] = i;
+	}
+	const int32_t idxA[6] = {0, 4, 9, 17, 22, 30};
+	const int32_t idxB[6] = {2, 7, 12, 20, 25, 31};
+
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+
+	for (int32_t c = 0; c < static_cast<int32_t>(fx.channels.size()); ++c)
+	{
+		float cdVals[4] = {}, spVals[4] = {}, mnVals[4] = {};
+		Status cdStatus = Status::Ok, spStatus = Status::Ok, mnStatus = Status::Ok;
+		for (size_t p = 0; p < paths.size(); ++p)
+		{
+			detail::ForceXdSimdPath(paths[p]);
+			AlignedBuf sA(static_cast<size_t>(snap.paddedDims));
+			AlignedBuf sB(static_cast<size_t>(snap.paddedDims));
+			cdStatus = CentroidDistanceCrossDeviceChannel(snap, idxA, 6, nullptr, nullptr,
+				snap, idxB, 6, nullptr, nullptr, Metric::Cosine, c, sA.I8(), sB.I8(),
+				&cdVals[p]);
+			AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+			spStatus = SpreadCrossDeviceChannel(snap, rows.data(), count, nullptr,
+				Reduce::Mean, c, cs.I8(), &spVals[p]);
+			std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+			std::vector<Hit> hbuf(static_cast<size_t>(count));
+			std::vector<int32_t> nbuf(static_cast<size_t>(count));
+			Workspace ws;
+			mnStatus = MeanNNCrossDeviceChannel(snap, nullptr, snap, nullptr, c, qbuf.data(),
+				hbuf.data(), nbuf.data(), ws, &mnVals[p]);
+			detail::ClearForcedXdSimdPath();
+		}
+		CHECK_MSG(cdStatus == Status::Ok,
+			"channel-scoped Cosine CentroidDistance not deterministic-testable "
+			"(unimplemented, slot 4): status=%d", static_cast<int>(cdStatus));
+		CHECK(spStatus == Status::Ok);
+		CHECK(mnStatus == Status::Ok);
+		if (cdStatus == Status::Ok && spStatus == Status::Ok && mnStatus == Status::Ok)
+		{
+			for (size_t p = 1; p < paths.size(); ++p)
+			{
+				CHECK_MSG(cdVals[p] == cdVals[0],
+					"channel Cosine CentroidDistance forced-path %d != scalar (ch=%d)",
+					static_cast<int>(paths[p]), c);
+				CHECK(spVals[p] == spVals[0]);
+				CHECK(mnVals[p] == mnVals[0]);
+			}
+		}
+	}
+}
+
+// T-V3-A3 -- composition (dim 8) + whole-vector-unchanged regression (dim 7).
+static void TestChannelScopedAnalyticsComposition()
+{
+	Rng rng(0xC0FFee44ull);
+	const int32_t dims = 64;
+	const int32_t count = 48;
+
+	ScratchChannelFixture fx;
+	MakeChannelScratchBank(fx, rng, count, dims, Metric::Dot, Quantization::Int8);
+	if (fx.createStatus != Status::Ok)
+	{
+		return;
+	}
+	// Tombstone a scatter so the snapshot source composition exercises exclusion.
+	for (int32_t r = 3; r < count; r += 9)
+	{
+		CHECK(fx.bank.Remove(r) == Status::Ok);
+	}
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+	std::vector<int32_t> rows(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i)
+	{
+		rows[static_cast<size_t>(i)] = i;
+	}
+
+	// (1) Weighted centroids: a channel-scoped CentroidDistance with all-equal weights
+	// bit-equals the unweighted form (the V2.4 P6 invariant, per channel). Red at the stub.
+	{
+		std::vector<int32_t> weights(static_cast<size_t>(count), 1);
+		for (int32_t c = 0; c < static_cast<int32_t>(fx.channels.size()); ++c)
+		{
+			AlignedBuf a1(static_cast<size_t>(snap.paddedDims));
+			AlignedBuf b1(static_cast<size_t>(snap.paddedDims));
+			AlignedBuf a2(static_cast<size_t>(snap.paddedDims));
+			AlignedBuf b2(static_cast<size_t>(snap.paddedDims));
+			float wtd = 0.0f, unw = 0.0f;
+			const Status sw = CentroidDistanceCrossDeviceChannel(snap, rows.data(), count,
+				weights.data(), tombs.data(), snap, rows.data(), count, weights.data(),
+				tombs.data(), Metric::Dot, c, a1.I8(), b1.I8(), &wtd);
+			const Status su = CentroidDistanceCrossDeviceChannel(snap, rows.data(), count,
+				nullptr, tombs.data(), snap, rows.data(), count, nullptr, tombs.data(),
+				Metric::Dot, c, a2.I8(), b2.I8(), &unw);
+			CHECK_MSG(sw == Status::Ok && su == Status::Ok,
+				"weighted/unweighted channel CentroidDistance failed (unimplemented, slot 4): "
+				"%d/%d", static_cast<int>(sw), static_cast<int>(su));
+			if (sw == Status::Ok && su == Status::Ok)
+			{
+				CHECK_MSG(wtd == unw,
+					"channel CentroidDistance all-equal-weighted != unweighted (ch=%d): "
+					"%.9g != %.9g", c, static_cast<double>(wtd), static_cast<double>(unw));
+			}
+		}
+	}
+
+	// (2) Scratch-snapshot source + tombstone exclusion: a channel-scoped Spread over the
+	// snapshot (excludeBits = tombstone words) bit-equals the same over a repacked live-only
+	// bank -- reachability today is via the stub (red); the REF equality is the slot-4 target.
+	{
+		AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+		float sp = 0.0f;
+		const Status s = SpreadCrossDeviceChannel(snap, rows.data(), count, tombs.data(),
+			Reduce::Mean, 0, cs.I8(), &sp);
+		CHECK_MSG(s == Status::Ok,
+			"channel Spread over a tombstoned snapshot failed (unimplemented, slot 4): %d",
+			static_cast<int>(s));
+	}
+
+	// (3) Whole-vector operators UNCHANGED (dim 7 regression -- GREEN guard): the shipped
+	// whole-vector CentroidDistanceCrossDevice yields the SAME value on the channel-carrying
+	// snapshot as on a channel-less copy of it (the channel table does not perturb the
+	// whole-vector path).
+	{
+		BankView bare = snap;
+		bare.channels = nullptr;
+		bare.channelCount = 0;
+		bare.channelInvNorms = nullptr;
+		const int32_t idxA[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t idxB[6] = {2, 7, 12, 20, 25, 31};
+		AlignedBuf a1(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf b1(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf a2(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf b2(static_cast<size_t>(snap.paddedDims));
+		float withCh = 0.0f, withoutCh = 0.0f;
+		CHECK(CentroidDistanceCrossDevice(snap, idxA, 6, nullptr, nullptr, snap, idxB, 6,
+				  nullptr, nullptr, Metric::Dot, a1.I8(), b1.I8(), &withCh) == Status::Ok);
+		CHECK(CentroidDistanceCrossDevice(bare, idxA, 6, nullptr, nullptr, bare, idxB, 6,
+				  nullptr, nullptr, Metric::Dot, a2.I8(), b2.I8(), &withoutCh) == Status::Ok);
+		CHECK_MSG(withCh == withoutCh,
+			"whole-vector CentroidDistance changed by the channel table: %.9g != %.9g",
+			static_cast<double>(withCh), static_cast<double>(withoutCh));
+	}
+}
+
+// T-V3-A4 -- rejection / degenerate (dims 2/5).
+static void TestChannelScopedAnalyticsRejections()
+{
+	Rng rng(0x8E7EC7ull);
+	const int32_t dims = 64;
+	const int32_t count = 16;
+
+	// A channel-LESS int8 bank: any channel-scoped op -> InvalidArgument.
+	{
+		ScratchBank plain;
+		CHECK(plain.Create(count, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source)
+		{
+			v = rng.NextFloat();
+		}
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(plain.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(plain.Snapshot(&snap, tombs.data()) == Status::Ok);
+		std::vector<int32_t> rows(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i)
+		{
+			rows[static_cast<size_t>(i)] = i;
+		}
+		AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+		float out = 0.0f;
+		CHECK_MSG(SpreadCrossDeviceChannel(snap, rows.data(), count, nullptr, Reduce::Mean, 0,
+					  cs.I8(), &out) == Status::InvalidArgument,
+			"channel-scoped op on a channel-less bank must be InvalidArgument");
+	}
+
+	// A channel bank with an out-of-range / negative channel selector -> InvalidArgument.
+	{
+		ScratchChannelFixture fx;
+		MakeChannelScratchBank(fx, rng, count, dims, Metric::Dot, Quantization::Int8);
+		if (fx.createStatus == Status::Ok)
+		{
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			std::vector<int32_t> rows(static_cast<size_t>(count));
+			for (int32_t i = 0; i < count; ++i)
+			{
+				rows[static_cast<size_t>(i)] = i;
+			}
+			AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+			float out = 0.0f;
+			const int32_t nChan = static_cast<int32_t>(fx.channels.size());
+			CHECK_MSG(SpreadCrossDeviceChannel(snap, rows.data(), count, nullptr, Reduce::Mean,
+						  nChan, cs.I8(), &out) == Status::InvalidArgument,
+				"out-of-range channel index must be InvalidArgument");
+			CHECK_MSG(SpreadCrossDeviceChannel(snap, rows.data(), count, nullptr, Reduce::Mean,
+						  -1, cs.I8(), &out) == Status::InvalidArgument,
+				"negative channel index must be InvalidArgument");
+		}
+	}
+
+	// All-zero-norm channel (Dot): a hand bank whose channel-0 lanes are all zero across
+	// the selection -> the channel-scoped Dot centroid distance is defined 0, never NaN.
+	{
+		const int32_t d = 32; // two int8 channels of 16
+		const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+		ScratchBank bank;
+		CHECK(bank.Create(4, d, Metric::Dot, Quantization::Int8, channels, 2) == Status::Ok);
+		// Rows with energy ONLY in channel 1 (channel-0 lanes all zero).
+		for (int32_t r = 0; r < 4; ++r)
+		{
+			float row[d] = {};
+			row[16 + (r % 16)] = 1.0f + 0.1f * r;
+			CHECK(bank.Append(row, d, nullptr) == Status::Ok);
+		}
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(4), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		const int32_t idx[4] = {0, 1, 2, 3};
+		AlignedBuf sA(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf sB(static_cast<size_t>(snap.paddedDims));
+		float cd = -12345.0f;
+		const Status s = CentroidDistanceCrossDeviceChannel(snap, idx, 2, nullptr, nullptr,
+			snap, idx + 2, 2, nullptr, nullptr, Metric::Dot, 0, sA.I8(), sB.I8(), &cd);
+		CHECK_MSG(s == Status::Ok,
+			"all-zero Dot channel CentroidDistance should be defined Ok (unimplemented): %d",
+			static_cast<int>(s));
+		if (s == Status::Ok)
+		{
+			CHECK_MSG(cd == cd, "all-zero channel produced NaN");
+			CHECK_MSG(cd == 0.0f, "all-zero Dot channel distance should be 0, got %g",
+				static_cast<double>(cd));
+		}
+	}
+}
+
+// T-V3-A5 (D-V3-8 (a)) -- channel-query-only storm: the shipped slot-2 channel query over a
+// HELD snapshot is stable under concurrent append/remove (result == the serial baseline).
+// GREEN on the current code (a coverage patch owed before slot 3's gate closed). TSan-clean
+// is the CI property; this functional form runs under build.bat, like the shipped scratch
+// concurrency tests.
+static void TestChannelQueryOnlyStorm()
+{
+	Rng rng(0x570A11ull);
+	const int32_t dims = 64;
+	const int32_t capacity = 512;
+	const int32_t appended = 200;
+
+	ScratchChannelFixture fx;
+	MakeChannelScratchBank(fx, rng, appended, dims, Metric::Cosine, Quantization::Int8,
+		capacity);
+	if (fx.createStatus != Status::Ok)
+	{
+		return;
+	}
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
+	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw)
+	{
+		v = rng.NextFloat();
+	}
+	AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+	PadQuery(queryRaw, fx.pd, qbuf.F32());
+	const QuerySegment seg[1] = {{fx.channels[0].offset, fx.channels[0].length, 1.0f}};
+	QueryParams params;
+	params.k = 10;
+	params.segments = seg;
+	params.segmentCount = 1;
+	params.excludeBits = tombs.data();
+
+	Workspace wsBase;
+	Hit baseHits[10];
+	int32_t baseN = 0;
+	CHECK(Query(snap, qbuf.F32(), params, wsBase, baseHits, &baseN) == Status::Ok);
+
+	std::atomic<bool> stop{false};
+	std::thread writer([&]() {
+		Rng wrng(0x999ull);
+		int32_t next = appended;
+		std::vector<float> row(dims);
+		while (!stop.load(std::memory_order_relaxed))
+		{
+			if (next < capacity)
+			{
+				for (auto& v : row)
+				{
+					v = wrng.NextFloat();
+				}
+				fx.bank.Append(row.data(), dims, &next);
+				++next;
+			}
+			fx.bank.Remove(next > appended ? appended - 1 : 0);
+		}
+	});
+	for (int32_t iter = 0; iter < 200; ++iter)
+	{
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		CHECK(n == baseN);
+		for (int32_t i = 0; i < n && i < baseN; ++i)
+		{
+			CHECK(hits[i].index == baseHits[i].index && hits[i].score == baseHits[i].score);
+		}
+	}
+	stop.store(true, std::memory_order_relaxed);
+	writer.join();
+}
+
+// T-V3-A6 (D-V3-8 (b)) -- full storm: a channel-SCOPED REDUCTION over a HELD snapshot is
+// stable under concurrent append/remove (result == the serial baseline). RED until slot 4
+// (the reduction stubs before producing a value). TSan-clean is the CI property.
+static void TestChannelScopedReductionStorm()
+{
+	Rng rng(0x570A22ull);
+	const int32_t dims = 64;
+	const int32_t capacity = 512;
+	const int32_t appended = 200;
+
+	ScratchChannelFixture fx;
+	MakeChannelScratchBank(fx, rng, appended, dims, Metric::Cosine, Quantization::Int8,
+		capacity);
+	if (fx.createStatus != Status::Ok)
+	{
+		return;
+	}
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
+	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	std::vector<int32_t> rows(static_cast<size_t>(appended));
+	for (int32_t i = 0; i < appended; ++i)
+	{
+		rows[static_cast<size_t>(i)] = i;
+	}
+
+	AlignedBuf csBase(static_cast<size_t>(snap.paddedDims));
+	float baseline = 0.0f;
+	const Status sBase = SpreadCrossDeviceChannel(snap, rows.data(), appended, tombs.data(),
+		Reduce::Mean, 0, csBase.I8(), &baseline);
+	CHECK_MSG(sBase == Status::Ok,
+		"channel-scoped reduction storm baseline failed (unimplemented, slot 4): status=%d",
+		static_cast<int>(sBase));
+	if (sBase != Status::Ok)
+	{
+		return; // red-unimplemented: no baseline to hold the storm against
+	}
+
+	std::atomic<bool> stop{false};
+	std::thread writer([&]() {
+		Rng wrng(0x888ull);
+		int32_t next = appended;
+		std::vector<float> row(dims);
+		while (!stop.load(std::memory_order_relaxed))
+		{
+			if (next < capacity)
+			{
+				for (auto& v : row)
+				{
+					v = wrng.NextFloat();
+				}
+				fx.bank.Append(row.data(), dims, &next);
+				++next;
+			}
+			fx.bank.Remove(next > appended ? appended - 1 : 0);
+		}
+	});
+	for (int32_t iter = 0; iter < 200; ++iter)
+	{
+		AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+		float v = 0.0f;
+		CHECK(SpreadCrossDeviceChannel(snap, rows.data(), appended, tombs.data(), Reduce::Mean,
+				  0, cs.I8(), &v) == Status::Ok);
+		CHECK(v == baseline); // the held snapshot is stable under concurrent writes
+	}
+	stop.store(true, std::memory_order_relaxed);
+	writer.join();
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -9662,6 +10418,12 @@ int main()
 	TestScratchChannelPersistenceVersioning();
 	TestScratchChannelPersistenceReservedBit();
 	TestScratchChannelPerChannelRecall();
+	TestChannelScopedAnalyticsRefFeat();
+	TestChannelScopedAnalyticsDeterminism();
+	TestChannelScopedAnalyticsComposition();
+	TestChannelScopedAnalyticsRejections();
+	TestChannelQueryOnlyStorm();
+	TestChannelScopedReductionStorm();
 	TestPinDrainLitmus();
 	TestPerRowBias();
 	TestWorkspaceReuseAcrossShapes();
