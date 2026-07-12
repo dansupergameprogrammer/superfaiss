@@ -12,6 +12,7 @@ add_library(superfaiss STATIC
 	src/bake.cpp
 	src/query.cpp
 	src/compose.cpp
+	src/analytics.cpp
 	src/pca.cpp
 	src/scratch.cpp
 )

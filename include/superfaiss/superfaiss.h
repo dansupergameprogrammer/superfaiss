@@ -12,5 +12,6 @@
 #include "bake.h"
 #include "query.h"
 #include "compose.h"
+#include "analytics.h"
 #include "pca.h"
 #include "scratch.h"

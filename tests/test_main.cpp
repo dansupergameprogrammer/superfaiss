@@ -6567,6 +6567,599 @@ static void TestXdcIntersect()
 		recallN > 0 ? recallSum / recallN : 1.0, recallN);
 }
 
+// ---------------------------------------------------------------------------
+// T-V2.5 — bank analytics + probing tooling (plan section 22)
+
+namespace an
+{
+	// Independent scalar recode of ScoreXdPair from the section 22.4 contract (REF).
+	inline float RefPair(const int8_t* a8, double as, int64_t asq, const int8_t* b8,
+		double bs, int64_t bsq, int32_t pd, Metric m)
+	{
+		int64_t cross = 0;
+		for (int32_t i = 0; i < pd; ++i)
+		{
+			cross += static_cast<int64_t>(a8[i]) * b8[i];
+		}
+		double d;
+		if (m == Metric::L2)
+		{
+			const double x = (as * as) * static_cast<double>(asq);
+			const double y = (bs * bs) * static_cast<double>(bsq);
+			const double z = ((as * bs) * static_cast<double>(cross)) * 2.0;
+			d = (x + y) - z;
+		}
+		else if (m == Metric::Cosine)
+		{
+			d = 1.0 - static_cast<double>(cross) /
+				std::sqrt(static_cast<double>(asq) * static_cast<double>(bsq));
+		}
+		else
+		{
+			d = static_cast<double>(cross) * (as * bs);
+		}
+		const double lim = 1.1754943508222875e-38;
+		return (d < lim && d > -lim) ? 0.0f : static_cast<float>(d);
+	}
+
+	inline void Hash(uint64_t& h, float v)
+	{
+		uint32_t b;
+		std::memcpy(&b, &v, 4);
+		h = (h ^ b) * 0x100000001B3ull;
+	}
+
+	// Dequantize an int8 bank row element to double (per-device float reference).
+	inline double Dq(const BankView& bank, int32_t r, int32_t i)
+	{
+		const int8_t* row =
+			static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(r) * bank.paddedDims;
+		return pool::DecodeScale(bank.scales[r]) * static_cast<double>(row[i]);
+	}
+
+	// float64 nearest-neighbour distance from vector s to target bank, in the metric's
+	// distance sense (the FEAT reference, independent of the operator).
+	inline double RefNearest(const std::vector<double>& s, const BankView& t)
+	{
+		double sSq = 0.0;
+		for (double v : s)
+		{
+			sSq += v * v;
+		}
+		double best = 0.0;
+		bool have = false;
+		for (int32_t r = 0; r < t.count; ++r)
+		{
+			double cross = 0.0;
+			double rSq = 0.0;
+			for (int32_t i = 0; i < t.dims; ++i)
+			{
+				const double rv = Dq(t, r, i);
+				cross += s[static_cast<size_t>(i)] * rv;
+				rSq += rv * rv;
+			}
+			double dist;
+			if (t.metric == Metric::L2)
+			{
+				dist = (sSq + rSq) - 2.0 * cross;
+			}
+			else if (t.metric == Metric::Cosine)
+			{
+				dist = 1.0 - cross / std::sqrt(sSq * rSq);
+			}
+			else
+			{
+				dist = cross; // dot similarity
+			}
+			const bool nearer =
+				!have || (t.metric == Metric::Dot ? dist > best : dist < best);
+			if (nearer)
+			{
+				best = dist;
+				have = true;
+			}
+		}
+		return best;
+	}
+
+	// The analytics battery under the CURRENT dispatch: representative operator scalars
+	// over the committed fixtures, hashed. Path-sensitive through DotI8I8 / QueryXdBatch.
+	inline uint64_t Battery(Workspace& ws)
+	{
+		xd::FixBank a(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+			xdfix::kBankADims, Metric::Dot);
+		xd::FixBank b(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+			xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+		xd::FixBank c(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+			xdfix::kBankCDims, Metric::L2);
+		xd::FixBank d(xdfix::kBankDRows, xdfix::kBankDScaleBits, xdfix::kBankDCount,
+			xdfix::kBankDDims, Metric::Dot); // adversarial tiny scale
+		xd::FixBank e(xdfix::kBankERows, xdfix::kBankEScaleBits, xdfix::kBankECount,
+			xdfix::kBankEDims, Metric::L2); // adversarial tiny scale
+		const BankView* banks[5] = {&a.view, &b.view, &c.view, &d.view, &e.view};
+		const Metric mets[5] = {Metric::Dot, Metric::Cosine, Metric::L2, Metric::Dot, Metric::L2};
+
+		const int32_t i1[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t i2[6] = {2, 7, 12, 20, 25, 31};
+		uint64_t h = 0xcbf29ce484222325ull;
+
+		// ScoreXdPair + CentroidDistance over each bank (dot/cosine/L2 + the tiny-scale
+		// adversarial floor cases on D/E; cosine sqrt path on B).
+		for (int32_t k = 0; k < 5; ++k)
+		{
+			const BankView& bank = *banks[k];
+			const int32_t pd = bank.paddedDims;
+			AlignedBuf cA(static_cast<size_t>(pd));
+			AlignedBuf cB(static_cast<size_t>(pd));
+			double sA = 0.0;
+			double sB = 0.0;
+			int64_t qA = 0;
+			int64_t qB = 0;
+			if (MakeCentroidCrossDevice(bank, i1, 6, nullptr, nullptr, cA.I8(), &sA, &qA) !=
+					Status::Ok ||
+				MakeCentroidCrossDevice(bank, i2, 6, nullptr, nullptr, cB.I8(), &sB, &qB) !=
+					Status::Ok)
+			{
+				continue;
+			}
+			const XdQuery pa{cA.I8(), sA, qA};
+			const XdQuery pb{cB.I8(), sB, qB};
+			float sc = 0.0f;
+			ScoreXdPair(pa, pb, pd, mets[k], &sc);
+			Hash(h, sc);
+			AlignedBuf dA(static_cast<size_t>(pd));
+			AlignedBuf dB(static_cast<size_t>(pd));
+			float cd = 0.0f;
+			CentroidDistanceCrossDevice(bank, i1, 6, nullptr, nullptr, bank, i2, 6, nullptr,
+				nullptr, mets[k], dA.I8(), dB.I8(), &cd);
+			Hash(h, cd);
+			// Spread (mean + max) over the union selection.
+			const int32_t all[12] = {0, 2, 4, 7, 9, 12, 17, 20, 22, 25, 30, 31};
+			AlignedBuf cs(static_cast<size_t>(pd));
+			float sm = 0.0f;
+			float sx = 0.0f;
+			SpreadCrossDevice(bank, all, 12, nullptr, Reduce::Mean, cs.I8(), &sm);
+			SpreadCrossDevice(bank, all, 12, nullptr, Reduce::Max, cs.I8(), &sx);
+			Hash(h, sm);
+			Hash(h, sx);
+		}
+
+		// NN divergence between two same-dims L2 banks (C and E are both 32-dim L2).
+		std::vector<XdQuery> qbuf(static_cast<size_t>(c.view.count));
+		std::vector<Hit> hbuf(static_cast<size_t>(c.view.count));
+		std::vector<int32_t> nbuf(static_cast<size_t>(c.view.count));
+		float mn = 0.0f;
+		float mx = 0.0f;
+		MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &mn);
+		MaxNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &mx);
+		Hash(h, mn);
+		Hash(h, mx);
+		return h;
+	}
+} // namespace an
+
+static void TestBankAnalytics()
+{
+	std::printf("bank analytics (T-V2.5): pair score, set distance, NN divergence, spread\n");
+	xd::FixBank a(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank b(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+		xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+	xd::FixBank c(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+	const BankView* banks[3] = {&a.view, &b.view, &c.view};
+	const Metric mets[3] = {Metric::Dot, Metric::Cosine, Metric::L2};
+	const char* names[3] = {"dot", "cosine", "L2"};
+	const int32_t i1[6] = {0, 4, 9, 17, 22, 30};
+	const int32_t i2[6] = {2, 7, 12, 20, 25, 31};
+	Workspace ws;
+
+	// --- T-V2.5-1 REF: ScoreXdPair == independent recode; CentroidDistance == the pair ---
+	for (int32_t k = 0; k < 3; ++k)
+	{
+		const BankView& bank = *banks[k];
+		const int32_t pd = bank.paddedDims;
+		AlignedBuf cA(static_cast<size_t>(pd));
+		AlignedBuf cB(static_cast<size_t>(pd));
+		double sA = 0.0;
+		double sB = 0.0;
+		int64_t qA = 0;
+		int64_t qB = 0;
+		CHECK(MakeCentroidCrossDevice(bank, i1, 6, nullptr, nullptr, cA.I8(), &sA, &qA) ==
+			Status::Ok);
+		CHECK(MakeCentroidCrossDevice(bank, i2, 6, nullptr, nullptr, cB.I8(), &sB, &qB) ==
+			Status::Ok);
+		const XdQuery pa{cA.I8(), sA, qA};
+		const XdQuery pb{cB.I8(), sB, qB};
+		float sc = 0.0f;
+		CHECK(ScoreXdPair(pa, pb, pd, mets[k], &sc) == Status::Ok);
+		const float ref = an::RefPair(cA.I8(), sA, qA, cB.I8(), sB, qB, pd, mets[k]);
+		CHECK_MSG(sc == ref, "%s pair %.9g != ref %.9g", names[k], sc, ref);
+
+		AlignedBuf dA(static_cast<size_t>(pd));
+		AlignedBuf dB(static_cast<size_t>(pd));
+		float cd = 0.0f;
+		CHECK(CentroidDistanceCrossDevice(bank, i1, 6, nullptr, nullptr, bank, i2, 6, nullptr,
+			nullptr, mets[k], dA.I8(), dB.I8(), &cd) == Status::Ok);
+		CHECK_MSG(cd == ref, "%s centroid-distance %.9g != pair %.9g", names[k], cd, ref);
+	}
+
+	// --- T-V2.5-3 FEAT: operators recover the right statistic vs a float64 reference ---
+	for (int32_t k = 0; k < 3; ++k)
+	{
+		const BankView& bank = *banks[k];
+		// CentroidDistance FEAT: float64 centroid distance (centroid requant tolerated).
+		std::vector<double> cf1(static_cast<size_t>(bank.dims));
+		std::vector<double> cf2(static_cast<size_t>(bank.dims));
+		pool::RefPoolF64(bank, i1, 6, nullptr, cf1.data());
+		pool::RefPoolF64(bank, i2, 6, nullptr, cf2.data());
+		double cross = 0.0;
+		double n1 = 0.0;
+		double n2 = 0.0;
+		for (int32_t i = 0; i < bank.dims; ++i)
+		{
+			cross += cf1[static_cast<size_t>(i)] * cf2[static_cast<size_t>(i)];
+			n1 += cf1[static_cast<size_t>(i)] * cf1[static_cast<size_t>(i)];
+			n2 += cf2[static_cast<size_t>(i)] * cf2[static_cast<size_t>(i)];
+		}
+		double fref;
+		if (mets[k] == Metric::L2)
+		{
+			fref = (n1 + n2) - 2.0 * cross;
+		}
+		else if (mets[k] == Metric::Cosine)
+		{
+			fref = 1.0 - cross / std::sqrt(n1 * n2);
+		}
+		else
+		{
+			fref = cross;
+		}
+		const int32_t pd = bank.paddedDims;
+		AlignedBuf dA(static_cast<size_t>(pd));
+		AlignedBuf dB(static_cast<size_t>(pd));
+		float cd = 0.0f;
+		CentroidDistanceCrossDevice(bank, i1, 6, nullptr, nullptr, bank, i2, 6, nullptr,
+			nullptr, mets[k], dA.I8(), dB.I8(), &cd);
+		const double tol = 0.3 * std::fabs(fref) + 0.05;
+		CHECK_MSG(std::fabs(static_cast<double>(cd) - fref) <= tol,
+			"%s centroid-distance FEAT: op %.6g float64 %.6g tol %.3g", names[k],
+			static_cast<double>(cd), fref, tol);
+		std::printf("  T-V2.5-3 %s centroid-distance FEAT: op %.6g float64 %.6g\n", names[k],
+			static_cast<double>(cd), fref);
+	}
+
+	// MeanNN / MaxNN FEAT over the two L2 32-dim banks (C source, E target).
+	{
+		xd::FixBank e(xdfix::kBankERows, xdfix::kBankEScaleBits, xdfix::kBankECount,
+			xdfix::kBankEDims, Metric::L2);
+		std::vector<XdQuery> qbuf(static_cast<size_t>(c.view.count));
+		std::vector<Hit> hbuf(static_cast<size_t>(c.view.count));
+		std::vector<int32_t> nbuf(static_cast<size_t>(c.view.count));
+		float mn = 0.0f;
+		float mx = 0.0f;
+		CHECK(MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &mn) == Status::Ok);
+		CHECK(MaxNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &mx) == Status::Ok);
+		double sum = 0.0;
+		double refMax = 0.0;
+		bool have = false;
+		for (int32_t r = 0; r < c.view.count; ++r)
+		{
+			std::vector<double> s(static_cast<size_t>(c.view.dims));
+			for (int32_t i = 0; i < c.view.dims; ++i)
+			{
+				s[static_cast<size_t>(i)] = an::Dq(c.view, r, i);
+			}
+			const double nn = an::RefNearest(s, e.view);
+			sum += nn;
+			if (!have || nn > refMax)
+			{
+				refMax = nn;
+			}
+			have = true;
+		}
+		const double refMean = sum / static_cast<double>(c.view.count);
+		const double tolM = 0.1 * std::fabs(refMean) + 1e-4;
+		const double tolX = 0.1 * std::fabs(refMax) + 1e-4;
+		CHECK_MSG(std::fabs(static_cast<double>(mn) - refMean) <= tolM,
+			"mean-NN FEAT op %.6g float64 %.6g", static_cast<double>(mn), refMean);
+		CHECK_MSG(std::fabs(static_cast<double>(mx) - refMax) <= tolX,
+			"max-NN FEAT op %.6g float64 %.6g", static_cast<double>(mx), refMax);
+		std::printf("  T-V2.5-3 mean-NN FEAT: op %.6g float64 %.6g; max-NN op %.6g float64 %.6g\n",
+			static_cast<double>(mn), refMean, static_cast<double>(mx), refMax);
+	}
+
+	// --- T-V2.5-4 shape/platform extremes + the ceiling (W1) ---
+	{
+		// One-row L2 bank: spread is exactly 0. The single-row centroid is bit-identical to
+		// the row only when the row's max magnitude is already +-127 (else pooling rescales
+		// it to full int8 range); this row is constructed that way so the case is exact.
+		alignas(16) const int8_t oneRow[16] = {127, -100, 64, 0, 33, -127, 20, 10, 80, -40, 60, 0, 30, -20, 10, 0};
+		const uint32_t oneScale[1] = {0x3f800000u}; // 1.0f
+		xd::FixBank one(oneRow, oneScale, 1, 16, Metric::L2);
+		const int32_t r0[1] = {0};
+		AlignedBuf cs(static_cast<size_t>(one.view.paddedDims));
+		float sp = -1.0f;
+		CHECK(SpreadCrossDevice(one.view, r0, 1, nullptr, Reduce::Mean, cs.I8(), &sp) ==
+			Status::Ok);
+		CHECK_MSG(sp == 0.0f, "one-row L2 spread %.9g != 0", sp);
+
+		// Ceiling: two all-127 int8 vectors at kMaxCrossDeviceDims - crossDot stays under
+		// 2^31 (W1). Score succeeds and matches the REF; a -128 operand would overflow.
+		const int32_t pd = kMaxCrossDeviceDims;
+		AlignedBuf ia(static_cast<size_t>(pd));
+		AlignedBuf ib(static_cast<size_t>(pd));
+		std::memset(ia.I8(), 127, static_cast<size_t>(pd));
+		std::memset(ib.I8(), 127, static_cast<size_t>(pd));
+		const int64_t sq = static_cast<int64_t>(pd) * 127 * 127;
+		const XdQuery ca{ia.I8(), 1.0, sq};
+		const XdQuery cb{ib.I8(), 1.0, sq};
+		float sc = 0.0f;
+		CHECK(ScoreXdPair(ca, cb, pd, Metric::Dot, &sc) == Status::Ok);
+		const float ref = an::RefPair(ia.I8(), 1.0, sq, ib.I8(), 1.0, sq, pd, Metric::Dot);
+		CHECK_MSG(sc == ref, "ceiling pair %.9g != ref %.9g", sc, ref);
+		CHECK(sq < (int64_t{1} << 31)); // the bound the score rode
+	}
+
+	// --- T-V2.5-5 rejection catalog (DEF) ---
+	{
+		const int32_t pd = a.view.paddedDims;
+		AlignedBuf img(static_cast<size_t>(pd));
+		std::memset(img.I8(), 3, static_cast<size_t>(pd));
+		const int64_t sq = detail::DotI8I8(img.I8(), img.I8(), pd);
+		const XdQuery good{img.I8(), 1.0, sq};
+		float out = 0.0f;
+		// over-cap dims
+		CHECK(ScoreXdPair(good, good, kMaxCrossDeviceDims + 1, Metric::Dot, &out) ==
+			Status::InvalidArgument);
+		// desynced payload (self-dot wrong)
+		const XdQuery desync{img.I8(), 1.0, sq + 1};
+		CHECK(ScoreXdPair(desync, good, pd, Metric::Dot, &out) == Status::InvalidArgument);
+		// non-finite scale
+		const XdQuery nanScale{img.I8(), std::nan(""), sq};
+		CHECK(ScoreXdPair(nanScale, good, pd, Metric::Dot, &out) == Status::InvalidArgument);
+		// zero self-dot cosine member
+		AlignedBuf zero(static_cast<size_t>(pd));
+		std::memset(zero.I8(), 0, static_cast<size_t>(pd));
+		const XdQuery z{zero.I8(), 1.0, 0};
+		CHECK(ScoreXdPair(z, good, pd, Metric::Cosine, &out) == Status::ZeroNormQuery);
+
+		// f32 bank rejection at the operator boundary.
+		AlignedBuf cbuf(static_cast<size_t>(pd));
+		BankView f32bank = a.view;
+		f32bank.quant = Quantization::Float32;
+		const int32_t idx[2] = {0, 1};
+		float cd = 0.0f;
+		AlignedBuf d2(static_cast<size_t>(pd));
+		CHECK(CentroidDistanceCrossDevice(f32bank, idx, 2, nullptr, nullptr, a.view, idx, 2,
+			nullptr, nullptr, Metric::Dot, cbuf.I8(), d2.I8(), &cd) == Status::InvalidArgument);
+		// dims mismatch A(48) vs C(32)
+		CHECK(CentroidDistanceCrossDevice(a.view, idx, 2, nullptr, nullptr, c.view, idx, 2,
+			nullptr, nullptr, Metric::Dot, cbuf.I8(), d2.I8(), &cd) == Status::InvalidArgument);
+		// empty source: MeanNN with every source row excluded.
+		std::vector<uint32_t> allEx(static_cast<size_t>((a.view.count + 31) / 32), 0xffffffffu);
+		std::vector<XdQuery> qbuf(static_cast<size_t>(a.view.count));
+		std::vector<Hit> hbuf(static_cast<size_t>(a.view.count));
+		std::vector<int32_t> nbuf(static_cast<size_t>(a.view.count));
+		float mn = 0.0f;
+		CHECK(MeanNNCrossDevice(a.view, allEx.data(), a.view, nullptr, qbuf.data(),
+			hbuf.data(), nbuf.data(), ws, &mn) == Status::InvalidArgument);
+	}
+
+	// --- T-V2.5-6 determinism: repeat bit-identity + fixed-order mean ---
+	{
+		xd::FixBank e(xdfix::kBankERows, xdfix::kBankEScaleBits, xdfix::kBankECount,
+			xdfix::kBankEDims, Metric::L2);
+		std::vector<XdQuery> qbuf(static_cast<size_t>(c.view.count));
+		std::vector<Hit> hbuf(static_cast<size_t>(c.view.count));
+		std::vector<int32_t> nbuf(static_cast<size_t>(c.view.count));
+		float m1 = 0.0f;
+		float m2 = 0.0f;
+		CHECK(MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &m1) == Status::Ok);
+		CHECK(MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), ws, &m2) == Status::Ok);
+		CHECK(m1 == m2); // repeat bit-identical
+		// The mean is the fixed-order (ascending source index) sum of per-row NN distances.
+		double acc = 0.0;
+		for (int32_t i = 0; i < c.view.count; ++i)
+		{
+			acc += static_cast<double>(hbuf[static_cast<size_t>(i)].score);
+		}
+		const double lim = 1.1754943508222875e-38;
+		double mref = acc / static_cast<double>(c.view.count);
+		const float mrefF = (mref < lim && mref > -lim) ? 0.0f : static_cast<float>(mref);
+		CHECK_MSG(m1 == mrefF, "fixed-order mean %.9g != recode %.9g", m1, mrefF);
+	}
+
+	// --- T-V2.5-7 carried contracts: weighted==unweighted, exclusion==subset, alloc flat ---
+	{
+		const int32_t pd = c.view.paddedDims;
+		const int32_t idx[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t eqW[6] = {5, 5, 5, 5, 5, 5};
+		AlignedBuf uA(static_cast<size_t>(pd));
+		AlignedBuf uB(static_cast<size_t>(pd));
+		AlignedBuf wA(static_cast<size_t>(pd));
+		AlignedBuf wB(static_cast<size_t>(pd));
+		float du = 0.0f;
+		float dw = 0.0f;
+		CHECK(CentroidDistanceCrossDevice(c.view, idx, 6, nullptr, nullptr, c.view, i2, 6,
+			nullptr, nullptr, Metric::L2, uA.I8(), uB.I8(), &du) == Status::Ok);
+		CHECK(CentroidDistanceCrossDevice(c.view, idx, 6, eqW, nullptr, c.view, i2, 6, eqW,
+			nullptr, Metric::L2, wA.I8(), wB.I8(), &dw) == Status::Ok);
+		CHECK_MSG(du == dw, "weighted %.9g != unweighted %.9g", dw, du);
+
+		// exclusion == subset: pooling [0,1,2,3] with rows 1,2 excluded == pooling [0,3].
+		const int32_t four[4] = {0, 1, 2, 3};
+		const int32_t two[2] = {0, 3};
+		std::vector<uint32_t> ex(static_cast<size_t>((c.view.count + 31) / 32), 0);
+		ex[0] = (1u << 1) | (1u << 2);
+		AlignedBuf eA(static_cast<size_t>(pd));
+		AlignedBuf eB(static_cast<size_t>(pd));
+		AlignedBuf sA(static_cast<size_t>(pd));
+		AlignedBuf sB(static_cast<size_t>(pd));
+		float de = 0.0f;
+		float ds = 0.0f;
+		CHECK(CentroidDistanceCrossDevice(c.view, four, 4, nullptr, ex.data(), c.view, i2, 6,
+			nullptr, nullptr, Metric::L2, eA.I8(), eB.I8(), &de) == Status::Ok);
+		CHECK(CentroidDistanceCrossDevice(c.view, two, 2, nullptr, nullptr, c.view, i2, 6,
+			nullptr, nullptr, Metric::L2, sA.I8(), sB.I8(), &ds) == Status::Ok);
+		CHECK_MSG(de == ds, "exclusion %.9g != subset %.9g", de, ds);
+
+		// Allocation flat (dim 1): a warm workspace does not grow across analytics calls of
+		// DIFFERING source counts. Prime on the larger source (C, 48 rows), then run the
+		// smaller (E, 32 rows) and a repeat under the global allocation counter.
+		xd::FixBank e(xdfix::kBankERows, xdfix::kBankEScaleBits, xdfix::kBankECount,
+			xdfix::kBankEDims, Metric::L2);
+		Workspace warm;
+		std::vector<XdQuery> qbuf(static_cast<size_t>(c.view.count));
+		std::vector<Hit> hbuf(static_cast<size_t>(c.view.count));
+		std::vector<int32_t> nbuf(static_cast<size_t>(c.view.count));
+		float m = 0.0f;
+		CHECK(MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), warm, &m) == Status::Ok);
+		const uint64_t before = AllocationCount();
+		CHECK(MeanNNCrossDevice(e.view, nullptr, c.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), warm, &m) == Status::Ok); // smaller source count
+		CHECK(MaxNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+			nbuf.data(), warm, &m) == Status::Ok);
+		CHECK_MSG(AllocationCount() == before, "warm analytics workspace grew: %llu -> %llu",
+			static_cast<unsigned long long>(before),
+			static_cast<unsigned long long>(AllocationCount()));
+	}
+
+	// --- T-V2.5-2 forced-path sweep + golden hash (GOLD) ---
+	{
+		std::vector<SimdPath> paths;
+		paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+		paths.push_back(SimdPath::SSE);
+		if (ActiveSimdPath() == SimdPath::AVX2)
+		{
+			paths.push_back(SimdPath::AVX2);
+		}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+		paths.push_back(SimdPath::NEON);
+#endif
+		uint64_t hashes[4] = {};
+		for (size_t i = 0; i < paths.size(); ++i)
+		{
+			detail::ForceXdSimdPath(paths[i]);
+			hashes[i] = an::Battery(ws);
+			detail::ClearForcedXdSimdPath();
+			if (i > 0)
+			{
+				CHECK_MSG(hashes[i] == hashes[0], "analytics forced path %d hash %llx != %llx",
+					static_cast<int>(paths[i]),
+					static_cast<unsigned long long>(hashes[i]),
+					static_cast<unsigned long long>(hashes[0]));
+			}
+		}
+		const uint64_t def = an::Battery(ws);
+		CHECK(def == hashes[0]);
+		std::printf("analytics cross-device hash: %016llx (%d forced paths agree)\n",
+			static_cast<unsigned long long>(def), static_cast<int>(paths.size()));
+		if constexpr (xdfix::kGoldenAnalyticsXdHash != 0)
+		{
+			CHECK_MSG(def == xdfix::kGoldenAnalyticsXdHash,
+				"analytics hash %016llx != pinned golden %016llx",
+				static_cast<unsigned long long>(def),
+				static_cast<unsigned long long>(xdfix::kGoldenAnalyticsXdHash));
+		}
+	}
+}
+
+static void TestProjectionReport()
+{
+	std::printf("projection report (T-V2.5-A): projections + separation (Feature A, offline)\n");
+	xd::FixBank a(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	const int32_t pd = a.view.paddedDims;
+
+	// A probe direction: normalize(row0 - row1) via MakeDirection.
+	AlignedBuf p0(static_cast<size_t>(pd) * sizeof(float));
+	AlignedBuf p1(static_cast<size_t>(pd) * sizeof(float));
+	for (int32_t i = 0; i < pd; ++i)
+	{
+		p0.F32()[i] = static_cast<float>(an::Dq(a.view, 0, i));
+		p1.F32()[i] = static_cast<float>(an::Dq(a.view, 1, i));
+	}
+	AlignedBuf dir(static_cast<size_t>(pd) * sizeof(float));
+	CHECK(MakeDirection(p0.F32(), p1.F32(), a.view.dims, pd, dir.F32()) == Status::Ok);
+
+	// A1 — projection == double dot of the dequantized row onto the unit direction.
+	std::vector<float> proj(static_cast<size_t>(a.view.count));
+	CHECK(ProjectionReport(a.view, dir.F32(), nullptr, proj.data(), nullptr) == Status::Ok);
+	for (int32_t r = 0; r < a.view.count; ++r)
+	{
+		double ref = 0.0;
+		for (int32_t i = 0; i < pd; ++i)
+		{
+			ref += an::Dq(a.view, r, i) * static_cast<double>(dir.F32()[i]);
+		}
+		CHECK_MSG(std::fabs(static_cast<double>(proj[static_cast<size_t>(r)]) - ref) <=
+				1e-4 * (std::fabs(ref) + 1.0),
+			"row %d projection %.6g ref %.6g", r, proj[static_cast<size_t>(r)], ref);
+	}
+
+	// A2 — separation: a known-separating axis clears the bar; a non-separating one does not.
+	// Build a synthetic 2-group bank: group A rows carry +value on dim 0, group B -value.
+	{
+		const int32_t n = 8;
+		const int32_t dims = 16;
+		alignas(16) int8_t rows[8 * 16] = {};
+		uint32_t scaleBits[8];
+		const uint32_t one = 0x3f800000u; // 1.0f
+		// dim 0 separates the groups with real within-group spread (nonzero pooled sd);
+		// dim 2 carries the SAME distribution in both groups (no group signal).
+		const int8_t sepAxis[8] = {100, 90, 110, 95, -100, -90, -110, -95};
+		const int8_t noAxis[8] = {40, -40, 40, -40, 40, -40, 40, -40};
+		for (int32_t r = 0; r < n; ++r)
+		{
+			scaleBits[r] = one;
+			rows[r * dims + 0] = sepAxis[r]; // separating axis = dim 0
+			rows[r * dims + 2] = noAxis[r];  // non-separating axis = dim 2
+		}
+		xd::FixBank g(rows, scaleBits, n, dims, Metric::Dot);
+		const int32_t gpd = g.view.paddedDims;
+		AlignedBuf sepDir(static_cast<size_t>(gpd) * sizeof(float));
+		AlignedBuf noDir(static_cast<size_t>(gpd) * sizeof(float));
+		std::memset(sepDir.F32(), 0, static_cast<size_t>(gpd) * sizeof(float));
+		std::memset(noDir.F32(), 0, static_cast<size_t>(gpd) * sizeof(float));
+		sepDir.F32()[0] = 1.0f; // aligned with the separating axis
+		noDir.F32()[2] = 1.0f;  // an axis with no group signal
+		std::vector<uint32_t> grp(1, 0x0000000fu); // rows 0..3 = group A
+		std::vector<float> gp(static_cast<size_t>(n));
+		float sepD = 0.0f;
+		float noD = 0.0f;
+		CHECK(ProjectionReport(g.view, sepDir.F32(), grp.data(), gp.data(), &sepD) ==
+			Status::Ok);
+		CHECK(ProjectionReport(g.view, noDir.F32(), grp.data(), gp.data(), &noD) == Status::Ok);
+		CHECK_MSG(std::fabs(sepD) >= 2.0f, "separating axis d=%.3f below bar", sepD);
+		CHECK_MSG(std::fabs(noD) <= 0.5f, "non-separating axis d=%.3f above bar", noD);
+		std::printf("  T-V2.5-A2 separation: separating d=%.3f, non-separating d=%.3f\n", sepD,
+			noD);
+	}
+
+	// A3 — rejections.
+	{
+		std::vector<float> proj2(static_cast<size_t>(a.view.count));
+		AlignedBuf zeroDir(static_cast<size_t>(pd) * sizeof(float));
+		std::memset(zeroDir.F32(), 0, static_cast<size_t>(pd) * sizeof(float));
+		CHECK(ProjectionReport(a.view, zeroDir.F32(), nullptr, proj2.data(), nullptr) ==
+			Status::ZeroNormQuery);
+		AlignedBuf nanDir(static_cast<size_t>(pd) * sizeof(float));
+		std::memset(nanDir.F32(), 0, static_cast<size_t>(pd) * sizeof(float));
+		nanDir.F32()[0] = std::nanf("");
+		CHECK(ProjectionReport(a.view, nanDir.F32(), nullptr, proj2.data(), nullptr) ==
+			Status::InvalidArgument);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -6608,6 +7201,8 @@ int main()
 	TestXdcBiasSparse();
 	TestXdcSegments();
 	TestXdcIntersect();
+	TestBankAnalytics();
+	TestProjectionReport();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
