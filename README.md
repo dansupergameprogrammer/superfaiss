@@ -151,6 +151,17 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   measured 0.9930 / 0.9885 / 0.9895 (Dot / Cosine / L2 — 200 seeded 8-row pools
   over the suite's 512×128 int8 fixtures, fixed recorded seed) at first
   calibration; measure per bank before adopting, as with any quantized mode.
+- **Bank analytics (v2.5).** Cross-device deterministic reductions over int8 banks:
+  a set-to-set centroid distance (drift over checkpoints is that operator between two
+  checkpoints' row sets), directed nearest-neighbour set divergence (mean, and the
+  order-free max that is the Hausdorff component), and within-bank dispersion — all
+  resting on one query-vs-query pair score, all bit-identical across machines by the
+  same integer-accumulation proof as the query path. Plus an offline per-device
+  probe-direction projection report, with an optional group-separation statistic, for
+  authoring-time inspection. Caller-owned scratch, zero steady-state allocation; the
+  result-direction convention (a `Dot` bank returns a similarity, not a distance) and
+  the cosine limb's determinism condition are stated in [API.md](docs/API.md) and
+  [DETERMINISM.md §2e](docs/DETERMINISM.md).
 
 ## What it deliberately is not
 

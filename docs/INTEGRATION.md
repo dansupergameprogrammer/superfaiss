@@ -57,6 +57,17 @@ if your platform has a C++17 toolchain, the library compiles.
   message), re-stage the image into aligned memory before handing it to
   `QueryXd`/`QueryXdBatch` — copying preserves the bytes, and the executed query
   is bit-for-bit the stored payload.
+- **Analytics scratch (v2.5) is caller-staged, zero steady-state allocation.** The
+  reduction operators take caller buffers sized in [API.md](API.md#analyticsh--bank-analytics-v25):
+  `paddedDims`-byte int8 buffers for centroid-distance and spread, and
+  `source.count ×` (`XdQuery` + `Hit` + `int32`) plus a `k = 1` `Workspace` for the
+  nearest-neighbour divergences — pool the workspace like any query. Run them over a
+  `ScratchBank` by taking a `Snapshot()` first; the operators score the snapshot's row
+  set and accept its tombstone words as `excludeBits`. The cosine pair adds one runtime
+  `sqrt` — the fast-math prohibition in §1 is what keeps it cross-device-exact, and the
+  mirror-equality tripwire catches a toolchain that breaks it. `ProjectionReport` is
+  per-device float, offline authoring/inspection only — outside the cross-device
+  contract.
 
 ## 3. Threading seam
 

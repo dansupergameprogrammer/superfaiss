@@ -271,6 +271,95 @@ an all-zero integer accumulator (antipodal members cancelling) is
 This operator is a versioned composition operator for embedding-space
 consumers (DETERMINISM.md §2d).
 
+## analytics.h — bank analytics (v2.5)
+
+Reductions over int8 `CrossDevice` banks: a set-to-set distance, directed
+nearest-neighbour divergence, within-bank dispersion, and the shared pair score they
+rest on — plus an offline per-device projection report. Cross-device determinism is one
+argument (integer accumulation + the fixed-order double epilogue, ascending-row-index
+mean / order-free max); the full contract is [DETERMINISM.md](DETERMINISM.md) §2e.
+
+```cpp
+Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metric metric,
+                   float* outScore);                                   // the pair score all others rest on
+
+Status CentroidDistanceCrossDevice(                                   // set-to-set; drift = this between two checkpoints
+    const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
+    const int32_t* weightsA, const uint32_t* excludeBitsA,
+    const BankView& bankB, const int32_t* rowIndicesB, int32_t rowCountB,
+    const int32_t* weightsB, const uint32_t* excludeBitsB,
+    Metric metric, int8_t* centroidScratchA, int8_t* centroidScratchB, float* outDistance);
+
+Status MeanNNCrossDevice(                                             // directed mean nearest-neighbour divergence (A->B)
+    const BankView& source, const uint32_t* sourceExcludeBits,
+    const BankView& target, const uint32_t* targetExcludeBits,
+    XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace& ws, float* outValue);
+
+Status MaxNNCrossDevice(...);                                         // same batch, order-free max (directed Hausdorff component)
+
+Status SpreadCrossDevice(                                            // within-bank dispersion vs the selection's own centroid
+    const BankView& bank, const int32_t* rowIndices, int32_t rowCount,
+    const uint32_t* excludeBits, Reduce reduce, int8_t* centroidScratch, float* outValue);
+
+enum class Reduce : uint8_t { Mean = 0, Max = 1 };                    // divergence/spread reduction
+
+Status ProjectionReport(const BankView& bank, const float* paddedDirection,           // OFFLINE, per-device float
+                        const uint32_t* groupBits, float* outProjections, float* outSeparation);
+```
+
+**Result direction — read this before ordering results.** The distance-named operators
+(`*Distance`, `divergence`, spread) return a **distance** for `Cosine`/`L2` but a
+**similarity** for `Dot`; the ordering flips with the metric:
+
+| Metric | The scalar these operators return | Ordering |
+|---|---|---|
+| `Dot` | a dot **similarity** (`a.scale · b.scale · crossDot`) | **larger = MORE similar** — NOT a distance; a `Dot` consumer reads it with that convention |
+| `Cosine` | `1 − crossDot / sqrt(a.sqSum · b.sqSum)`, in `[0, 2]` | larger = farther |
+| `L2` | squared Euclidean distance | larger = farther |
+
+The nearest-neighbour divergences score in the **target** bank's metric by the same
+table. `ProjectionReport` is a plain per-row dot projection (float), unaffected.
+
+**Scratch — caller-owned, zero steady-state allocation:**
+
+| Operator | Caller scratch |
+|---|---|
+| `ScoreXdPair` | none |
+| `CentroidDistanceCrossDevice` | two int8 buffers, `paddedDims` bytes each, 16-aligned |
+| `MeanNNCrossDevice` / `MaxNNCrossDevice` | `source.count ×` (`XdQuery` + `Hit` + `int32`) — `sizeof(XdQuery)+sizeof(Hit)+4` = 36 bytes/source-row on a 64-bit target — plus a `Workspace` reserved for `k = 1` |
+| `SpreadCrossDevice` | one int8 buffer, `paddedDims` bytes, 16-aligned |
+| `ProjectionReport` | `outProjections` = `bank.count` floats; `outSeparation` one float (optional, Cohen's-d over `groupBits`). **Per-device float, offline — outside the cross-device contract.** |
+
+**Checkpoint drift** — the centroid distance between two checkpoints' row sets:
+
+```cpp
+alignas(16) int8_t scratchA[256], scratchB[256];   // paddedDims = 256
+float drift = 0.f;
+Status s = CentroidDistanceCrossDevice(
+    bankT,  rowsT,  countT,  /*weights*/nullptr, /*exclude*/nullptr,
+    bankT1, rowsT1, countT1, nullptr,            nullptr,
+    Metric::Cosine, scratchA, scratchB, &drift);
+// Ok -> drift is a Cosine distance in [0,2]; larger = the checkpoints' centroids moved apart.
+// Bit-identical on any machine given identical bytes (DETERMINISM.md §2e).
+```
+
+**Directed set divergence** — A against B, in B's metric:
+
+```cpp
+std::vector<XdQuery> q(A.count); std::vector<Hit> h(A.count); std::vector<int32_t> c(A.count);
+Workspace ws; ws.Reserve(/*k*/1, /*batchWidth*/1);   // 36 * A.count scratch bytes + a k=1 warm Workspace
+float div = 0.f;
+Status s = MeanNNCrossDevice(A, /*srcExclude*/nullptr, B, /*tgtExclude*/nullptr,
+                             q.data(), h.data(), c.data(), ws, &div);
+// Scored in TARGET B's metric (see the direction table). MaxNNCrossDevice is the
+// directed Hausdorff component (order-free max).
+```
+
+Rejections are explicit: an empty or fully-excluded selection is `InvalidArgument`; a
+zero-norm centroid (antipodal members cancelling) is `ZeroNormQuery`; a desynced
+`XdQuery` payload (scale/self-dot mismatch) is `InvalidArgument`. Over a mutable bank,
+take a `ScratchBank::Snapshot()` first and pass its tombstone words as the exclude bits.
+
 ## pca.h — inspection projections (v1.1)
 
 ```cpp
