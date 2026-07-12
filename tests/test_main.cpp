@@ -5990,6 +5990,583 @@ static void TestTrustBoundaryValidation()
 	}
 }
 
+// ===================================================================================
+// T-XDC — CrossDevice composition feature oracles (Test Design SS6A, amendment A9/A10).
+//
+// J-1 (Japp feature-oracle re-audit): the composed cross-device surface (per-row bias
+// dense+sparse, segments, intersect) was proven only by the golden battery hash + batch
+// == singles — consistency oracles. A wrong-but-deterministic composition epilogue
+// passes them. These suites add the missing FEATURE ORACLES:
+//   REF  — a reference recoded from the API/DETERMINISM contract (NOT from kernels.cpp),
+//          bit-exact to the kernel's composed score at full k. The primary,
+//          wrong-but-deterministic catch. Required green.
+//   FEAT — recall@10 of the composed query's top-k vs an INDEPENDENT double brute-force
+//          of the SAME composition over the dequantized rows. The neighbour-recovery
+//          honesty number; reported here (red-uncalibrated per SS4 until a calibration
+//          event pins its floor), not asserted.
+// Forge temper 2026-07-11: W1 (bias is the double-domain floored add), W3 (segments —
+// exact-match channel rule, bit-decode, segment order, single floor), S2 (sparse bias
+// tested at k<count to exercise the k+P re-selection).
+namespace xdc
+{
+	// --- primitives recoded from DETERMINISM.md SS2c (independent of kernels.cpp) ---
+
+	// DAZ-proof decode of an IEEE float bit pattern to double: subnormals as
+	// sign*mant*2^-149, normals a plain cast. The SS2c float-input decode.
+	inline double BitsToDouble(float f)
+	{
+		uint32_t b;
+		std::memcpy(&b, &f, 4);
+		if ((b & 0x7f800000u) != 0)
+		{
+			return static_cast<double>(f);
+		}
+		const double m = static_cast<double>(static_cast<int32_t>(b & 0x7fffffu)) *
+			1.4012984643248171e-45; // 2^-149
+		return (b >> 31) != 0 ? -m : m;
+	}
+
+	// The subnormal floor: |x| < FLT_MIN -> exactly 0.0f, else the single cast (SS2c).
+	inline float Floor(double d)
+	{
+		const double lim = 1.1754943508222875e-38;
+		if (d < lim && d > -lim)
+		{
+			return 0.0f;
+		}
+		return static_cast<float>(d);
+	}
+
+	// W1: bias composition recoded from contract — one fused add, UNCONDITIONAL (the
+	// reward's sign is the caller's value; the reference does NOT branch on metric),
+	// applied to the floored unbiased score in the double domain, then re-floored.
+	inline float ComposeBias(float unbiased, float bias)
+	{
+		return Floor(static_cast<double>(unbiased) + BitsToDouble(bias));
+	}
+
+	// W3: segmented CrossDevice row score, recoded from the contract. One contribution
+	// per segment in ascending order (the kernel builds one range per segment; it does
+	// NOT split a segment across channels). Per segment: the dot/L2 double epilogue over
+	// [offset,length); then the per-channel inverse sub-norm ONLY when the segment's
+	// offset AND length exactly match a channel (a spanning/partial segment gets none);
+	// then the weight. Weights and inv-norms bit-decoded. Accumulate in double; the
+	// caller floors the total once. Weight-0 segments are omitted (discarded like a gap).
+	inline double SegmentedRowD(const BankView& bank, const int8_t* q8, double qScale,
+		const QuerySegment* segs, int32_t segCount, int32_t r)
+	{
+		const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * bank.paddedDims;
+		const double rowScale = BitsToDouble(bank.scales[r]);
+		const bool isL2 = bank.metric == Metric::L2;
+		const bool perChannel =
+			bank.metric == Metric::Cosine && bank.channelInvNorms != nullptr;
+		double total = 0.0;
+		for (int32_t s = 0; s < segCount; ++s)
+		{
+			const QuerySegment& seg = segs[s];
+			if (seg.weight == 0.0f)
+			{
+				continue; // weight-0 omitted, contributes nothing (SS2c)
+			}
+			double partial;
+			if (isL2)
+			{
+				int64_t cross = 0, rowSq = 0, qSq = 0;
+				for (int32_t i = 0; i < seg.length; ++i)
+				{
+					const int32_t o = seg.offset + i;
+					cross += static_cast<int64_t>(row[o]) * q8[o];
+					rowSq += static_cast<int64_t>(row[o]) * row[o];
+					qSq += static_cast<int64_t>(q8[o]) * q8[o];
+				}
+				const double a = (qScale * qScale) * static_cast<double>(qSq);
+				const double b = (rowScale * rowScale) * static_cast<double>(rowSq);
+				const double c = ((rowScale * qScale) * static_cast<double>(cross)) * 2.0;
+				partial = (a + b) - c;
+			}
+			else
+			{
+				int64_t acc = 0;
+				for (int32_t i = 0; i < seg.length; ++i)
+				{
+					const int32_t o = seg.offset + i;
+					acc += static_cast<int64_t>(row[o]) * q8[o];
+				}
+				partial = static_cast<double>(acc) * (rowScale * qScale);
+			}
+			if (perChannel)
+			{
+				for (int32_t c = 0; c < bank.channelCount; ++c)
+				{
+					if (bank.channels[c].offset == seg.offset &&
+						bank.channels[c].length == seg.length)
+					{
+						partial *= BitsToDouble(bank.channelInvNorms[
+							static_cast<int64_t>(r) * bank.channelCount + c]);
+						break;
+					}
+				}
+			}
+			total += BitsToDouble(seg.weight) * partial;
+		}
+		return total;
+	}
+
+	inline bool ScoreBitsEqual(float a, float b)
+	{
+		uint32_t ab, bb;
+		std::memcpy(&ab, &a, 4);
+		std::memcpy(&bb, &b, 4);
+		return ab == bb;
+	}
+
+	// Quantize the fixture query `q` for bank `bank` into q8/scale/sq (the exact bytes
+	// the kernel scores, so REF bit-equality is a statement about the kernel, not the
+	// quantizer).
+	struct QQ
+	{
+		AlignedBuf q8;
+		AlignedBuf qf;
+		double scale = 0.0;
+		int64_t sq = 0;
+		QQ(const BankView& bank, int32_t query)
+			: q8(static_cast<size_t>(bank.paddedDims)),
+			  qf(static_cast<size_t>(bank.paddedDims) * sizeof(float))
+		{
+			xd::LoadQuery(query, bank.paddedDims, qf.F32());
+			QuantizeQueryXd(qf.F32(), bank.paddedDims, q8.I8(), &scale, &sq);
+		}
+	};
+
+	// Independent double whole-row score over the DEQUANTIZED int8 rows (the vectors the
+	// bank represents) against the FLOAT query — the FEAT ground truth. Composition is
+	// applied in double by the caller. best-first index order returned via sort.
+	inline double DequantWholeRowD(const BankView& bank, const float* qf, int32_t r)
+	{
+		const int8_t* row = static_cast<const int8_t*>(bank.rows) +
+			static_cast<int64_t>(r) * bank.paddedDims;
+		const double rowScale = BitsToDouble(bank.scales[r]);
+		double score = 0.0;
+		if (bank.metric == Metric::L2)
+		{
+			for (int32_t i = 0; i < bank.dims; ++i)
+			{
+				const double d = static_cast<double>(qf[i]) - row[i] * rowScale;
+				score += d * d;
+			}
+		}
+		else
+		{
+			for (int32_t i = 0; i < bank.dims; ++i)
+			{
+				score += static_cast<double>(qf[i]) * (row[i] * rowScale);
+			}
+		}
+		return score;
+	}
+
+	// recall@10 of the XD hit list (first 10 indices) against a double top-10 built from
+	// per-row double scores. metric sets the sort direction.
+	inline double Recall10(const Hit* hits, int32_t n,
+		const std::vector<double>& scoreByIndex, Metric metric)
+	{
+		const int32_t count = static_cast<int32_t>(scoreByIndex.size());
+		std::vector<int32_t> idx(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i)
+		{
+			idx[static_cast<size_t>(i)] = i;
+		}
+		std::sort(idx.begin(), idx.end(), [&](int32_t a, int32_t b) {
+			const double sa = scoreByIndex[static_cast<size_t>(a)];
+			const double sb = scoreByIndex[static_cast<size_t>(b)];
+			if (sa != sb)
+			{
+				return metric == Metric::L2 ? sa < sb : sa > sb;
+			}
+			return a < b;
+		});
+		const int32_t top = n < 10 ? n : 10;
+		int32_t match = 0;
+		for (int32_t i = 0; i < top; ++i)
+		{
+			for (int32_t j = 0; j < top; ++j)
+			{
+				if (hits[i].index == idx[static_cast<size_t>(j)])
+				{
+					++match;
+					break;
+				}
+			}
+		}
+		return top > 0 ? static_cast<double>(match) / top : 1.0;
+	}
+} // namespace xdc
+
+// T-XDC-1 — CrossDevice x per-row bias (dense), Query. REF bit-exact + FEAT recall.
+static void TestXdcBiasDense()
+{
+	Workspace ws;
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+	const xd::FixBank* banks[2] = {&bankA, &bankC};
+
+	double recallSum = 0.0;
+	int32_t recallN = 0;
+	for (const xd::FixBank* bp : banks)
+	{
+		const BankView& bank = bp->view;
+		const bool isL2 = bank.metric == Metric::L2;
+		std::vector<float> dense(static_cast<size_t>(bank.count));
+		for (int32_t r = 0; r < bank.count; ++r)
+		{
+			// Mix of ordinary, subnormal, and FLT_MIN bias — the DAZ-proof decode is
+			// part of the surface. On L2 a reward is NEGATIVE (lower is better), N2.
+			const uint32_t bits = (r % 4 == 0) ? 0x00000007u                   // subnormal
+				: (r % 4 == 1) ? (isL2 ? 0xbc23d70au : 0x3c23d70au)            // -/+0.01
+				: (r % 4 == 2) ? 0x00800000u                                   // FLT_MIN
+				: (isL2 ? 0xbd4ccccdu : 0x3d4ccccdu);                          // -/+0.05
+			std::memcpy(&dense[static_cast<size_t>(r)], &bits, 4);
+		}
+		RowBias rb;
+		rb.dense = dense.data();
+
+		for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+		{
+			xdc::QQ qq(bank, q);
+			std::vector<Hit> hits(static_cast<size_t>(bank.count));
+			int32_t n = 0;
+			QueryParams p;
+			p.exactness = Exactness::CrossDevice;
+			p.k = bank.count;
+			p.bias = &rb;
+			CHECK(Query(bank, qq.qf.F32(), p, ws, hits.data(), &n) == Status::Ok);
+			CHECK(n == bank.count);
+
+			// REF: every row's kernel score bit-equals the contract reference.
+			for (int32_t i = 0; i < n; ++i)
+			{
+				const int32_t idx = hits[static_cast<size_t>(i)].index;
+				const float want = xdc::ComposeBias(
+					xd::RefXdScore(bank, qq.q8.I8(), qq.scale, qq.sq, idx),
+					dense[static_cast<size_t>(idx)]);
+				CHECK_MSG(xdc::ScoreBitsEqual(want, hits[static_cast<size_t>(i)].score),
+					"T-XDC-1 bias score mismatch (metric %d row %d)",
+					static_cast<int>(bank.metric), idx);
+			}
+
+			// FEAT: recall@10 vs the double biased brute-force (reported).
+			std::vector<double> sc(static_cast<size_t>(bank.count));
+			for (int32_t r = 0; r < bank.count; ++r)
+			{
+				sc[static_cast<size_t>(r)] = xdc::DequantWholeRowD(bank, qq.qf.F32(), r) +
+					xdc::BitsToDouble(dense[static_cast<size_t>(r)]);
+			}
+			recallSum += xdc::Recall10(hits.data(), n, sc, bank.metric);
+			++recallN;
+		}
+	}
+	std::printf("  T-XDC-1 dense-bias FEAT recall@10 (uncalibrated): %.3f (n=%d)\n",
+		recallN > 0 ? recallSum / recallN : 1.0, recallN);
+}
+
+// T-XDC-2 — CrossDevice x per-row bias (sparse), the k+P re-selection path (J-4/S2).
+static void TestXdcBiasSparse()
+{
+	Workspace ws;
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	const BankView& bank = bankA.view;
+
+	for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+	{
+		xdc::QQ qq(bank, q);
+		const BiasPair pairs[2] = {{5, 0.25f}, {40, -0.5f}};
+		RowBias rb;
+		rb.pairs = pairs;
+		rb.pairCount = 2;
+		auto pairBias = [&](int32_t idx) -> float {
+			for (int32_t p = 0; p < rb.pairCount; ++p)
+			{
+				if (pairs[p].index == idx)
+				{
+					return pairs[p].bias;
+				}
+			}
+			return 0.0f;
+		};
+
+		// Pass (a): full k = count — every composed score bit-exact.
+		{
+			std::vector<Hit> hits(static_cast<size_t>(bank.count));
+			int32_t n = 0;
+			QueryParams p;
+			p.exactness = Exactness::CrossDevice;
+			p.k = bank.count;
+			p.bias = &rb;
+			CHECK(Query(bank, qq.qf.F32(), p, ws, hits.data(), &n) == Status::Ok);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				const int32_t idx = hits[static_cast<size_t>(i)].index;
+				const float base = xd::RefXdScore(bank, qq.q8.I8(), qq.scale, qq.sq, idx);
+				const float want = pairBias(idx) != 0.0f
+					? xdc::ComposeBias(base, pairBias(idx)) : base;
+				CHECK_MSG(xdc::ScoreBitsEqual(want, hits[static_cast<size_t>(i)].score),
+					"T-XDC-2(a) sparse score mismatch (row %d)", idx);
+			}
+		}
+
+		// Pass (b): k < count, a lift crossing the k boundary — the ONLY pass that
+		// exercises SelectWithSparseBias's scanK = k + pairCount re-selection.
+		{
+			const int32_t kSmall = 8;
+			// Unbiased ranking to place the lift/evict deterministically.
+			std::vector<Hit> base(static_cast<size_t>(bank.count));
+			int32_t bn = 0;
+			QueryParams pu;
+			pu.exactness = Exactness::CrossDevice;
+			pu.k = bank.count;
+			CHECK(Query(bank, qq.qf.F32(), pu, ws, base.data(), &bn) == Status::Ok);
+			const int32_t lift = base[static_cast<size_t>(kSmall)].index;    // first out
+			const int32_t evict = base[static_cast<size_t>(kSmall - 1)].index; // last in
+			// Reward large enough to carry the lifted row to the very top (scaled to the
+			// top score so the boost survives float ULP at this magnitude): its composed
+			// score clears base[0], so it enters and the old boundary row (evict) drops
+			// out of the top-k.
+			const float reward = (base[0].score - base[static_cast<size_t>(kSmall)].score) +
+				std::fabs(base[0].score) * 0.5f + 1.0f;
+			const BiasPair lp[1] = {{lift, reward}};
+			RowBias lb;
+			lb.pairs = lp;
+			lb.pairCount = 1;
+
+			std::vector<Hit> got(static_cast<size_t>(kSmall));
+			int32_t gn = 0;
+			QueryParams pb;
+			pb.exactness = Exactness::CrossDevice;
+			pb.k = kSmall;
+			pb.bias = &lb;
+			CHECK(Query(bank, qq.qf.F32(), pb, ws, got.data(), &gn) == Status::Ok);
+			CHECK(gn == kSmall);
+
+			// Independent reference: score all rows composed, sort (better score, then
+			// ascending index), take top kSmall.
+			std::vector<std::pair<float, int32_t>> ref(static_cast<size_t>(bank.count));
+			for (int32_t r = 0; r < bank.count; ++r)
+			{
+				float s = xd::RefXdScore(bank, qq.q8.I8(), qq.scale, qq.sq, r);
+				if (r == lift)
+				{
+					s = xdc::ComposeBias(s, reward);
+				}
+				ref[static_cast<size_t>(r)] = {s, r};
+			}
+			std::sort(ref.begin(), ref.end(), [](const std::pair<float, int32_t>& a,
+				const std::pair<float, int32_t>& b) {
+				if (a.first != b.first)
+				{
+					return a.first > b.first; // Dot: higher is better
+				}
+				return a.second < b.second;
+			});
+			for (int32_t i = 0; i < kSmall; ++i)
+			{
+				CHECK_MSG(got[static_cast<size_t>(i)].index == ref[static_cast<size_t>(i)].second,
+					"T-XDC-2(b) re-selection order mismatch at %d: got %d want %d",
+					i, got[static_cast<size_t>(i)].index, ref[static_cast<size_t>(i)].second);
+				CHECK(xdc::ScoreBitsEqual(got[static_cast<size_t>(i)].score,
+					ref[static_cast<size_t>(i)].first));
+			}
+			// The membership change is asserted, not just the scores.
+			bool liftIn = false, evictIn = false;
+			for (int32_t i = 0; i < kSmall; ++i)
+			{
+				liftIn = liftIn || got[static_cast<size_t>(i)].index == lift;
+				evictIn = evictIn || got[static_cast<size_t>(i)].index == evict;
+			}
+			CHECK_MSG(liftIn, "T-XDC-2(b) lifted row %d not in top-k", lift);
+			CHECK_MSG(!evictIn, "T-XDC-2(b) evicted row %d still in top-k", evict);
+		}
+	}
+}
+
+// T-XDC-3 — CrossDevice x segments (whole-row weighted + channel cosine), Query.
+static void TestXdcSegments()
+{
+	Workspace ws;
+	xd::FixBank bankB(xdfix::kBankBRows, xdfix::kBankBScaleBits, xdfix::kBankBCount,
+		xdfix::kBankBDims, Metric::Cosine, xdfix::kBankBChannels);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+
+	// bankB: channel-matched segments (exact-match inv-norm), a weight-0 (mask), and a
+	// segment SPANNING two channels (W3: no inv-norm applies — MatchChannel misses).
+	const QuerySegment segsB[3] = {
+		{bankB.view.channels[0].offset, bankB.view.channels[0].length, 1.5f},
+		{bankB.view.channels[1].offset, bankB.view.channels[1].length, 0.0f}, // masked
+		{bankB.view.channels[2].offset,
+			bankB.view.channels[2].length + bankB.view.channels[3].length, -0.75f}, // spans 2+3
+	};
+	// bankC (L2, non-channel): the expanded-epilogue segmented path.
+	const QuerySegment segsC[2] = {{0, 16, 1.0f}, {16, 16, 2.0f}};
+
+	struct Case { const xd::FixBank* bank; const QuerySegment* segs; int32_t segCount; };
+	const Case cases[2] = {{&bankB, segsB, 3}, {&bankC, segsC, 2}};
+
+	double recallSum = 0.0;
+	int32_t recallN = 0;
+	for (const Case& cs : cases)
+	{
+		const BankView& bank = cs.bank->view;
+		for (int32_t q = 0; q < xdfix::kQueryCount; ++q)
+		{
+			xdc::QQ qq(bank, q);
+			std::vector<Hit> hits(static_cast<size_t>(bank.count));
+			int32_t n = 0;
+			QueryParams p;
+			p.exactness = Exactness::CrossDevice;
+			p.k = bank.count;
+			p.segments = cs.segs;
+			p.segmentCount = cs.segCount;
+			CHECK(Query(bank, qq.qf.F32(), p, ws, hits.data(), &n) == Status::Ok);
+			CHECK(n == bank.count);
+
+			// REF: the per-segment double combine (W3), floored once, bit-equals.
+			for (int32_t i = 0; i < n; ++i)
+			{
+				const int32_t idx = hits[static_cast<size_t>(i)].index;
+				const float want = xdc::Floor(
+					xdc::SegmentedRowD(bank, qq.q8.I8(), qq.scale, cs.segs, cs.segCount, idx));
+				CHECK_MSG(xdc::ScoreBitsEqual(want, hits[static_cast<size_t>(i)].score),
+					"T-XDC-3 segmented score mismatch (metric %d row %d)",
+					static_cast<int>(bank.metric), idx);
+			}
+
+			// FEAT: recall@10 vs a double segmented brute-force over dequant rows.
+			std::vector<double> sc(static_cast<size_t>(bank.count));
+			for (int32_t r = 0; r < bank.count; ++r)
+			{
+				sc[static_cast<size_t>(r)] =
+					xdc::SegmentedRowD(bank, qq.q8.I8(), qq.scale, cs.segs, cs.segCount, r);
+			}
+			recallSum += xdc::Recall10(hits.data(), n, sc, bank.metric);
+			++recallN;
+		}
+	}
+	std::printf("  T-XDC-3 segmented FEAT recall@10 (uncalibrated): %.3f (n=%d)\n",
+		recallN > 0 ? recallSum / recallN : 1.0, recallN);
+}
+
+// T-XDC-4 — CrossDevice x intersect (worst-of fusion), QueryIntersect.
+static void TestXdcIntersect()
+{
+	Workspace ws;
+	xd::FixBank bankA(xdfix::kBankARows, xdfix::kBankAScaleBits, xdfix::kBankACount,
+		xdfix::kBankADims, Metric::Dot);
+	xd::FixBank bankC(xdfix::kBankCRows, xdfix::kBankCScaleBits, xdfix::kBankCCount,
+		xdfix::kBankCDims, Metric::L2);
+	const xd::FixBank* banks[2] = {&bankA, &bankC};
+
+	const int32_t members = 3;
+	double recallSum = 0.0;
+	int32_t recallN = 0;
+	for (const xd::FixBank* bp : banks)
+	{
+		const BankView& bank = bp->view;
+		const bool isL2 = bank.metric == Metric::L2;
+		// Three distinct member queries laid out contiguously.
+		AlignedBuf batch(static_cast<size_t>(members) * bank.paddedDims * sizeof(float));
+		for (int32_t m = 0; m < members; ++m)
+		{
+			xd::LoadQuery(m % xdfix::kQueryCount, bank.paddedDims,
+				batch.F32() + static_cast<int64_t>(m) * bank.paddedDims);
+		}
+		// Per-member quantized payloads for the reference — one contiguous aligned
+		// buffer (each member offset m*paddedDims stays 16-aligned; AlignedBuf is not
+		// movable, so a vector of them is out).
+		AlignedBuf mq8(static_cast<size_t>(members) * bank.paddedDims);
+		std::vector<double> mScale(static_cast<size_t>(members));
+		std::vector<int64_t> mSq(static_cast<size_t>(members));
+		for (int32_t m = 0; m < members; ++m)
+		{
+			QuantizeQueryXd(batch.F32() + static_cast<int64_t>(m) * bank.paddedDims,
+				bank.paddedDims, mq8.I8() + static_cast<int64_t>(m) * bank.paddedDims,
+				&mScale[static_cast<size_t>(m)], &mSq[static_cast<size_t>(m)]);
+		}
+
+		std::vector<Hit> hits(static_cast<size_t>(bank.count));
+		int32_t n = 0;
+		QueryParams p;
+		p.exactness = Exactness::CrossDevice;
+		p.k = bank.count;
+		CHECK(QueryIntersect(bank, batch.F32(), members, p, ws, hits.data(), &n) == Status::Ok);
+		CHECK(n == bank.count);
+
+		// REF: each row's WORST fused score across members (L2 -> max, else -> min),
+		// bit-exact — each member score is the proven whole-row contract reference.
+		auto worstOf = [&](int32_t r) -> float {
+			float fused = 0.0f;
+			for (int32_t m = 0; m < members; ++m)
+			{
+				const float s = xd::RefXdScore(bank,
+					mq8.I8() + static_cast<int64_t>(m) * bank.paddedDims,
+					mScale[static_cast<size_t>(m)], mSq[static_cast<size_t>(m)], r);
+				if (m == 0 || (isL2 ? s > fused : s < fused))
+				{
+					fused = s;
+				}
+			}
+			return fused;
+		};
+		for (int32_t i = 0; i < n; ++i)
+		{
+			const int32_t idx = hits[static_cast<size_t>(i)].index;
+			CHECK_MSG(xdc::ScoreBitsEqual(worstOf(idx), hits[static_cast<size_t>(i)].score),
+				"T-XDC-4 intersect score mismatch (metric %d row %d)",
+				static_cast<int>(bank.metric), idx);
+		}
+
+		// queryCount == 1 degenerates to Query, bit-identically (INV, restated).
+		{
+			std::vector<Hit> one(static_cast<size_t>(bank.count));
+			std::vector<Hit> single(static_cast<size_t>(bank.count));
+			int32_t n1 = 0, ns = 0;
+			CHECK(QueryIntersect(bank, batch.F32(), 1, p, ws, one.data(), &n1) == Status::Ok);
+			CHECK(Query(bank, batch.F32(), p, ws, single.data(), &ns) == Status::Ok);
+			CHECK(n1 == ns);
+			for (int32_t i = 0; i < n1; ++i)
+			{
+				CHECK(one[static_cast<size_t>(i)].index == single[static_cast<size_t>(i)].index &&
+					xdc::ScoreBitsEqual(one[static_cast<size_t>(i)].score,
+						single[static_cast<size_t>(i)].score));
+			}
+		}
+
+		// FEAT: recall@10 vs a double worst-of over dequant rows (reported).
+		std::vector<double> sc(static_cast<size_t>(bank.count));
+		for (int32_t r = 0; r < bank.count; ++r)
+		{
+			double fused = 0.0;
+			for (int32_t m = 0; m < members; ++m)
+			{
+				const double s = xdc::DequantWholeRowD(bank,
+					batch.F32() + static_cast<int64_t>(m) * bank.paddedDims, r);
+				if (m == 0 || (isL2 ? s > fused : s < fused))
+				{
+					fused = s;
+				}
+			}
+			sc[static_cast<size_t>(r)] = fused;
+		}
+		recallSum += xdc::Recall10(hits.data(), n, sc, bank.metric);
+		++recallN;
+	}
+	std::printf("  T-XDC-4 intersect FEAT recall@10 (uncalibrated): %.3f (n=%d)\n",
+		recallN > 0 ? recallSum / recallN : 1.0, recallN);
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -6027,6 +6604,10 @@ int main()
 	TestPoolXdSweep();
 	TestPoolXdBatch();
 	TestPoolRecallAndContracts();
+	TestXdcBiasDense();
+	TestXdcBiasSparse();
+	TestXdcSegments();
+	TestXdcIntersect();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
