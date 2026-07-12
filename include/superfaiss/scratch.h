@@ -345,6 +345,16 @@ private:
 	// The recall sweep proper — assumes the arena is stable (caller holds the reader pin
 	// or the writer guard). Const: it only reads rows, retained floats, and tombstones.
 	Status MeasureRecallLocked(uint64_t seed, Workspace& ws, ScratchRecallReport* out) const;
+	// The per-channel recall sweep (V3.0): as MeasureRecallLocked but the self-query and
+	// the reference scan are both restricted to `channel`'s element sub-range.
+	Status MeasureRecallLockedChannel(
+		uint64_t seed, Workspace& ws, const ChannelInfo& channel, ScratchRecallReport* out) const;
+	// Compaction shared by the channel-aware Freeze paths: copies live rows/scales into the
+	// caller buffers, fills outIndexMap (old->new, -1 for tombstoned), and re-derives the
+	// per-channel inverse sub-norms over the compacted rows. Assumes a validated Cosine
+	// channel bank and that the caller holds the writer guard.
+	Status FreezeChannelsLocked(
+		void* outRows, float* outScales, int32_t* outIndexMap, float* outChannelInvNorms) const;
 
 	Allocator Allocator_ = DefaultAllocator();
 	uint8_t* Arena_ = nullptr;

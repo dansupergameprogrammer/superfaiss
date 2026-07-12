@@ -109,9 +109,19 @@ namespace
 
 	constexpr uint32_t kScratchMagic = 0x42535346u; // "FSSB" little-endian
 	// V2.3 bumped 1 -> 2: a retention-carrying blob writes 2, a non-retention blob
-	// still writes 1, and this reader accepts both. Version 0 or > 2 is a hard reject.
+	// still writes 1, and this reader accepts both. Version 0 or > 3 is a hard reject.
 	constexpr uint32_t kScratchVersion = 2;
 	constexpr uint32_t kScratchVersionRetain = 2; // retained floats present in the blob
+	// V3.0 (plan section 23.6, Forge S1): retention is encoded AS the version integer
+	// (1=plain, 2=retention), so a linear bump cannot carry channels + retention together.
+	// Version 3 makes the presence-flags byte authoritative instead: a channels-carrying
+	// blob writes version 3 and sets reserved[0] as a flags byte (bit 0 retention, bit 1
+	// channels; bits 2-7 reserved, tolerated on read). A channel-LESS bank keeps writing
+	// the legacy 1/2 (byte-identical, old-reader-compatible); channels are what trigger v3.
+	constexpr uint32_t kScratchVersionChannels = 3;
+	constexpr size_t kScratchFlagsByteIndex = 0;    // flags live in reserved[0] (header offset 26)
+	constexpr uint8_t kScratchFlagRetention = 0x01; // reserved[0] bit 0
+	constexpr uint8_t kScratchFlagChannels = 0x02;  // reserved[0] bit 1
 	// Archive geometry ceiling (review M2): the largest row capacity a load will
 	// entertain. With paddedDims capped at kMaxCrossDeviceDims, every ArenaBytes
 	// term stays below 2^49 — far from int64 overflow.
@@ -692,46 +702,160 @@ Status ScratchBank::Freeze(void* outRows, float* outScales, int32_t* outIndexMap
 	return Status::Ok;
 }
 
-// SCAFFOLD (Curie, slot-3 red suite, plan section 23.9): the channel-aware Freeze
-// overload is declared in scratch.h so the slot-3 suite compiles and links against the
-// real interface the plan specifies (section 23.4), but its body -- compacting the live
-// rows AND re-deriving the per-channel inverse sub-norms over the surviving (compacted)
-// rows -- is not implemented here. It unconditionally returns BadAlignment, a status no
-// section 23.8 slot-3 cell expects (Ok on a valid channel Cosine bank; InvalidArgument on
-// a non-channel bank), so every test against this overload fails at a specific runtime
-// assertion for the one true reason -- channel-aware Freeze does not exist yet -- never at
-// compile or link time. Hastings replaces this body with the real implementation (section
-// 23.4); this comment is removed with it.
-Status ScratchBank::Freeze(void* /*outRows*/, float* /*outScales*/,
-	int32_t* /*outIndexMap*/, float* /*outChannelInvNorms*/,
-	ScratchRecallReport* /*outReport*/, Workspace* /*recallWs*/,
-	uint64_t /*recallSeed*/) const
+// Compaction shared by the channel-aware Freeze paths (V3.0, section 23.4). Copies the
+// live rows (and int8 scales) into the caller buffers exactly as the base Freeze does — a
+// pure byte copy, never a re-quantize (V3-G6 / T-V2-C2), so a frozen row is bit-identical
+// to the scratch row it graduated from — fills the old->new index map, then RE-DERIVES the
+// per-channel inverse sub-norms over the compacted rows into outChannelInvNorms (the
+// survivors renumbered, so the graduated bank's sub-norms follow them). Assumes a validated
+// Cosine channel bank and that the caller holds the writer guard.
+Status ScratchBank::FreezeChannelsLocked(
+	void* outRows, float* outScales, int32_t* outIndexMap, float* outChannelInvNorms) const
 {
-	return Status::BadAlignment;
+	const int32_t count = PublishedCount_.load(std::memory_order_relaxed);
+	const size_t rowBytes = static_cast<size_t>(PaddedDims_) * ElementSize(Quant_);
+	int32_t next = 0;
+	for (int32_t i = 0; i < count; ++i)
+	{
+		const bool dead =
+			(Tombstones_[i >> 5].load(std::memory_order_relaxed) & (1u << (i & 31))) != 0;
+		if (outIndexMap != nullptr)
+		{
+			outIndexMap[i] = dead ? -1 : next;
+		}
+		if (dead)
+		{
+			continue;
+		}
+		std::memcpy(static_cast<uint8_t*>(outRows) + static_cast<size_t>(next) * rowBytes,
+			static_cast<const uint8_t*>(Rows_) + static_cast<size_t>(i) * rowBytes, rowBytes);
+		if (Quant_ == Quantization::Int8)
+		{
+			outScales[next] = Scales_[i];
+		}
+		++next;
+	}
+
+	// Re-derive the sub-norms over the compacted survivors (bit-equal to
+	// ComputeChannelInverseNorms over the frozen BankView — the graduated bank is
+	// ground-truth-anchored, not a verbatim copy of the pre-compaction arena).
+	BankView frozen;
+	frozen.rows = outRows;
+	frozen.scales = Quant_ == Quantization::Int8 ? outScales : nullptr;
+	frozen.count = next;
+	frozen.dims = Dims_;
+	frozen.paddedDims = PaddedDims_;
+	frozen.quant = Quant_;
+	frozen.metric = Metric_;
+	frozen.channels = Channels_;
+	frozen.channelCount = ChannelCount_;
+	if (next == 0)
+	{
+		return Status::Ok; // zero live rows: a defined empty graduation, nothing to derive
+	}
+	return ComputeChannelInverseNorms(frozen, outChannelInvNorms);
 }
 
-// SCAFFOLD (Curie, slot-3 red suite, D-V3-7): the per-channel recall surfaces
-// (FreezeWithRecall + MeasureScratchRecallPerChannel) are declared in scratch.h so the
-// slot-3 recall suite compiles and links against the real interface (plan section 23.4
-// item b, section 23.9 slot-3 gate), but their bodies -- the seeded per-channel recall
-// sweep over each channel's sub-range, and the freeze-time per-channel re-measure -- are
-// not implemented. Both unconditionally return BadAlignment, a status no slot-3 cell
-// expects (Ok on a valid retention+channel Cosine bank; InvalidArgument on a
-// non-retention or non-channel bank), so every recall cell fails at a specific runtime
-// assertion for the one true reason. Hastings replaces both bodies with the real
-// implementation; these comments are removed with them.
-Status ScratchBank::FreezeWithRecall(void* /*outRows*/, float* /*outScales*/,
-	int32_t* /*outIndexMap*/, float* /*outChannelInvNorms*/,
-	ScratchRecallReport* /*outRecallReports*/, int32_t /*reportCount*/,
-	Workspace& /*recallWs*/, uint64_t /*recallSeed*/) const
+// Channel-aware Freeze (V3.0, section 23.4): base-Freeze compaction plus the re-derived
+// per-channel sub-norms. Valid only on a Cosine channel bank (InvalidArgument otherwise —
+// use the base Freeze). The optional outReport/recallWs re-measure the WHOLE-bank recall at
+// freeze time exactly as the base Freeze (per-channel re-measure is FreezeWithRecall).
+Status ScratchBank::Freeze(void* outRows, float* outScales, int32_t* outIndexMap,
+	float* outChannelInvNorms, ScratchRecallReport* outReport, Workspace* recallWs,
+	uint64_t recallSeed) const
 {
-	return Status::BadAlignment;
+	if (!IsCreated() || outRows == nullptr || outChannelInvNorms == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	if (ChannelCount_ <= 0 || Metric_ != Metric::Cosine)
+	{
+		return Status::InvalidArgument; // a non-channel / non-Cosine bank uses the base Freeze
+	}
+	if (Quant_ == Quantization::Int8 && outScales == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	WriterGuard guard(WriterBusy_);
+	if (outReport != nullptr && recallWs != nullptr && Retain_)
+	{
+		const Status measured = MeasureRecallLocked(recallSeed, *recallWs, outReport);
+		if (measured != Status::Ok)
+		{
+			return measured;
+		}
+	}
+	return FreezeChannelsLocked(outRows, outScales, outIndexMap, outChannelInvNorms);
 }
 
-Status ScratchBank::MeasureScratchRecallPerChannel(Workspace& /*workspace*/,
-	ScratchRecallReport* /*outReports*/, int32_t /*reportCount*/, uint64_t /*seed*/)
+// Channel-aware Freeze that also re-measures per-channel recall over the compacted rows
+// (V3.0, D-V3-7). Requires a retention-enabled Cosine channel bank (the float reference the
+// recall sweep scans). Each report is measured at the current generation — a fresh number
+// for the graduated bank, never a stale one.
+Status ScratchBank::FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap,
+	float* outChannelInvNorms, ScratchRecallReport* outRecallReports, int32_t reportCount,
+	Workspace& recallWs, uint64_t recallSeed) const
 {
-	return Status::BadAlignment;
+	if (!IsCreated() || outRows == nullptr || outChannelInvNorms == nullptr ||
+		outRecallReports == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	if (ChannelCount_ <= 0 || Metric_ != Metric::Cosine || !Retain_ ||
+		reportCount != ChannelCount_)
+	{
+		return Status::InvalidArgument;
+	}
+	if (Quant_ == Quantization::Int8 && outScales == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	WriterGuard guard(WriterBusy_);
+	// Measure per channel BEFORE compaction: the sweep excludes tombstones, so it already
+	// scores over exactly the live (about-to-be-compacted) rows, at the current generation.
+	for (int32_t c = 0; c < ChannelCount_; ++c)
+	{
+		const Status measured =
+			MeasureRecallLockedChannel(recallSeed, recallWs, Channels_[c], &outRecallReports[c]);
+		if (measured != Status::Ok)
+		{
+			return measured;
+		}
+	}
+	return FreezeChannelsLocked(outRows, outScales, outIndexMap, outChannelInvNorms);
+}
+
+// Per-channel recall (V3.0, D-V3-7): one seeded recall@k report per channel over its
+// sub-range. Requires a retention-enabled Cosine channel bank; InvalidArgument otherwise.
+Status ScratchBank::MeasureScratchRecallPerChannel(
+	Workspace& workspace, ScratchRecallReport* outReports, int32_t reportCount, uint64_t seed)
+{
+	if (!IsCreated() || outReports == nullptr)
+	{
+		return Status::InvalidArgument;
+	}
+	// Reject-over-degrade: no channel table (use the whole-vector routine) or no retained
+	// floats (no reference to scan) is a defined InvalidArgument, never a guessed number.
+	if (ChannelCount_ <= 0 || Metric_ != Metric::Cosine || !Retain_ ||
+		reportCount != ChannelCount_)
+	{
+		return Status::InvalidArgument;
+	}
+	while (!TryPinReader())
+	{
+		std::this_thread::yield();
+	}
+	Status status = Status::Ok;
+	for (int32_t c = 0; c < ChannelCount_; ++c)
+	{
+		status = MeasureRecallLockedChannel(seed, workspace, Channels_[c], &outReports[c]);
+		if (status != Status::Ok)
+		{
+			break;
+		}
+	}
+	UnpinReader();
+	return status;
 }
 
 Status ScratchBank::Save(const ScratchArchive& archive) const
@@ -743,9 +867,22 @@ Status ScratchBank::Save(const ScratchArchive& archive) const
 	WriterGuard guard(WriterBusy_);
 
 	ScratchHeader header;
-	// A retention bank writes version 2 and appends the retained floats; a plain bank
-	// still writes version 1 (byte-identical to a pre-V2.3 blob).
-	header.version = Retain_ ? kScratchVersionRetain : 1u;
+	// Writer version-selection (Forge S1 / Japp G-3): channels are what trigger the v3
+	// presence-flags format. A channel-carrying bank writes version 3 with the flags byte
+	// (retention bit + channels bit) authoritative and appends the channel table; a
+	// channel-LESS bank keeps the legacy encoding — version 2 with retained floats, else
+	// version 1 (byte-identical to a pre-V2.3 blob) — so old readers stay compatible.
+	const bool hasChannels = ChannelCount_ > 0;
+	if (hasChannels)
+	{
+		header.version = kScratchVersionChannels;
+		header.reserved[kScratchFlagsByteIndex] = static_cast<uint8_t>(
+			(Retain_ ? kScratchFlagRetention : 0u) | kScratchFlagChannels);
+	}
+	else
+	{
+		header.version = Retain_ ? kScratchVersionRetain : 1u;
+	}
 	header.capacity = Capacity_;
 	header.count = PublishedCount_.load(std::memory_order_relaxed);
 	header.dims = Dims_;
@@ -755,6 +892,20 @@ Status ScratchBank::Save(const ScratchArchive& archive) const
 	if (!archive.write(archive.user, &header, sizeof(header)))
 	{
 		return Status::BadFormat;
+	}
+	// The channel table (v3 only), written immediately after the header so Load can size
+	// the arena (which folds in the sub-norm region) before it reads the rows. The
+	// per-channel sub-norm arena itself is NOT serialized — it is re-derived on Load from
+	// {rows, channel table, scales} (Forge W3), which removes a desync surface.
+	if (hasChannels)
+	{
+		const int32_t channelCount = ChannelCount_;
+		if (!archive.write(archive.user, &channelCount, sizeof(channelCount)) ||
+			!archive.write(archive.user, Channels_,
+				static_cast<size_t>(channelCount) * sizeof(ChannelInfo)))
+		{
+			return Status::BadFormat;
+		}
 	}
 	const size_t rowBytes =
 		static_cast<size_t>(header.count) * PaddedDims_ * ElementSize(Quant_);
@@ -800,15 +951,33 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	{
 		return Status::BadFormat;
 	}
-	// V2.3 accepts the known set {1, 2}; version 0 or anything newer is the standing
-	// old-reader/new-data hard-reject. Version 2 carries retained floats; version 1
-	// loads with retention absent (defined).
+	// Accepts {1, 2, 3}; version 0 or anything newer is the standing old-reader/new-data
+	// hard-reject (a future v4 archive rejects here). Legacy 1/2 encode retention as the
+	// version integer; version 3 makes the flags byte authoritative.
 	if (header.magic != kScratchMagic ||
-		header.version < 1u || header.version > kScratchVersion)
+		header.version < 1u || header.version > kScratchVersionChannels)
 	{
 		return Status::BadFormat;
 	}
-	const bool wantRetain = header.version == kScratchVersionRetain;
+	// Version 3: retention and channel presence come from the reserved[0] flags byte, and
+	// bits 2-7 are reserved — masked off, tolerated (never rejected, never mis-read as
+	// retention or channels; Japp G-3 forward tolerance). Legacy 1/2 read retention from
+	// the version integer, exactly as shipped, and carry no channel table.
+	const uint8_t flags = header.reserved[kScratchFlagsByteIndex];
+	const bool hasChannels = header.version == kScratchVersionChannels &&
+		(flags & kScratchFlagChannels) != 0;
+	const bool wantRetain = header.version == kScratchVersionChannels
+		? (flags & kScratchFlagRetention) != 0
+		: header.version == kScratchVersionRetain;
+	// Version 3 is emitted ONLY for a channel-carrying bank (channels trigger the presence-
+	// flags format; a retention-only bank stays legacy v2). A v3 blob without the channels
+	// flag is therefore something the writer never produces — reject it as corrupt rather
+	// than adopt it as a plain bank. This also catches a legacy blob whose version integer
+	// was hand-bumped to 3 (its reserved bytes are zero, so the channels flag is clear).
+	if (header.version == kScratchVersionChannels && !hasChannels)
+	{
+		return Status::BadFormat;
+	}
 	const bool metricOk = header.metric <= static_cast<uint8_t>(Metric::L2);
 	const bool quantOk = header.quant <= static_cast<uint8_t>(Quantization::Int8);
 	if (!metricOk || !quantOk || header.capacity <= 0 || header.dims <= 0 ||
@@ -831,15 +1000,45 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 		return Status::BadFormat;
 	}
 
+	// The channel table (v3), read here — before the arena is created — so the channel
+	// Create sizes the sub-norm region into the single allocation. Bounded before use; the
+	// channel Create re-validates the geometry (the archive is untrusted).
+	ChannelInfo channels[kMaxChannels];
+	int32_t channelCount = 0;
+	if (hasChannels)
+	{
+		if (!archive.read(archive.user, &channelCount, sizeof(channelCount)))
+		{
+			return Status::BadFormat;
+		}
+		if (channelCount <= 0 || channelCount > kMaxChannels)
+		{
+			return Status::BadFormat;
+		}
+		if (!archive.read(archive.user, channels,
+				static_cast<size_t>(channelCount) * sizeof(ChannelInfo)))
+		{
+			return Status::BadFormat;
+		}
+	}
+
 	// Build the incoming state in a fresh bank so a bad archive leaves this one
-	// unchanged (reject-over-degrade).
+	// unchanged (reject-over-degrade). A channel archive is created channel-capable so its
+	// arena carries the (about-to-be-re-derived) sub-norm region.
 	ScratchBank incoming;
-	const Status created = incoming.Create(header.capacity, header.dims,
-		static_cast<Metric>(header.metric), static_cast<Quantization>(header.quant),
-		wantRetain, allocator);
+	const Status created = hasChannels
+		? incoming.Create(header.capacity, header.dims,
+			  static_cast<Metric>(header.metric), static_cast<Quantization>(header.quant),
+			  channels, channelCount, wantRetain, allocator)
+		: incoming.Create(header.capacity, header.dims,
+			  static_cast<Metric>(header.metric), static_cast<Quantization>(header.quant),
+			  wantRetain, allocator);
 	if (created != Status::Ok)
 	{
-		return created;
+		// A malformed channel table fails the channel Create's geometry validation; in an
+		// untrusted archive that is a format defect, not an argument error.
+		return (hasChannels && created == Status::InvalidArgument) ? Status::BadFormat
+																   : created;
 	}
 
 	const size_t rowBytes =
@@ -908,6 +1107,22 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 		return content;
 	}
 
+	// Re-derive the per-channel sub-norm arena on Load (Forge W3): recompute it from the
+	// loaded rows + channel table rather than trust a serialized copy, so a desynced arena
+	// cannot load as authoritative. The channel Create above sized the region into
+	// incoming's arena; ComputeChannelInverseNorms fills it exactly as Append did.
+	if (hasChannels && incoming.Metric_ == Metric::Cosine)
+	{
+		BankView cview = view;
+		cview.channels = incoming.Channels_;
+		cview.channelCount = incoming.ChannelCount_;
+		const Status subNorm = ComputeChannelInverseNorms(cview, incoming.ChannelInvNorms_);
+		if (subNorm != Status::Ok)
+		{
+			return subNorm;
+		}
+	}
+
 	// Validated: adopt the incoming arena wholesale (its region pointers included —
 	// re-binding would re-zero the tombstones just loaded). Exclusive by contract,
 	// so the swap is not observed mid-flight.
@@ -932,6 +1147,12 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	Metric_ = incoming.Metric_;
 	Quant_ = incoming.Quant_;
 	Retain_ = incoming.Retain_;
+	ChannelCount_ = incoming.ChannelCount_;
+	for (int32_t c = 0; c < incoming.ChannelCount_; ++c)
+	{
+		Channels_[c] = incoming.Channels_[c];
+	}
+	ChannelInvNorms_ = incoming.ChannelInvNorms_; // points into the adopted arena
 	PublishedCount_.store(header.count, std::memory_order_release);
 	TombstonedCount_.store(tombstoned, std::memory_order_relaxed);
 	Generation_.store(priorGeneration + 1, std::memory_order_release);
@@ -1115,6 +1336,172 @@ Status ScratchBank::MeasureRecallLocked(
 		}
 
 		// recall@k: how many of the reference top-k the quantized scan also returned.
+		for (int32_t i = 0; i < got; ++i)
+		{
+			if (refHits.Contains(heap[i].index))
+			{
+				++totalHits;
+			}
+		}
+		totalPossible += refHits.Count();
+	}
+
+	out->recall = totalPossible > 0
+		? static_cast<float>(static_cast<double>(totalHits) / static_cast<double>(totalPossible))
+		: 0.0f;
+	return Status::Ok;
+}
+
+Status ScratchBank::MeasureRecallLockedChannel(
+	uint64_t seed, Workspace& ws, const ChannelInfo& channel, ScratchRecallReport* out) const
+{
+	const int32_t count = PublishedCount_.load(std::memory_order_acquire);
+	const int32_t tombstoned = TombstonedCount_.load(std::memory_order_relaxed);
+	const int32_t liveRows = count - tombstoned;
+
+	// Descriptive fields identical to the whole-vector routine — only `recall` is
+	// channel-specific; liveRows/k/seed/generation/informative describe the bank.
+	out->recall = 0.0f;
+	out->sampleCount = liveRows < 1000 ? liveRows : 1000;
+	out->liveRows = liveRows;
+	out->seed = seed;
+	out->generation = Generation();
+	out->informative = liveRows >= kRecallInformativeRows;
+	const int32_t k = liveRows - 1 < 10 ? (liveRows - 1) : 10;
+	out->k = k < 0 ? 0 : k;
+	if (k <= 0)
+	{
+		return Status::Ok;
+	}
+
+	// The quantized snapshot, carrying the channel table so a single channel-aligned segment
+	// scores per-channel exactly as a live channel query does.
+	BankView view;
+	view.rows = Rows_;
+	view.scales = Scales_;
+	view.count = count;
+	view.dims = Dims_;
+	view.paddedDims = PaddedDims_;
+	view.quant = Quant_;
+	view.metric = Metric_;
+	view.channels = Channels_;
+	view.channelCount = ChannelCount_;
+	view.channelInvNorms = ChannelInvNorms_;
+
+	if (!ws.ReserveQueryScratch(PaddedDims_, 1) || !ws.ReserveBiasBits(count) ||
+		!ws.Reserve(k, 1))
+	{
+		return Status::OutOfMemory;
+	}
+	float* query = ws.QueryScratch(0);
+	uint32_t* exclude = ws.BiasBits();
+	const int32_t tombWords = TombstoneWords(count);
+	for (int32_t w = 0; w < tombWords; ++w)
+	{
+		exclude[w] = Tombstones_[w].load(std::memory_order_relaxed);
+	}
+
+	const QuerySegment seg[1] = {{channel.offset, channel.length, 1.0f}};
+	QueryParams params;
+	params.k = k;
+	params.segments = seg;
+	params.segmentCount = 1;
+	params.excludeBits = exclude;
+	params.exactness = Quant_ == Quantization::Int8 ? Exactness::CrossDevice
+													: Exactness::PerDevice;
+
+	// The reference scan runs over the retained (dims-wide) float rows, so the channel range
+	// clamps at Dims_ (pad lanes are zero on both sides and contribute nothing).
+	const int32_t lo = channel.offset;
+	const int32_t hi = channel.offset + channel.length < Dims_ ? channel.offset + channel.length
+															   : Dims_;
+
+	RecallRng rng(seed);
+	const int32_t sampleTarget = out->sampleCount;
+	int32_t selected = 0;
+	int32_t seen = 0;
+	int64_t totalHits = 0;
+	int64_t totalPossible = 0;
+	RecallTopK refHits;
+	refHits.Init(k);
+	for (int32_t si = 0; si < count && selected < sampleTarget; ++si)
+	{
+		const bool dead =
+			(Tombstones_[si >> 5].load(std::memory_order_relaxed) & (1u << (si & 31))) != 0;
+		if (dead)
+		{
+			continue;
+		}
+		const int32_t remaining = liveRows - seen;
+		const int32_t needed = sampleTarget - selected;
+		++seen;
+		if (rng.Unit() * remaining >= needed)
+		{
+			continue;
+		}
+		++selected;
+
+		const float* self = Retained_ + static_cast<int64_t>(si) * Dims_;
+		std::memcpy(query, self, static_cast<size_t>(Dims_) * sizeof(float));
+		for (int32_t d = Dims_; d < PaddedDims_; ++d)
+		{
+			query[d] = 0.0f;
+		}
+
+		// Reference top-k over the channel sub-range: per-channel cosine (dot over the
+		// sub-vector norm — the D-V2-1 contract), dot, or squared-L2, matching how the
+		// segmented kernel scores the same channel-aligned segment.
+		refHits.Clear();
+		for (int32_t j = 0; j < count; ++j)
+		{
+			if (j == si)
+			{
+				continue;
+			}
+			if ((Tombstones_[j >> 5].load(std::memory_order_relaxed) & (1u << (j & 31))) != 0)
+			{
+				continue;
+			}
+			const float* rrow = Retained_ + static_cast<int64_t>(j) * Dims_;
+			double score = 0.0;
+			if (Metric_ == Metric::L2)
+			{
+				for (int32_t d = lo; d < hi; ++d)
+				{
+					const double diff = static_cast<double>(self[d]) - rrow[d];
+					score += diff * diff;
+				}
+			}
+			else if (Metric_ == Metric::Cosine)
+			{
+				double dot = 0.0, subNorm = 0.0;
+				for (int32_t d = lo; d < hi; ++d)
+				{
+					dot += static_cast<double>(self[d]) * rrow[d];
+					subNorm += static_cast<double>(rrow[d]) * rrow[d];
+				}
+				score = subNorm > 0.0 ? dot / std::sqrt(subNorm) : 0.0;
+			}
+			else
+			{
+				for (int32_t d = lo; d < hi; ++d)
+				{
+					score += static_cast<double>(self[d]) * rrow[d];
+				}
+			}
+			refHits.Insert(j, score, Metric_ == Metric::L2);
+		}
+
+		exclude[si >> 5] |= 1u << (si & 31);
+		Hit heap[RecallTopK::kMax];
+		int32_t got = 0;
+		const Status qs = Query(view, query, params, ws, heap, &got);
+		exclude[si >> 5] &= ~(1u << (si & 31));
+		if (qs != Status::Ok)
+		{
+			return qs;
+		}
+
 		for (int32_t i = 0; i < got; ++i)
 		{
 			if (refHits.Contains(heap[i].index))
