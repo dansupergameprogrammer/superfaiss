@@ -716,6 +716,8 @@ inline constexpr uint64_t kGoldenPoolXdHash = 0x9cf4eeddc1132a03ull;
 // pair), CentroidDistanceCrossDevice, MeanNN/MaxNNCrossDevice, and SpreadCrossDevice
 // over the committed fixture banks, across the forced-path sweep. Same capture/re-pin
 // discipline as kGoldenXdHash; 0 means 'not yet pinned' (the test prints the value).
-inline constexpr uint64_t kGoldenAnalyticsXdHash = 0x3b7d4af1a821acfcull;
+// Re-pinned 2026-07-12: the T-V2.5-8 coverage-close added Cosine and Dot MeanNN/MaxNN to
+// the battery (Japp G1), so the hash moved once with cause.
+inline constexpr uint64_t kGoldenAnalyticsXdHash = 0xcd995d373f06df97ull;
 
 } // namespace xdfix

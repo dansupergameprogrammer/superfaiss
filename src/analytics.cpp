@@ -62,6 +62,22 @@ inline bool IsInt8CrossDevice(const BankView& bank)
 		bank.paddedDims <= kMaxCrossDeviceDims;
 }
 
+// True if any image element is INT8_MIN (-128). The ±127 premise the int32 cross-dot
+// bound rests on (plan W1) admits only [-127, 127]; a -128 element at paddedDims near the
+// ceiling overflows the int32 accumulator (D-V2-13). Checked at the public boundary before
+// any accumulation - the self-dot recompute below would itself overflow on such a payload.
+inline bool HasMinInt8(const int8_t* image, int32_t n)
+{
+	for (int32_t i = 0; i < n; ++i)
+	{
+		if (image[i] == -128)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 // Distance-sense pair score over trusted (unvalidated) payloads. `metric` picks the family.
 inline float XdPairScore(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metric metric)
 {
@@ -101,6 +117,11 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 	// Payload law, both members (the shipped QueryXd boundary check): scale finite and
 	// non-negative, self-dot recomputed from the image and matched.
 	if (!std::isfinite(a.scale) || a.scale < 0.0 || !std::isfinite(b.scale) || b.scale < 0.0)
+	{
+		return Status::InvalidArgument;
+	}
+	// -128 guard (D-V2-13): enforce the +-127 premise before any int32 accumulation.
+	if (HasMinInt8(a.q8, paddedDims) || HasMinInt8(b.q8, paddedDims))
 	{
 		return Status::InvalidArgument;
 	}
@@ -224,26 +245,50 @@ Status NNDivergence(
 		return s;
 	}
 
+	// F4 count guard: k=1 + a verified non-empty target gives exactly one hit per query, so
+	// under contract every countScratch[i] == 1 and `counted` == m (green path unchanged). The
+	// guard hardens against a future k/exclusion change that could leave a query with no hit -
+	// a default score=0 must not enter the reduction silently.
 	const Metric metric = target.metric;
 	if (reduce == Reduce::Mean)
 	{
 		double acc = 0.0;
+		int32_t counted = 0;
 		for (int32_t i = 0; i < m; ++i)
 		{
+			if (countScratch[i] < 1)
+			{
+				continue;
+			}
 			acc += HitDistance(hitScratch[i].score, metric); // fixed order (plan N2)
+			++counted;
 		}
-		*outValue = XdFloor(acc / static_cast<double>(m));
+		if (counted == 0)
+		{
+			return Status::InvalidArgument;
+		}
+		*outValue = XdFloor(acc / static_cast<double>(counted));
 	}
 	else
 	{
-		double best = HitDistance(hitScratch[0].score, metric);
-		for (int32_t i = 1; i < m; ++i)
+		double best = 0.0;
+		bool have = false;
+		for (int32_t i = 0; i < m; ++i)
 		{
+			if (countScratch[i] < 1)
+			{
+				continue;
+			}
 			const double d = HitDistance(hitScratch[i].score, metric);
-			if (d > best)
+			if (!have || d > best)
 			{
 				best = d; // order-free max
 			}
+			have = true;
+		}
+		if (!have)
+		{
+			return Status::InvalidArgument;
 		}
 		*outValue = XdFloor(best);
 	}
@@ -360,6 +405,29 @@ Status ProjectionReport(const BankView& bank, const float* paddedDirection,
 	if (dirNormSq == 0.0)
 	{
 		return Status::ZeroNormQuery;
+	}
+	// F3: reject an empty tag group BEFORE writing any projection, so a rejected call leaves
+	// outProjections untouched (the no-partial-result-on-rejection convention).
+	if (groupBits != nullptr && outSeparation != nullptr)
+	{
+		int32_t nA = 0;
+		int32_t nB = 0;
+		for (int32_t r = 0; r < bank.count; ++r)
+		{
+			if ((groupBits[static_cast<uint32_t>(r) >> 5] &
+					(1u << (static_cast<uint32_t>(r) & 31u))) != 0u)
+			{
+				++nA;
+			}
+			else
+			{
+				++nB;
+			}
+		}
+		if (nA == 0 || nB == 0)
+		{
+			return Status::InvalidArgument;
+		}
 	}
 
 	const int32_t pd = bank.paddedDims;

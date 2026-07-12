@@ -6662,6 +6662,69 @@ namespace an
 		return best;
 	}
 
+	// A row-disjoint whole-row slice of a bank (channels dropped) — a source/target pair for
+	// same-metric NN divergence without new committed bytes.
+	inline BankView SliceView(const BankView& base, int32_t startRow, int32_t count)
+	{
+		BankView v = base;
+		v.rows = static_cast<const int8_t*>(base.rows) +
+			static_cast<int64_t>(startRow) * base.paddedDims;
+		v.scales = base.scales + startRow;
+		v.count = count;
+		v.channels = nullptr;
+		v.channelCount = 0;
+		v.channelInvNorms = nullptr;
+		return v;
+	}
+
+	// Independent bit-exact recode of MeanNN/MaxNN: the nearest target score per source row
+	// (via the contract-recoded xd::RefXdScore, not the kernel), inverted to distance sense,
+	// reduced in ascending source order. Matches the operator bitwise (REF).
+	inline float RefNNReduce(const BankView& src, const BankView& tgt, Reduce reduce)
+	{
+		const int8_t* srcRows = static_cast<const int8_t*>(src.rows);
+		const int32_t pd = src.paddedDims;
+		double acc = 0.0;
+		int32_t counted = 0;
+		double best = 0.0;
+		bool have = false;
+		for (int32_t i = 0; i < src.count; ++i)
+		{
+			const int8_t* q8 = srcRows + static_cast<int64_t>(i) * pd;
+			const double qs = pool::DecodeScale(src.scales[i]);
+			const int64_t qSq = detail::DotI8I8(q8, q8, pd);
+			float bestScore = 0.0f;
+			bool haveT = false;
+			for (int32_t r = 0; r < tgt.count; ++r)
+			{
+				const float sc = xd::RefXdScore(tgt, q8, qs, qSq, r);
+				const bool better = !haveT ||
+					(tgt.metric == Metric::L2 ? sc < bestScore : sc > bestScore);
+				if (better)
+				{
+					bestScore = sc;
+					haveT = true;
+				}
+			}
+			const double dist = tgt.metric == Metric::Cosine
+				? 1.0 - static_cast<double>(bestScore)
+				: static_cast<double>(bestScore);
+			if (reduce == Reduce::Mean)
+			{
+				acc += dist;
+				++counted;
+			}
+			else if (!have || dist > best)
+			{
+				best = dist;
+			}
+			have = true;
+		}
+		const double lim = 1.1754943508222875e-38;
+		const double res = reduce == Reduce::Mean ? acc / static_cast<double>(counted) : best;
+		return (res < lim && res > -lim) ? 0.0f : static_cast<float>(res);
+	}
+
 	// The analytics battery under the CURRENT dispatch: representative operator scalars
 	// over the committed fixtures, hashed. Path-sensitive through DotI8I8 / QueryXdBatch.
 	inline uint64_t Battery(Workspace& ws)
@@ -6736,6 +6799,40 @@ namespace an
 			nbuf.data(), ws, &mx);
 		Hash(h, mn);
 		Hash(h, mx);
+
+		// NN divergence on Cosine and Dot targets (T-V2.5-8): a whole-vector-normalized
+		// Cosine bank (the shipped scaled-dot cosine needs unit-norm rows, as production
+		// S-SEM banks are) and row-disjoint Dot slices, so the reduction's cosine (1-cos
+		// inversion) and dot branches cross the forced-path sweep too. Fixed seed → the
+		// battery stays deterministic across paths.
+		Rng cosRng(0xC051E0DE7E57ull);
+		TestBank cosBank(cosRng, 64, 32, Quantization::Int8, Metric::Cosine);
+		const BankView cosSrc = SliceView(cosBank.view, 0, 32);
+		const BankView cosTgt = SliceView(cosBank.view, 32, 32);
+		const BankView dotSrc = SliceView(a.view, 0, 32);
+		const BankView dotTgt = SliceView(a.view, 32, 32);
+		const BankView* pairs[4] = {&cosSrc, &dotSrc, &cosTgt, &dotTgt};
+		int32_t maxN = 0;
+		for (int32_t p = 0; p < 4; ++p)
+		{
+			maxN = pairs[p]->count > maxN ? pairs[p]->count : maxN;
+		}
+		std::vector<XdQuery> qb2(static_cast<size_t>(maxN));
+		std::vector<Hit> hb2(static_cast<size_t>(maxN));
+		std::vector<int32_t> nb2(static_cast<size_t>(maxN));
+		float v = 0.0f;
+		MeanNNCrossDevice(cosSrc, nullptr, cosTgt, nullptr, qb2.data(), hb2.data(), nb2.data(),
+			ws, &v);
+		Hash(h, v);
+		MaxNNCrossDevice(cosSrc, nullptr, cosTgt, nullptr, qb2.data(), hb2.data(), nb2.data(),
+			ws, &v);
+		Hash(h, v);
+		MeanNNCrossDevice(dotSrc, nullptr, dotTgt, nullptr, qb2.data(), hb2.data(), nb2.data(),
+			ws, &v);
+		Hash(h, v);
+		MaxNNCrossDevice(dotSrc, nullptr, dotTgt, nullptr, qb2.data(), hb2.data(), nb2.data(),
+			ws, &v);
+		Hash(h, v);
 		return h;
 	}
 } // namespace an
@@ -6871,6 +6968,144 @@ static void TestBankAnalytics()
 			"max-NN FEAT op %.6g float64 %.6g", static_cast<double>(mx), refMax);
 		std::printf("  T-V2.5-3 mean-NN FEAT: op %.6g float64 %.6g; max-NN op %.6g float64 %.6g\n",
 			static_cast<double>(mn), refMean, static_cast<double>(mx), refMax);
+	}
+
+	// --- T-V2.5-8 MeanNN/MaxNN on Cosine and Dot targets (G1): REF (bit-exact) + FEAT ---
+	{
+		Rng cosRng(0xC051E0DE7E57ull);
+		TestBank cosBank(cosRng, 64, 32, Quantization::Int8, Metric::Cosine);
+		const BankView srcs[2] = {an::SliceView(cosBank.view, 0, 32), an::SliceView(a.view, 0, 32)};
+		const BankView tgts[2] = {an::SliceView(cosBank.view, 32, 32), an::SliceView(a.view, 32, 32)};
+		const char* nm[2] = {"cosine", "dot"};
+		std::vector<XdQuery> qb(32);
+		std::vector<Hit> hb(32);
+		std::vector<int32_t> nb(32);
+		for (int32_t k = 0; k < 2; ++k)
+		{
+			float opMean = 0.0f;
+			float opMax = 0.0f;
+			CHECK(MeanNNCrossDevice(srcs[k], nullptr, tgts[k], nullptr, qb.data(), hb.data(),
+				nb.data(), ws, &opMean) == Status::Ok);
+			CHECK(MaxNNCrossDevice(srcs[k], nullptr, tgts[k], nullptr, qb.data(), hb.data(),
+				nb.data(), ws, &opMax) == Status::Ok);
+			// REF — bit-exact independent recode (nearest via xd::RefXdScore, inverted, reduced).
+			CHECK_MSG(opMean == an::RefNNReduce(srcs[k], tgts[k], Reduce::Mean),
+				"%s mean-NN REF mismatch (%.9g)", nm[k], opMean);
+			CHECK_MSG(opMax == an::RefNNReduce(srcs[k], tgts[k], Reduce::Max),
+				"%s max-NN REF mismatch (%.9g)", nm[k], opMax);
+			// FEAT — vs float64 brute-force nearest distance.
+			double sum = 0.0;
+			double fMax = 0.0;
+			bool have = false;
+			for (int32_t i = 0; i < srcs[k].count; ++i)
+			{
+				std::vector<double> s(static_cast<size_t>(srcs[k].dims));
+				for (int32_t j = 0; j < srcs[k].dims; ++j)
+				{
+					s[static_cast<size_t>(j)] = an::Dq(srcs[k], i, j);
+				}
+				const double nn = an::RefNearest(s, tgts[k]);
+				sum += nn;
+				if (!have || nn > fMax)
+				{
+					fMax = nn;
+				}
+				have = true;
+			}
+			const double fMean = sum / static_cast<double>(srcs[k].count);
+			CHECK_MSG(std::fabs(static_cast<double>(opMean) - fMean) <= 0.1 * std::fabs(fMean) + 1e-4,
+				"%s mean-NN FEAT op %.6g f64 %.6g", nm[k], static_cast<double>(opMean), fMean);
+			CHECK_MSG(std::fabs(static_cast<double>(opMax) - fMax) <= 0.1 * std::fabs(fMax) + 1e-4,
+				"%s max-NN FEAT op %.6g f64 %.6g", nm[k], static_cast<double>(opMax), fMax);
+			std::printf("  T-V2.5-8 %s mean-NN op %.6g f64 %.6g; max-NN op %.6g f64 %.6g\n",
+				nm[k], static_cast<double>(opMean), fMean, static_cast<double>(opMax), fMax);
+		}
+	}
+
+	// --- T-V2.5-9 Spread feature oracle on every metric (G2) ---
+	{
+		const int32_t sel[8] = {0, 4, 9, 17, 22, 30, 33, 44};
+		for (int32_t bi = 0; bi < 3; ++bi)
+		{
+			const BankView& bank = *banks[bi];
+			const int32_t pd = bank.paddedDims;
+			AlignedBuf cs(static_cast<size_t>(pd));
+			float opMean = 0.0f;
+			float opMax = 0.0f;
+			CHECK(SpreadCrossDevice(bank, sel, 8, nullptr, Reduce::Mean, cs.I8(), &opMean) ==
+				Status::Ok);
+			CHECK(SpreadCrossDevice(bank, sel, 8, nullptr, Reduce::Max, cs.I8(), &opMax) ==
+				Status::Ok);
+			// float64 dispersion: distance of each selected row to the float64 centroid.
+			std::vector<double> cf(static_cast<size_t>(bank.dims));
+			pool::RefPoolF64(bank, sel, 8, nullptr, cf.data());
+			double cSq = 0.0;
+			for (double vv : cf)
+			{
+				cSq += vv * vv;
+			}
+			double sum = 0.0;
+			double dMax = 0.0;
+			bool have = false;
+			for (int32_t i = 0; i < 8; ++i)
+			{
+				double cross = 0.0;
+				double sSq = 0.0;
+				for (int32_t j = 0; j < bank.dims; ++j)
+				{
+					const double rv = an::Dq(bank, sel[i], j);
+					cross += rv * cf[static_cast<size_t>(j)];
+					sSq += rv * rv;
+				}
+				double dist;
+				if (bank.metric == Metric::L2)
+				{
+					dist = (sSq + cSq) - 2.0 * cross;
+				}
+				else if (bank.metric == Metric::Cosine)
+				{
+					dist = 1.0 - cross / std::sqrt(sSq * cSq);
+				}
+				else
+				{
+					dist = cross;
+				}
+				sum += dist;
+				if (!have || dist > dMax)
+				{
+					dMax = dist;
+				}
+				have = true;
+			}
+			const double fMean = sum / 8.0;
+			CHECK_MSG(std::fabs(static_cast<double>(opMean) - fMean) <= 0.3 * std::fabs(fMean) + 0.05,
+				"%s spread-mean FEAT op %.6g f64 %.6g", names[bi], static_cast<double>(opMean), fMean);
+			CHECK_MSG(std::fabs(static_cast<double>(opMax) - dMax) <= 0.3 * std::fabs(dMax) + 0.05,
+				"%s spread-max FEAT op %.6g f64 %.6g", names[bi], static_cast<double>(opMax), dMax);
+			std::printf("  T-V2.5-9 %s spread-mean op %.6g f64 %.6g; max op %.6g f64 %.6g\n",
+				names[bi], static_cast<double>(opMean), fMean, static_cast<double>(opMax), dMax);
+		}
+	}
+
+	// --- T-V2.5-11 the -128 boundary guard at public ScoreXdPair (D-V2-13) ---
+	{
+		const int32_t pd = 16;
+		AlignedBuf img(static_cast<size_t>(pd));
+		AlignedBuf bad(static_cast<size_t>(pd));
+		std::memset(img.I8(), 5, static_cast<size_t>(pd));
+		std::memset(bad.I8(), 5, static_cast<size_t>(pd));
+		bad.I8()[3] = -128; // INT8_MIN — outside the ±127 premise
+		const int64_t sq = detail::DotI8I8(img.I8(), img.I8(), pd);
+		const XdQuery good{img.I8(), 1.0, sq};
+		const XdQuery badQ{bad.I8(), 1.0, sq}; // self-dot value irrelevant: the guard fires first
+		float out = 0.0f;
+		CHECK(ScoreXdPair(badQ, good, pd, Metric::Dot, &out) == Status::InvalidArgument);
+		CHECK(ScoreXdPair(good, badQ, pd, Metric::Dot, &out) == Status::InvalidArgument);
+		// A valid ±127 payload is unaffected.
+		AlignedBuf okb(static_cast<size_t>(pd));
+		std::memset(okb.I8(), 127, static_cast<size_t>(pd));
+		const XdQuery okQ{okb.I8(), 1.0, detail::DotI8I8(okb.I8(), okb.I8(), pd)};
+		CHECK(ScoreXdPair(okQ, okQ, pd, Metric::Dot, &out) == Status::Ok);
 	}
 
 	// --- T-V2.5-4 shape/platform extremes + the ceiling (W1) ---
@@ -7157,6 +7392,136 @@ static void TestProjectionReport()
 		nanDir.F32()[0] = std::nanf("");
 		CHECK(ProjectionReport(a.view, nanDir.F32(), nullptr, proj2.data(), nullptr) ==
 			Status::InvalidArgument);
+
+		// F3 — an empty tag group is rejected BEFORE any projection is written (no partial
+		// result on rejection). Every row in group A (bit set) leaves group B empty.
+		AlignedBuf validDir(static_cast<size_t>(pd) * sizeof(float));
+		std::memset(validDir.F32(), 0, static_cast<size_t>(pd) * sizeof(float));
+		validDir.F32()[0] = 1.0f;
+		std::vector<float> proj3(static_cast<size_t>(a.view.count));
+		for (int32_t r = 0; r < a.view.count; ++r)
+		{
+			proj3[static_cast<size_t>(r)] = -12345.0f; // sentinel: must stay untouched
+		}
+		std::vector<uint32_t> allGroupA(
+			static_cast<size_t>((a.view.count + 31) / 32), 0xffffffffu);
+		float sep = 0.0f;
+		CHECK(ProjectionReport(a.view, validDir.F32(), allGroupA.data(), proj3.data(), &sep) ==
+			Status::InvalidArgument);
+		for (int32_t r = 0; r < a.view.count; ++r)
+		{
+			CHECK(proj3[static_cast<size_t>(r)] == -12345.0f); // untouched
+		}
+	}
+}
+
+// T-V2.5-10 — analytics over a real scratch-bank snapshot: tombstone exclusion (G4) and a
+// concurrent-writer storm (G3, dim 3). The shipped T-V2.5-7 exercised excludeBits on a
+// static bank; this drives the operators over a live scratch Snapshot().
+static void TestAnalyticsScratchSnapshot()
+{
+	std::printf("bank analytics scratch snapshot (T-V2.5-10): tombstone exclusion + concurrency\n");
+	const int32_t dims = 32;
+	const int32_t capacity = 128;
+	const int32_t appended = 64;
+	ScratchBank scratch;
+	CHECK(scratch.Create(capacity, dims, Metric::L2, Quantization::Int8) == Status::Ok);
+	Rng rng(0xA11A1717C0FFEEull);
+	std::vector<float> src(static_cast<size_t>(appended) * dims);
+	for (auto& v : src)
+	{
+		v = rng.NextFloat();
+	}
+	for (int32_t r = 0; r < appended; ++r)
+	{
+		int32_t idx = -1;
+		CHECK(scratch.Append(src.data() + static_cast<size_t>(r) * dims, dims, &idx) == Status::Ok);
+	}
+	for (int32_t r = 3; r < appended; r += 9)
+	{
+		CHECK(scratch.Remove(r) == Status::Ok); // a deterministic scatter of tombstones
+	}
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(appended), 0u);
+	CHECK(scratch.Snapshot(&snap, tombs.data()) == Status::Ok);
+	const int32_t pd = snap.paddedDims;
+
+	// Live indices (published, not tombstoned), ascending.
+	std::vector<int32_t> allIdx;
+	std::vector<int32_t> liveIdx;
+	for (int32_t r = 0; r < snap.count; ++r)
+	{
+		allIdx.push_back(r);
+		if (!IsExcluded(tombs.data(), r))
+		{
+			liveIdx.push_back(r);
+		}
+	}
+	CHECK(!liveIdx.empty());
+
+	// Tombstone exclusion (G4): the operator over ALL rows with the tombstone words as
+	// excludeBits bit-equals the operator over the live indices alone — deletion is exclusion,
+	// on a real snapshot, in both the pool and the reduction.
+	{
+		AlignedBuf cs1(static_cast<size_t>(pd));
+		AlignedBuf cs2(static_cast<size_t>(pd));
+		float sAll = 0.0f;
+		float sLive = 0.0f;
+		CHECK(SpreadCrossDevice(snap, allIdx.data(), static_cast<int32_t>(allIdx.size()),
+			tombs.data(), Reduce::Mean, cs1.I8(), &sAll) == Status::Ok);
+		CHECK(SpreadCrossDevice(snap, liveIdx.data(), static_cast<int32_t>(liveIdx.size()),
+			nullptr, Reduce::Mean, cs2.I8(), &sLive) == Status::Ok);
+		CHECK_MSG(sAll == sLive, "scratch spread tombstone!=subset (%.9g vs %.9g)", sAll, sLive);
+
+		AlignedBuf da(static_cast<size_t>(pd));
+		AlignedBuf db(static_cast<size_t>(pd));
+		AlignedBuf da2(static_cast<size_t>(pd));
+		AlignedBuf db2(static_cast<size_t>(pd));
+		float dAll = 0.0f;
+		float dLive = 0.0f;
+		CHECK(CentroidDistanceCrossDevice(snap, allIdx.data(), static_cast<int32_t>(allIdx.size()),
+			nullptr, tombs.data(), snap, liveIdx.data(), static_cast<int32_t>(liveIdx.size()),
+			nullptr, nullptr, Metric::L2, da.I8(), db.I8(), &dAll) == Status::Ok);
+		CHECK(CentroidDistanceCrossDevice(snap, liveIdx.data(), static_cast<int32_t>(liveIdx.size()),
+			nullptr, nullptr, snap, liveIdx.data(), static_cast<int32_t>(liveIdx.size()),
+			nullptr, nullptr, Metric::L2, da2.I8(), db2.I8(), &dLive) == Status::Ok);
+		CHECK_MSG(dAll == dLive, "scratch centroid-distance tombstone!=subset (%.9g vs %.9g)",
+			dAll, dLive);
+	}
+
+	// Concurrency (G3, dim 3): a reduction over a HELD snapshot is invariant while a writer
+	// appends and removes concurrently — the snapshot's rows [0,count) and captured tombstone
+	// words are stable. TSan (CI) proves the reads take no lock and do not race the writer.
+	{
+		AlignedBuf cs(static_cast<size_t>(pd));
+		float baseline = 0.0f;
+		CHECK(SpreadCrossDevice(snap, allIdx.data(), static_cast<int32_t>(allIdx.size()),
+			tombs.data(), Reduce::Mean, cs.I8(), &baseline) == Status::Ok);
+
+		std::atomic<bool> stop{false};
+		std::thread writer([&]() {
+			int32_t next = appended;
+			while (!stop.load(std::memory_order_relaxed))
+			{
+				if (next < capacity)
+				{
+					scratch.Append(src.data(), dims, &next); // reuses row 0's data; index unused
+					++next;
+				}
+				scratch.Remove(next > appended ? appended - 1 : 0);
+			}
+		});
+		for (int32_t iter = 0; iter < 200; ++iter)
+		{
+			AlignedBuf cs2(static_cast<size_t>(pd));
+			float v = 0.0f;
+			CHECK(SpreadCrossDevice(snap, allIdx.data(), static_cast<int32_t>(allIdx.size()),
+				tombs.data(), Reduce::Mean, cs2.I8(), &v) == Status::Ok);
+			CHECK(v == baseline); // the held snapshot is stable under concurrent writes
+		}
+		stop.store(true, std::memory_order_relaxed);
+		writer.join();
 	}
 }
 
@@ -7203,6 +7568,7 @@ int main()
 	TestXdcIntersect();
 	TestBankAnalytics();
 	TestProjectionReport();
+	TestAnalyticsScratchSnapshot();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
