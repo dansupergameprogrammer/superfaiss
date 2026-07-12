@@ -143,13 +143,14 @@ int64_t ScratchBank::RowRegionBytes(int32_t capacity) const
 }
 
 int64_t ScratchBank::ArenaBytes(
-	int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant, bool retain)
+	int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant, bool retain,
+	int32_t subNormPerRow)
 {
-	// One allocation: rows, scales (int8 only), tombstone words, one staging row, and
-	// (retention only) the retained float rows. Rows come first (kAlignment-aligned
-	// block, row stride is a multiple of kAlignment); every later region needs only
-	// 4-byte alignment and each region's size is a multiple of 4, so the packing
-	// preserves it.
+	// One allocation: rows, scales (int8 only), tombstone words, one staging row,
+	// (retention only) the retained float rows, and (channel Cosine only) the per-channel
+	// inverse sub-norms. Rows come first (kAlignment-aligned block, row stride is a multiple
+	// of kAlignment); every later region needs only 4-byte alignment and each region's size
+	// is a multiple of 4, so the packing preserves it.
 	int64_t bytes = static_cast<int64_t>(capacity) * paddedDims * ElementSize(quant);
 	bytes = (bytes + 15) & ~int64_t{15};
 	if (quant == Quantization::Int8)
@@ -161,6 +162,10 @@ int64_t ScratchBank::ArenaBytes(
 	if (retain)
 	{
 		bytes += static_cast<int64_t>(capacity) * dims * sizeof(float);
+	}
+	if (subNormPerRow > 0)
+	{
+		bytes += static_cast<int64_t>(capacity) * subNormPerRow * sizeof(float);
 	}
 	return bytes;
 }
@@ -196,6 +201,17 @@ void ScratchBank::BindArena(uint8_t* arena, int32_t capacity)
 	{
 		Retained_ = nullptr;
 	}
+	// Per-channel inverse sub-norms (V3.0): Cosine channel banks only. Written per row at
+	// Append (per-row-standalone, V3-G4); sized into this same allocation (V3-G5).
+	if (Metric_ == Metric::Cosine && ChannelCount_ > 0)
+	{
+		ChannelInvNorms_ = reinterpret_cast<float*>(cursor);
+		cursor += static_cast<int64_t>(capacity) * ChannelCount_ * sizeof(float);
+	}
+	else
+	{
+		ChannelInvNorms_ = nullptr;
+	}
 	for (int32_t w = 0; w < TombstoneWords(capacity); ++w)
 	{
 		::new (static_cast<void*>(Tombstones_ + w)) std::atomic<uint32_t>(0u);
@@ -220,7 +236,7 @@ Status ScratchBank::Create(
 	}
 
 	const int32_t paddedDims = PaddedDims(dims, quant);
-	const int64_t bytes = ArenaBytes(capacity, dims, paddedDims, quant, retainFloats);
+	const int64_t bytes = ArenaBytes(capacity, dims, paddedDims, quant, retainFloats, 0);
 	uint8_t* arena = static_cast<uint8_t*>(
 		detail::SeamAlloc(allocator, static_cast<size_t>(bytes), kAlignment));
 	if (arena == nullptr)
@@ -234,6 +250,7 @@ Status ScratchBank::Create(
 	Metric_ = metric;
 	Quant_ = quant;
 	Retain_ = retainFloats;
+	ChannelCount_ = 0; // single-space bank: no channel table
 	BindArena(arena, capacity);
 	PublishedCount_.store(0, std::memory_order_release);
 	TombstonedCount_.store(0, std::memory_order_relaxed);
@@ -241,22 +258,87 @@ Status ScratchBank::Create(
 	return Status::Ok;
 }
 
-// SCAFFOLD (Curie, slot-2 red suite, §23.9): the channel-capable Create overload
-// is declared in scratch.h so the slot-2 red suite compiles and links, but its
-// real body -- channel-table construction-time validation, the sub-norm-arena
-// sizing into ArenaBytes, and binding the table/arena into the single allocation
-// (§23.4) -- is not implemented here. It unconditionally returns OutOfMemory, a
-// status no §23.8 slot-2 cell expects (Ok on a valid table, InvalidArgument on a
-// malformed one), so every test against this overload fails at a specific
-// runtime assertion for the one true reason -- the feature does not exist yet --
-// never at compile or link time. Hastings replaces this body with the real
-// implementation (§23.4); this comment is removed with it.
+// Channel-capable Create (V3.0, plan section 23.4): the channel table becomes a
+// scratch-bank property, fixed for the bank's lifetime (D-V3-2). The table is validated
+// at construction with the same rules ValidateBank applies to a baked channel table
+// (validation moves from import-time to construction-time); on a Cosine bank the arena
+// additionally carries a capacity x channelCount per-channel inverse-sub-norm array,
+// sized into the SAME single allocation (V3-G5) and filled per-row-standalone at Append
+// (V3-G4). channels==null with channelCount==0 is a single-space bank, identical to the
+// overloads above.
 Status ScratchBank::Create(
-	int32_t /*capacity*/, int32_t /*dims*/, Metric /*metric*/, Quantization /*quant*/,
-	const ChannelInfo* /*channels*/, int32_t /*channelCount*/, bool /*retainFloats*/,
-	const Allocator& /*allocator*/)
+	int32_t capacity, int32_t dims, Metric metric, Quantization quant,
+	const ChannelInfo* channels, int32_t channelCount, bool retainFloats,
+	const Allocator& allocator)
 {
-	return Status::OutOfMemory;
+	if (IsCreated() || capacity <= 0 || dims <= 0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (metric != Metric::Dot && metric != Metric::Cosine && metric != Metric::L2)
+	{
+		return Status::InvalidArgument;
+	}
+	if (quant != Quantization::Float32 && quant != Quantization::Int8)
+	{
+		return Status::InvalidArgument;
+	}
+
+	const int32_t paddedDims = PaddedDims(dims, quant);
+
+	// Channel-table validation, mirroring ValidateBank's channel rules exactly (in-bounds,
+	// ascending, non-overlapping, on the 16-byte element grid, count in [1, kMaxChannels]).
+	// A null table with a nonzero count, or a nonzero count with no table, is malformed.
+	if (channels != nullptr || channelCount != 0)
+	{
+		if (channels == nullptr || channelCount <= 0 || channelCount > kMaxChannels)
+		{
+			return Status::InvalidArgument;
+		}
+		const int32_t grid = kAlignment / ElementSize(quant);
+		int32_t prevEnd = 0;
+		for (int32_t c = 0; c < channelCount; ++c)
+		{
+			const ChannelInfo& channel = channels[c];
+			if (channel.offset < 0 || channel.length <= 0 ||
+				channel.offset % grid != 0 || channel.length % grid != 0 ||
+				channel.offset < prevEnd ||
+				static_cast<int64_t>(channel.offset) + channel.length > paddedDims)
+			{
+				return Status::InvalidArgument;
+			}
+			prevEnd = channel.offset + channel.length;
+		}
+	}
+
+	const int32_t subNormPerRow = (metric == Metric::Cosine && channelCount > 0)
+		? channelCount
+		: 0;
+	const int64_t bytes = ArenaBytes(capacity, dims, paddedDims, quant, retainFloats,
+		subNormPerRow);
+	uint8_t* arena = static_cast<uint8_t*>(
+		detail::SeamAlloc(allocator, static_cast<size_t>(bytes), kAlignment));
+	if (arena == nullptr)
+	{
+		return Status::OutOfMemory;
+	}
+
+	Allocator_ = allocator;
+	Dims_ = dims;
+	PaddedDims_ = paddedDims;
+	Metric_ = metric;
+	Quant_ = quant;
+	Retain_ = retainFloats;
+	ChannelCount_ = channelCount;
+	for (int32_t c = 0; c < channelCount; ++c)
+	{
+		Channels_[c] = channels[c];
+	}
+	BindArena(arena, capacity);
+	PublishedCount_.store(0, std::memory_order_release);
+	TombstonedCount_.store(0, std::memory_order_relaxed);
+	Generation_.store(0, std::memory_order_release);
+	return Status::Ok;
 }
 
 void ScratchBank::Destroy()
@@ -271,6 +353,8 @@ void ScratchBank::Destroy()
 	Tombstones_ = nullptr;
 	Staging_ = nullptr;
 	Retained_ = nullptr;
+	ChannelInvNorms_ = nullptr;
+	ChannelCount_ = 0;
 	Retain_ = false;
 	Capacity_ = 0;
 	PublishedCount_.store(0, std::memory_order_relaxed);
@@ -385,6 +469,44 @@ Status ScratchBank::AppendValidated(const float* row, int32_t* outIndex)
 			static_cast<size_t>(Dims_) * sizeof(float));
 	}
 
+	// Per-channel inverse sub-norms (V3.0, Cosine channel banks): computed from THIS row's
+	// just-written QUANTIZED bytes over each channel range — per-row-standalone (V3-G4), no
+	// cross-row read. A verbatim per-row recode of bake.cpp's ComputeChannelInverseNorms
+	// (c outer, j inner, double accumulate, 1/sqrt or 0 on a zero-norm channel), so the
+	// append-time array bit-equals that reference over the snapshot's own rows. Written into
+	// the arena slot before the count publishes — a snapshot never sees a row without its
+	// sub-norms.
+	if (Metric_ == Metric::Cosine && ChannelCount_ > 0)
+	{
+		float* invNorms = ChannelInvNorms_ + static_cast<int64_t>(index) * ChannelCount_;
+		for (int32_t c = 0; c < ChannelCount_; ++c)
+		{
+			const ChannelInfo& channel = Channels_[c];
+			double norm = 0.0;
+			if (Quant_ == Quantization::Int8)
+			{
+				const int8_t* qrow =
+					static_cast<const int8_t*>(Rows_) + static_cast<int64_t>(index) * PaddedDims_;
+				const double scale = Scales_[index];
+				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
+				{
+					const double v = scale * qrow[j];
+					norm += v * v;
+				}
+			}
+			else
+			{
+				const float* qrow =
+					static_cast<const float*>(Rows_) + static_cast<int64_t>(index) * PaddedDims_;
+				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
+				{
+					norm += static_cast<double>(qrow[j]) * qrow[j];
+				}
+			}
+			invNorms[c] = norm > 0.0 ? static_cast<float>(1.0 / std::sqrt(norm)) : 0.0f;
+		}
+	}
+
 	// Row fully written; only now does it exist for readers.
 	PublishedCount_.store(index + 1, std::memory_order_release);
 	// A successful append is a mutation: advance the generation so any prior recall
@@ -435,6 +557,15 @@ Status ScratchBank::Snapshot(BankView* outView, uint32_t* outTombstones) const
 	view.paddedDims = PaddedDims_;
 	view.quant = Quant_;
 	view.metric = Metric_;
+	// Channel table (V3.0): the snapshot IS a channel-carrying BankView. channelInvNorms is
+	// non-null only on a Cosine channel bank (Dot/L2 channel banks score from the segments
+	// alone and carry no sub-norm arena — the kernel gates on Cosine && channelInvNorms).
+	if (ChannelCount_ > 0)
+	{
+		view.channels = Channels_;
+		view.channelCount = ChannelCount_;
+		view.channelInvNorms = ChannelInvNorms_;
+	}
 	*outView = view;
 	for (int32_t w = 0; w < TombstoneWords(count); ++w)
 	{
@@ -454,7 +585,11 @@ Status ScratchBank::Grow(int32_t newCapacity)
 	{
 		return Status::InvalidArgument;
 	}
-	const int64_t bytes = ArenaBytes(newCapacity, Dims_, PaddedDims_, Quant_, Retain_);
+	const int32_t subNormPerRow = (Metric_ == Metric::Cosine && ChannelCount_ > 0)
+		? ChannelCount_
+		: 0;
+	const int64_t bytes = ArenaBytes(newCapacity, Dims_, PaddedDims_, Quant_, Retain_,
+		subNormPerRow);
 	uint8_t* arena = static_cast<uint8_t*>(
 		detail::SeamAlloc(Allocator_, static_cast<size_t>(bytes), kAlignment));
 	if (arena == nullptr)
@@ -467,6 +602,7 @@ Status ScratchBank::Grow(int32_t newCapacity)
 	const float* oldScales = Scales_;
 	const std::atomic<uint32_t>* oldTombstones = Tombstones_;
 	const float* oldRetained = Retained_;
+	const float* oldChannelInvNorms = ChannelInvNorms_;
 	uint8_t* oldArena = Arena_;
 
 	BindArena(arena, newCapacity);
@@ -488,6 +624,13 @@ Status ScratchBank::Grow(int32_t newCapacity)
 	{
 		std::memcpy(Retained_, oldRetained,
 			static_cast<size_t>(count) * Dims_ * sizeof(float));
+	}
+	// Index-preserving for the sub-norm arena too (V3.0): each surviving row keeps its
+	// per-channel inverse sub-norms at the same index — no recompute, bit-unchanged.
+	if (subNormPerRow > 0)
+	{
+		std::memcpy(ChannelInvNorms_, oldChannelInvNorms,
+			static_cast<size_t>(count) * ChannelCount_ * sizeof(float));
 	}
 
 	detail::SeamFree(Allocator_, oldArena);

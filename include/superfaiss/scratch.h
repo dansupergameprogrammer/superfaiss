@@ -292,8 +292,12 @@ public:
 private:
 	Status AppendValidated(const float* row, int32_t* outIndex);
 	int64_t RowRegionBytes(int32_t capacity) const;
+	// subNormPerRow is the per-channel inverse-sub-norm count stored per row (the channel
+	// count on a Cosine channel bank, else 0); it sizes the sub-norm region into the same
+	// single allocation (V3-G5). Dot/L2 channel banks carry no sub-norm region.
 	static int64_t ArenaBytes(
-		int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant, bool retain);
+		int32_t capacity, int32_t dims, int32_t paddedDims, Quantization quant, bool retain,
+		int32_t subNormPerRow);
 	void BindArena(uint8_t* arena, int32_t capacity);
 	// The recall sweep proper — assumes the arena is stable (caller holds the reader pin
 	// or the writer guard). Const: it only reads rows, retained floats, and tombstones.
@@ -306,12 +310,19 @@ private:
 	std::atomic<uint32_t>* Tombstones_ = nullptr;
 	float* Staging_ = nullptr;                   // one dims-wide row (normalize scratch)
 	float* Retained_ = nullptr;                  // capacity x dims, retention only
+	float* ChannelInvNorms_ = nullptr;           // capacity x channelCount, Cosine+channels only
 	int32_t Capacity_ = 0;
 	int32_t Dims_ = 0;
 	int32_t PaddedDims_ = 0;
 	Metric Metric_ = Metric::Dot;
 	Quantization Quant_ = Quantization::Float32;
 	bool Retain_ = false;
+	// Channel table (V3.0, D-V3-2): fixed at Create for the bank's lifetime. Empty
+	// (ChannelCount_ == 0) for a single-space bank. Held by value — small (<= kMaxChannels)
+	// and survives Grow/Load without an arena region of its own; the per-channel inverse
+	// sub-norms (ChannelInvNorms_) live in the arena.
+	int32_t ChannelCount_ = 0;
+	ChannelInfo Channels_[kMaxChannels] = {};
 	std::atomic<int32_t> PublishedCount_{0};
 	std::atomic<int32_t> ReaderPins_{0};
 	std::atomic<bool> ExclusiveWaiting_{false};
