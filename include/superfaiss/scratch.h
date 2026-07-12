@@ -103,6 +103,28 @@ public:
 		bool retainFloats,
 		const Allocator& allocator = DefaultAllocator());
 
+	// Channel-capable overload (V3.0, plan section 23.4): the channel table
+	// becomes a scratch-bank property, fixed for the bank's lifetime (D-V3-2).
+	// Validated at construction with the same rules ValidateBank applies to a
+	// baked channel table (in-bounds, ascending, non-overlapping, on the
+	// 16-byte element grid, channelCount in [1, kMaxChannels]) -- validation
+	// moves from import-time to construction-time. On a Cosine bank the arena
+	// additionally carries a capacity x channelCount per-channel inverse-
+	// sub-norm array (computed per-row-standalone at Append, V3-G4), sized
+	// into the SAME single allocation (V3-G5); Dot/L2 channel banks need no
+	// sub-norm arena. `channels` may be null with `channelCount` 0 for a
+	// single-space bank (equivalent to the overloads above). Not valid to
+	// call on a created bank.
+	Status Create(
+		int32_t capacity,
+		int32_t dims,
+		Metric metric,
+		Quantization quant,
+		const ChannelInfo* channels,
+		int32_t channelCount,
+		bool retainFloats = false,
+		const Allocator& allocator = DefaultAllocator());
+
 	// Releases the arena. Exclusive (no readers in flight). Safe on an empty bank.
 	void Destroy();
 

@@ -7525,6 +7525,1271 @@ static void TestAnalyticsScratchSnapshot()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T-V3 -- V3.0 channel-capable scratch banks, Slot 2 (SuperFAISS_V2_Plan.md
+// section 23.4 Tier 1 core: channel table at Create, append-time per-channel
+// Cosine sub-norms, Snapshot carries the table). Authored red-first by Curie
+// from section 23.8 (the Coverage Model) and
+// Claude/Curie/SuperFAISS_V3_Test_Design.md. Slot 2 does not cover
+// channel-aware Freeze or archive persistence (section 23.9 slot 3) or Tier 2
+// channel-scoped analytics (slot 4) -- those suites land with their slots.
+//
+// SCAFFOLD (Curie, not the feature): ScratchBank's channel-table Create
+// overload is declared in scratch.h but stubbed in scratch.cpp to
+// unconditionally return Status::OutOfMemory -- a status no cell below
+// expects -- so every test in this section compiles, links, and fails at a
+// specific runtime assertion for the one true reason ("channel-capable Create
+// is not implemented"), never on a compile error. Hastings replaces the stub
+// body with the real channel-table validation + sub-norm-arena construction
+// (section 23.4); the scaffold comment in scratch.cpp goes with it.
+
+namespace
+{
+	// Independent double-precision normalize (FEAT ground truth). Deliberately
+	// NOT a call to the library's NormalizeRows -- the dim-10 discipline: an
+	// achievement claim's reference is independent of the operator's own
+	// steps, not another call to the same code the operator (or its bake-time
+	// twin) uses.
+	void RefNormalizeRow(double* row, int32_t dims)
+	{
+		double norm = 0.0;
+		for (int32_t i = 0; i < dims; ++i)
+		{
+			norm += row[i] * row[i];
+		}
+		if (norm <= 0.0)
+		{
+			return;
+		}
+		const double inv = 1.0 / std::sqrt(norm);
+		for (int32_t i = 0; i < dims; ++i)
+		{
+			row[i] *= inv;
+		}
+	}
+
+	// Slot-2 CAL bands (Curie, proposed; pin at first calibration per the
+	// T-V2.5-3 convention): the FEAT tolerance for a per-channel score against
+	// the independent double brute-force reference, relative to the
+	// reference magnitude. Float32 has no quantization noise (residual is
+	// float rounding only); Int8 carries quantization error on top.
+	constexpr double kChannelFeatRelTolF32 = 1e-4;
+	constexpr double kChannelFeatRelTolI8 = 0.05;
+
+	// A channel-capable scratch-bank fixture: the raw (pre-normalize) source
+	// rows fed to Append, and an INDEPENDENT double reference per row (post
+	// row-normalize for Cosine, identity for Dot/L2) -- the FEAT ground truth.
+	// Two channels split the row in half on the quantization's element grid,
+	// mirroring TestPerChannelCosine's fixture shape.
+	struct ScratchChannelFixture
+	{
+		ScratchBank bank;
+		std::vector<ChannelInfo> channels;
+		std::vector<float> rawSource;  // count x dims, exactly what Append receives
+		std::vector<double> refRows;   // count x dims, independent double reference
+		int32_t dims = 0;
+		int32_t count = 0;
+		int32_t pd = 0;
+		Metric metric = Metric::Dot;
+		Quantization quant = Quantization::Float32;
+		Status createStatus = Status::InvalidArgument;
+	};
+
+	void MakeChannelScratchBank(
+		ScratchChannelFixture& fx, Rng& rng, int32_t count, int32_t dims, Metric metric,
+		Quantization quant, int32_t capacityOverride = -1)
+	{
+		fx.dims = dims;
+		fx.count = count;
+		fx.metric = metric;
+		fx.quant = quant;
+		fx.pd = PaddedDims(dims, quant);
+		const int32_t grid = kAlignment / ElementSize(quant);
+		int32_t half = (dims / 2 / grid) * grid;
+		if (half <= 0)
+		{
+			half = grid;
+		}
+		fx.channels = {{0, half}, {half, fx.pd - half}};
+
+		fx.rawSource.resize(static_cast<size_t>(count) * dims);
+		fx.refRows.resize(static_cast<size_t>(count) * dims);
+		for (int32_t r = 0; r < count; ++r)
+		{
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				const float v = rng.NextFloat();
+				fx.rawSource[static_cast<size_t>(r) * dims + i] = v;
+				fx.refRows[static_cast<size_t>(r) * dims + i] = static_cast<double>(v);
+			}
+			if (metric == Metric::Cosine)
+			{
+				RefNormalizeRow(fx.refRows.data() + static_cast<size_t>(r) * dims, dims);
+			}
+		}
+
+		const int32_t capacity = capacityOverride > 0 ? capacityOverride : count;
+		fx.createStatus = fx.bank.Create(capacity, dims, metric, quant,
+			fx.channels.data(), static_cast<int32_t>(fx.channels.size()));
+		CHECK_MSG(fx.createStatus == Status::Ok,
+			"channel Create failed (unimplemented, slot 2): status=%d",
+			static_cast<int>(fx.createStatus));
+		if (fx.createStatus != Status::Ok)
+		{
+			return; // slot-2 unimplemented: nothing further to append
+		}
+		for (int32_t r = 0; r < count; ++r)
+		{
+			int32_t idx = -1;
+			CHECK(fx.bank.Append(fx.rawSource.data() + static_cast<size_t>(r) * dims,
+					dims, &idx) == Status::Ok);
+			CHECK(idx == r);
+		}
+	}
+
+	// Builds the baked (imported) twin of a fixture's source rows, using the
+	// SAME import pipeline baked banks use (NormalizeRows / QuantizeRowsInt8 /
+	// PadRowsFloat32 / ComputeChannelInverseNorms) -- legitimate here because
+	// this IS the baked-twin equality oracle (section 23.7.1), not the FEAT.
+	struct BakedTwin
+	{
+		AlignedBuf payload;
+		std::vector<float> scales;
+		std::vector<float> invNorms;
+		BankView view;
+
+		explicit BakedTwin(const ScratchChannelFixture& fx)
+			: payload(static_cast<size_t>(fx.count > 0 ? fx.count : 1) * fx.pd *
+				  ElementSize(fx.quant))
+		{
+			std::vector<float> normalized = fx.rawSource;
+			if (fx.metric == Metric::Cosine && fx.count > 0)
+			{
+				CHECK(NormalizeRows(normalized.data(), fx.count, fx.dims, nullptr) ==
+					Status::Ok);
+			}
+			if (fx.quant == Quantization::Int8)
+			{
+				scales.resize(static_cast<size_t>(fx.count));
+				QuantizeRowsInt8(normalized.data(), fx.count, fx.dims, fx.pd,
+					payload.I8(), scales.data());
+			}
+			else
+			{
+				PadRowsFloat32(normalized.data(), fx.count, fx.dims, fx.pd, payload.F32());
+			}
+			view.rows = payload.ptr;
+			view.scales = fx.quant == Quantization::Int8 ? scales.data() : nullptr;
+			view.count = fx.count;
+			view.dims = fx.dims;
+			view.paddedDims = fx.pd;
+			view.quant = fx.quant;
+			view.metric = fx.metric;
+			view.channels = fx.channels.data();
+			view.channelCount = static_cast<int32_t>(fx.channels.size());
+			if (fx.metric == Metric::Cosine)
+			{
+				invNorms.resize(static_cast<size_t>(fx.count) * fx.channels.size());
+				CHECK(ComputeChannelInverseNorms(view, invNorms.data()) == Status::Ok);
+				view.channelInvNorms = invNorms.data();
+			}
+		}
+	};
+} // namespace
+
+// T-V3-1 -- channel table at Create: construction-time validation (dims 2/5).
+// Closes G-4 (the >kMaxChannels rejection).
+static void TestScratchChannelCreateRejections()
+{
+	Rng rng(0xC4A9E1ull);
+	const int32_t dims = 64;
+
+	// Valid tables accepted, every metric x quant, and capacity is honored
+	// (append to capacity succeeds, the next append is OutOfMemory) -- the
+	// arena sizing must have room for rows AND (Cosine) the sub-norm array in
+	// the one allocation.
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			const int32_t count = 16;
+			ScratchChannelFixture fx;
+				MakeChannelScratchBank(fx, rng, count, dims, metric, quant);
+			if (fx.createStatus != Status::Ok)
+			{
+				continue; // already CHECKed red inside the fixture builder
+			}
+			CHECK(fx.bank.Count() == count);
+			float extra[dims];
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				extra[i] = 0.1f;
+			}
+			CHECK(fx.bank.Append(extra, dims, nullptr) == Status::OutOfMemory);
+		}
+	}
+
+	auto expectCreateRejected = [&](const ChannelInfo* channels, int32_t channelCount,
+										const char* why) {
+		ScratchBank bank;
+		const Status s = bank.Create(64, dims, Metric::Dot, Quantization::Float32,
+			channels, channelCount);
+		CHECK_MSG(s == Status::InvalidArgument,
+			"%s: expected InvalidArgument, got %d", why, static_cast<int>(s));
+	};
+
+	// Overlapping channels.
+	{
+		const ChannelInfo bad[2] = {{0, 32}, {16, 32}};
+		expectCreateRejected(bad, 2, "overlapping channels");
+	}
+	// Non-ascending (second channel starts before the first ends, reversed order).
+	{
+		const ChannelInfo bad[2] = {{32, 16}, {0, 16}};
+		expectCreateRejected(bad, 2, "non-ascending channels");
+	}
+	// Off the 16-byte element grid (Float32 grid == 4 elements).
+	{
+		const ChannelInfo bad[1] = {{0, 6}};
+		expectCreateRejected(bad, 1, "off-grid length");
+	}
+	{
+		const ChannelInfo bad[1] = {{2, 8}};
+		expectCreateRejected(bad, 1, "off-grid offset");
+	}
+	// Out of bounds (extends past paddedDims).
+	{
+		const ChannelInfo bad[1] = {{0, dims + 64}};
+		expectCreateRejected(bad, 1, "out-of-bounds channel");
+	}
+	// Zero-length channel.
+	{
+		const ChannelInfo bad[1] = {{0, 0}};
+		expectCreateRejected(bad, 1, "zero-length channel");
+	}
+	// Negative offset.
+	{
+		const ChannelInfo bad[1] = {{-4, 8}};
+		expectCreateRejected(bad, 1, "negative offset");
+	}
+	// Null table with non-zero count.
+	{
+		expectCreateRejected(nullptr, 1, "null table, nonzero count");
+	}
+	// G-4: exceeding kMaxChannels (8). A structurally valid 9-channel table
+	// (ascending, non-overlapping, on-grid, in-bounds) rejected SOLELY for
+	// count -- proves the cap fires independently of the other rules.
+	{
+		const int32_t wideDims = 9 * kAlignment; // 9 whole-grid-unit channels
+		ChannelInfo nine[9];
+		for (int32_t c = 0; c < 9; ++c)
+		{
+			nine[c] = {c * kAlignment, kAlignment};
+		}
+		ScratchBank bank;
+		const Status s = bank.Create(64, wideDims, Metric::Dot, Quantization::Float32,
+			nine, 9);
+		CHECK_MSG(s == Status::InvalidArgument,
+			"kMaxChannels cap (G-4): expected InvalidArgument, got %d",
+			static_cast<int>(s));
+	}
+	// Exactly kMaxChannels (8) is accepted -- the boundary is exclusive-above,
+	// not exclusive-at (dim 4 extreme, folded here since it's a Create cell).
+	{
+		const int32_t wideDims = 8 * kAlignment;
+		ChannelInfo eight[8];
+		for (int32_t c = 0; c < 8; ++c)
+		{
+			eight[c] = {c * kAlignment, kAlignment};
+		}
+		ScratchBank bank;
+		const Status s = bank.Create(4, wideDims, Metric::Dot, Quantization::Float32,
+			eight, 8);
+		CHECK_MSG(s == Status::Ok,
+			"kMaxChannels boundary: expected Ok at exactly 8, got %d",
+			static_cast<int>(s));
+	}
+}
+
+// T-V3-2 / T-V3-3 -- append-time per-channel Cosine sub-norms: REF equality
+// against the bake.cpp:143-181 reference (ComputeChannelInverseNorms run over
+// the scratch snapshot's own quantized rows), and the per-row-standalone
+// property (V3-G4) via a permuted-append-order control (INV).
+static void TestScratchChannelAppendSubNorms()
+{
+	Rng rng(0xA55B0Full);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		ScratchChannelFixture fx;
+			MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine, quant);
+		if (fx.createStatus != Status::Ok)
+		{
+			continue;
+		}
+
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		CHECK_MSG(snap.channelCount == 2, "Snapshot did not carry the channel table: %d",
+			snap.channelCount);
+		CHECK(snap.channels != nullptr);
+		CHECK_MSG(snap.channelInvNorms != nullptr,
+			"Snapshot did not carry the per-channel sub-norm arena");
+		if (snap.channelCount != 2 || snap.channels == nullptr ||
+			snap.channelInvNorms == nullptr)
+		{
+			continue;
+		}
+
+		// REF: the bake.cpp reference applied to the snapshot's OWN quantized
+		// rows/scales/channels must bit-equal the append-time-derived array.
+		std::vector<float> refInvNorms(static_cast<size_t>(count) * snap.channelCount);
+		CHECK(ComputeChannelInverseNorms(snap, refInvNorms.data()) == Status::Ok);
+		CHECK_MSG(std::memcmp(refInvNorms.data(), snap.channelInvNorms,
+					  refInvNorms.size() * sizeof(float)) == 0,
+			"append-time sub-norm does not bit-equal the bake.cpp reference (quant=%d)",
+			static_cast<int>(quant));
+	}
+
+	// Permuted-append-order control (V3-G4): the same source rows, appended in
+	// two different orders, yield IDENTICAL per-row sub-norms at each row's
+	// own (possibly different) index -- the row-standalone property.
+	{
+		ScratchChannelFixture inOrder;
+		MakeChannelScratchBank(inOrder, rng, count, dims, Metric::Cosine, Quantization::Int8);
+		if (inOrder.createStatus != Status::Ok)
+		{
+			return;
+		}
+
+		std::vector<int32_t> permutation(count);
+		for (int32_t i = 0; i < count; ++i)
+		{
+			permutation[i] = count - 1 - i; // simple reversal
+		}
+		ScratchBank permBank;
+		const Status created = permBank.Create(count, dims, Metric::Cosine,
+			Quantization::Int8, inOrder.channels.data(),
+			static_cast<int32_t>(inOrder.channels.size()));
+		CHECK_MSG(created == Status::Ok,
+			"permuted-order bank Create failed (unimplemented, slot 2): status=%d",
+			static_cast<int>(created));
+		if (created != Status::Ok)
+		{
+			return;
+		}
+		std::vector<int32_t> permIndex(count, -1); // source row -> permuted-bank index
+		for (int32_t p = 0; p < count; ++p)
+		{
+			const int32_t sourceRow = permutation[p];
+			int32_t idx = -1;
+			CHECK(permBank.Append(
+					  inOrder.rawSource.data() + static_cast<size_t>(sourceRow) * dims,
+					  dims, &idx) == Status::Ok);
+			permIndex[sourceRow] = idx;
+		}
+
+		BankView snapA, snapB;
+		std::vector<uint32_t> tombsA(ScratchBank::TombstoneWords(count), 0u);
+		std::vector<uint32_t> tombsB(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(inOrder.bank.Snapshot(&snapA, tombsA.data()) == Status::Ok);
+		CHECK(permBank.Snapshot(&snapB, tombsB.data()) == Status::Ok);
+		if (snapA.channelInvNorms == nullptr || snapB.channelInvNorms == nullptr)
+		{
+			return; // already CHECKed red above
+		}
+		for (int32_t sourceRow = 0; sourceRow < count; ++sourceRow)
+		{
+			const float* a = snapA.channelInvNorms +
+				static_cast<int64_t>(sourceRow) * snapA.channelCount;
+			const float* b = snapB.channelInvNorms +
+				static_cast<int64_t>(permIndex[sourceRow]) * snapB.channelCount;
+			CHECK_MSG(std::memcmp(a, b, static_cast<size_t>(snapA.channelCount) *
+						  sizeof(float)) == 0,
+				"row %d's sub-norms depend on append order (not per-row-standalone)",
+				sourceRow);
+		}
+	}
+}
+
+// T-V3-4 -- Snapshot carries the channel table; a channel query over the
+// scratch snapshot bit-equals the SAME query over a baked twin (section
+// 23.7.1, the crux consistency check -- kept alongside T-V3-5's feature
+// oracle per Japp's note that equality oracles never stand alone for an
+// achievement claim). Also: raw-segment and whole-vector regression (dim 7 --
+// "raw segments already worked; named channels are the addition", "no
+// whole-vector path changed").
+static void TestScratchChannelSnapshotBakedTwin()
+{
+	Rng rng(0x5A17ED0ull);
+	const int32_t dims = 64;
+	const int32_t count = 96;
+	const int32_t k = 12;
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			ScratchChannelFixture fx;
+				MakeChannelScratchBank(fx, rng, count, dims, metric, quant);
+			if (fx.createStatus != Status::Ok)
+			{
+				continue;
+			}
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			BakedTwin twin(fx);
+
+			std::vector<float> queryRaw(dims);
+			for (auto& v : queryRaw)
+			{
+				v = rng.NextFloat();
+			}
+			AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+			PadQuery(queryRaw, fx.pd, qbuf.F32());
+
+			const QuerySegment segs[2] = {
+				{fx.channels[0].offset, fx.channels[0].length, 1.0f},
+				{fx.channels[1].offset, fx.channels[1].length, 0.75f},
+			};
+			QueryParams params;
+			params.k = k;
+			params.segments = segs;
+			params.segmentCount = 2;
+
+			Workspace wsScratch, wsBaked;
+			Hit scratchHits[12], bakedHits[12];
+			int32_t nScratch = 0, nBaked = 0;
+			CHECK(Query(snap, qbuf.F32(), params, wsScratch, scratchHits, &nScratch) ==
+				Status::Ok);
+			CHECK(Query(twin.view, qbuf.F32(), params, wsBaked, bakedHits, &nBaked) ==
+				Status::Ok);
+			CHECK_MSG(nScratch == nBaked, "hit count mismatch: scratch=%d baked=%d",
+				nScratch, nBaked);
+			for (int32_t i = 0; i < nScratch && i < nBaked; ++i)
+			{
+				CHECK_MSG(scratchHits[i].index == bakedHits[i].index &&
+						scratchHits[i].score == bakedHits[i].score,
+					"channel query over scratch snapshot != baked twin at hit %d "
+					"(metric=%d quant=%d)",
+					i, static_cast<int>(metric), static_cast<int>(quant));
+			}
+
+			// Raw-segment regression: a degenerate whole-row segment list is
+			// bit-identical to the plain (no-segment) scan, on a channel-
+			// carrying scratch bank exactly as it was on a channel-less one
+			// (dim 7 -- "no whole-vector path changed").
+			{
+				const QuerySegment whole[1] = {{0, fx.pd, 1.0f}};
+				QueryParams wp;
+				wp.k = k;
+				wp.segments = whole;
+				wp.segmentCount = 1;
+				QueryParams plain;
+				plain.k = k;
+
+				Workspace wsW, wsP;
+				Hit wHits[12], pHits[12];
+				int32_t nW = 0, nP = 0;
+				CHECK(Query(snap, qbuf.F32(), wp, wsW, wHits, &nW) == Status::Ok);
+				CHECK(Query(snap, qbuf.F32(), plain, wsP, pHits, &nP) == Status::Ok);
+				CHECK(nW == nP);
+				for (int32_t i = 0; i < nW && i < nP; ++i)
+				{
+					CHECK(wHits[i].index == pHits[i].index &&
+						wHits[i].score == pHits[i].score);
+				}
+			}
+		}
+	}
+}
+
+// T-V3-5 -- FEAT: the scratch per-channel query vs an independent double
+// brute-force top-k over the DEQUANTIZED snapshot rows, computed from the
+// per-channel-cosine/dot/L2 DEFINITION, not from bake.cpp's own steps.
+// Executes on the mutable path (a scratch channel bank), closing Japp's S-1
+// (the FEAT anchor path) and covering N-1 (the metric matrix: Dot, Cosine, L2
+// each proven per channel).
+static void TestScratchChannelFeatureOracle()
+{
+	Rng rng(0xFEA7ull);
+	const int32_t dims = 64;
+	const int32_t count = 120;
+	const int32_t k = 10;
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			ScratchChannelFixture fx;
+				MakeChannelScratchBank(fx, rng, count, dims, metric, quant);
+			if (fx.createStatus != Status::Ok)
+			{
+				continue;
+			}
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+			std::vector<float> queryRaw(dims);
+			for (auto& v : queryRaw)
+			{
+				v = rng.NextFloat();
+			}
+			AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+			PadQuery(queryRaw, fx.pd, qbuf.F32());
+
+			const ChannelInfo& ch = fx.channels[0]; // the first channel
+			const QuerySegment seg[1] = {{ch.offset, ch.length, 1.0f}};
+			QueryParams params;
+			params.k = k;
+			params.segments = seg;
+			params.segmentCount = 1;
+
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+
+			// Independent double brute-force from the DEFINITION: per-channel
+			// dot / squared-L2-distance / cosine (dot over sub-vector norms)
+			// computed directly from fx.refRows -- never touching
+			// ComputeChannelInverseNorms, the kernel, or QuantizeRowsInt8.
+			struct RefHitLocal
+			{
+				int32_t index;
+				double score;
+			};
+			std::vector<RefHitLocal> ref;
+			ref.reserve(static_cast<size_t>(count));
+			for (int32_t r = 0; r < count; ++r)
+			{
+				const double* row = fx.refRows.data() + static_cast<size_t>(r) * dims;
+				double score = 0.0;
+				if (metric == Metric::Dot)
+				{
+					for (int32_t j = ch.offset; j < ch.offset + ch.length && j < dims; ++j)
+					{
+						score += static_cast<double>(qbuf.F32()[j]) * row[j];
+					}
+				}
+				else if (metric == Metric::L2)
+				{
+					for (int32_t j = ch.offset; j < ch.offset + ch.length && j < dims; ++j)
+					{
+						const double d = static_cast<double>(qbuf.F32()[j]) - row[j];
+						score += d * d;
+					}
+				}
+				else // Cosine: dot(query_sub, row_sub) / ||row_sub|| -- the
+					 // SUB-VECTOR norm of the (whole-row-unit-normalized) row,
+					 // never the whole-row norm (the exact D-V2-1 contract
+					 // point a wrong-but-deterministic implementation could
+					 // get backwards, per Japp S-1/G-1).
+				{
+					double dot = 0.0, subNorm = 0.0;
+					for (int32_t j = ch.offset; j < ch.offset + ch.length && j < dims; ++j)
+					{
+						dot += static_cast<double>(qbuf.F32()[j]) * row[j];
+						subNorm += row[j] * row[j];
+					}
+					score = subNorm > 0.0 ? dot / std::sqrt(subNorm) : 0.0;
+				}
+				ref.push_back({r, score});
+			}
+			std::sort(ref.begin(), ref.end(), [&](const RefHitLocal& a, const RefHitLocal& b) {
+				if (a.score != b.score)
+				{
+					return metric == Metric::L2 ? (a.score < b.score) : (a.score > b.score);
+				}
+				return a.index < b.index;
+			});
+
+			const double tol = quant == Quantization::Int8 ? kChannelFeatRelTolI8
+															 : kChannelFeatRelTolF32;
+			const int32_t expected = static_cast<int32_t>(ref.size()) < k
+				? static_cast<int32_t>(ref.size())
+				: k;
+			CHECK_MSG(n == expected, "FEAT hit count: got %d expected %d", n, expected);
+			const double boundary = ref[static_cast<size_t>(expected) - 1].score;
+			std::vector<double> refByIndex(static_cast<size_t>(count),
+				metric == Metric::L2 ? 1e300 : -1e300);
+			for (const RefHitLocal& h : ref)
+			{
+				refByIndex[static_cast<size_t>(h.index)] = h.score;
+			}
+			for (int32_t i = 0; i < n; ++i)
+			{
+				const double rs = refByIndex[static_cast<size_t>(hits[i].index)];
+				const double band = tol * (1.0 + std::fabs(boundary));
+				const bool inTrueTopK =
+					metric == Metric::L2 ? (rs <= boundary + band) : (rs >= boundary - band);
+				CHECK_MSG(inTrueTopK,
+					"FEAT: hit %d (row %d) not within CAL band of the definition-grounded "
+					"brute-force (metric=%d quant=%d)",
+					i, hits[i].index, static_cast<int>(metric), static_cast<int>(quant));
+				CHECK_MSG(std::fabs(rs - static_cast<double>(hits[i].score)) <= band,
+					"FEAT score drift: got %.9g ref %.9g (metric=%d quant=%d)",
+					static_cast<double>(hits[i].score), rs, static_cast<int>(metric),
+					static_cast<int>(quant));
+			}
+		}
+	}
+}
+
+// Zero-norm row channel scores 0, never NaN (defined, dim 5); zero-norm
+// Cosine query sub-vector on a nonzero-weight segment -> ZeroNormQuery
+// (dim 2/5).
+static void TestScratchChannelDegenerateAndRuntimeRejections()
+{
+	const int32_t d = 8;
+	const ChannelInfo channels[2] = {{0, 4}, {4, 4}};
+
+	ScratchBank bank;
+	const Status created =
+		bank.Create(4, d, Metric::Cosine, Quantization::Float32, channels, 2);
+	CHECK_MSG(created == Status::Ok,
+		"zero-norm-channel fixture Create failed (unimplemented, slot 2): status=%d",
+		static_cast<int>(created));
+	if (created != Status::Ok)
+	{
+		return;
+	}
+
+	// Row 0: energy only in channel 0. Row 1: energy only in channel 1 (its
+	// channel-0 sub-vector is all zero -- a zero-norm ROW CHANNEL, legal).
+	float row0[d] = {1, 0, 0, 0, 0, 0, 0, 0};
+	float row1[d] = {0, 0, 0, 0, 1, 0, 0, 0};
+	CHECK(bank.Append(row0, d, nullptr) == Status::Ok);
+	CHECK(bank.Append(row1, d, nullptr) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(2), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	if (snap.channelInvNorms == nullptr)
+	{
+		return; // already CHECKed red
+	}
+	CHECK_MSG(snap.channelInvNorms[1 * 2 + 0] == 0.0f,
+		"row 1's channel-0 inverse sub-norm should be 0 (zero-norm row channel)");
+
+	alignas(16) float q[8] = {1.0f, 0, 0, 0, 0, 0, 0, 0};
+	const QuerySegment ch0[1] = {{0, 4, 1.0f}};
+	QueryParams p;
+	p.k = 2;
+	p.segments = ch0;
+	p.segmentCount = 1;
+	Workspace ws;
+	Hit hits[2];
+	int32_t n = 0;
+	CHECK(Query(snap, q, p, ws, hits, &n) == Status::Ok);
+	for (int32_t i = 0; i < n; ++i)
+	{
+		CHECK(hits[i].score == hits[i].score); // not NaN
+		if (hits[i].index == 1)
+		{
+			CHECK_MSG(hits[i].score == 0.0f,
+				"zero-norm row channel should score exactly 0, got %g", hits[i].score);
+		}
+	}
+
+	// Zero-norm QUERY sub-vector on a nonzero-weight Cosine segment ->
+	// ZeroNormQuery (the whole-vector zero-norm law, applied per scored
+	// segment).
+	alignas(16) float zeroSubQuery[8] = {0, 0, 0, 0, 1.0f, 0, 0, 0}; // ch0 sub-vector all-zero
+	Hit hits2[2];
+	int32_t n2 = 0;
+	CHECK(Query(snap, zeroSubQuery, p, ws, hits2, &n2) == Status::ZeroNormQuery);
+}
+
+// T-V3-7 -- composition reachable at slot 2 (dim 8): channel query x
+// {scratch-snapshot tombstone exclusion, generic excludeBits, CrossDevice
+// int8, batch, decomposition, intersection (G-2), metric override (G-2)},
+// and channel query x per-row bias, both dense and sparse forms (Forge W2,
+// N-3).
+static void TestScratchChannelComposition()
+{
+	Rng rng(0xC0F5171Full);
+	const int32_t dims = 64;
+	const int32_t count = 128;
+	const int32_t k = 10;
+
+	ScratchChannelFixture fx;
+		MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	if (fx.createStatus != Status::Ok)
+	{
+		return;
+	}
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw)
+	{
+		v = rng.NextFloat();
+	}
+	AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+	PadQuery(queryRaw, fx.pd, qbuf.F32());
+	const ChannelInfo& ch0 = fx.channels[0];
+	const QuerySegment seg[1] = {{ch0.offset, ch0.length, 1.0f}};
+
+	// 1) Tombstone exclusion: a channel query over a snapshot, excludeBits =
+	// the snapshot's own tombstone words, bit-equals the same channel query
+	// over a bare bank built from only the live rows (deletion-is-exclusion,
+	// on a real snapshot, extended to channels -- the T-V2.5-10 shape).
+	{
+		for (int32_t r = 3; r < count; r += 5)
+		{
+			CHECK(fx.bank.Remove(r) == Status::Ok);
+		}
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		for (int32_t i = 0; i < n; ++i)
+		{
+			CHECK(!IsExcluded(tombs.data(), hits[i].index));
+		}
+
+		// Bare live-only bank, built directly from the same fixture rows.
+		std::vector<float> liveSource;
+		std::vector<int32_t> liveOldIndex;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			if (IsExcluded(tombs.data(), r))
+			{
+				continue;
+			}
+			liveSource.insert(liveSource.end(),
+				fx.rawSource.begin() + static_cast<size_t>(r) * dims,
+				fx.rawSource.begin() + static_cast<size_t>(r + 1) * dims);
+			liveOldIndex.push_back(r);
+		}
+		const int32_t liveCount = static_cast<int32_t>(liveOldIndex.size());
+		CHECK(NormalizeRows(liveSource.data(), liveCount, dims, nullptr) == Status::Ok);
+		AlignedBuf liveRows(static_cast<size_t>(liveCount) * fx.pd);
+		std::vector<float> liveScales(static_cast<size_t>(liveCount));
+		QuantizeRowsInt8(liveSource.data(), liveCount, dims, fx.pd, liveRows.I8(),
+			liveScales.data());
+		BankView liveView;
+		liveView.rows = liveRows.ptr;
+		liveView.scales = liveScales.data();
+		liveView.count = liveCount;
+		liveView.dims = dims;
+		liveView.paddedDims = fx.pd;
+		liveView.quant = Quantization::Int8;
+		liveView.metric = Metric::Cosine;
+		liveView.channels = fx.channels.data();
+		liveView.channelCount = static_cast<int32_t>(fx.channels.size());
+		std::vector<float> liveInvNorms(
+			static_cast<size_t>(liveCount) * fx.channels.size());
+		CHECK(ComputeChannelInverseNorms(liveView, liveInvNorms.data()) == Status::Ok);
+		liveView.channelInvNorms = liveInvNorms.data();
+
+		QueryParams pl;
+		pl.k = k;
+		pl.segments = seg;
+		pl.segmentCount = 1;
+		Workspace wsl;
+		Hit liveHits[10];
+		int32_t nLive = 0;
+		CHECK(Query(liveView, qbuf.F32(), pl, wsl, liveHits, &nLive) == Status::Ok);
+		CHECK_MSG(n == nLive, "tombstone-excluded channel query count mismatch: %d vs %d",
+			n, nLive);
+		for (int32_t i = 0; i < n && i < nLive; ++i)
+		{
+			CHECK(liveOldIndex[static_cast<size_t>(liveHits[i].index)] == hits[i].index);
+			CHECK(liveHits[i].score == hits[i].score);
+		}
+	}
+
+	// Re-snapshot (post-removal state) for the remaining composition cells.
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+	// 2) CrossDevice int8 channel query over the scratch snapshot: bit-equals
+	// the same CrossDevice channel query over the baked twin (kernel already
+	// composes, V3-G11 -- only the snapshot's channel fields are new).
+	{
+		BakedTwin twin(fx);
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		p.exactness = Exactness::CrossDevice;
+		Workspace wsS, wsB;
+		Hit sHits[10], bHits[10];
+		int32_t nS = 0, nB = 0;
+		// The baked twin carries every row (no tombstones); querying it
+		// without exclusion is the composition-reachability half of this
+		// cell -- CrossDevice + channel segments must not reject
+		// (InvalidArgument) on either bank type. The scratch-vs-baked
+		// bit-equality claim is T-V3-4's (PerDevice); this cell's job is
+		// proving CrossDevice mode itself composes with channels on the
+		// mutable path, which the kernel already supports (V3-G11) once
+		// Snapshot carries the table.
+		CHECK(Query(snap, qbuf.F32(), p, wsS, sHits, &nS) == Status::Ok);
+		QueryParams pBaked = p;
+		pBaked.excludeBits = nullptr;
+		CHECK(Query(twin.view, qbuf.F32(), pBaked, wsB, bHits, &nB) == Status::Ok);
+	}
+
+	// 3) Batch: QueryBatch with segments over the scratch snapshot matches
+	// per-query single Query() calls, bit-identical (existing batch==single
+	// law, extended to channels).
+	{
+		const int32_t m = 3;
+		std::vector<float> queries(static_cast<size_t>(m) * fx.pd, 0.0f);
+		for (int32_t q = 0; q < m; ++q)
+		{
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				queries[static_cast<size_t>(q) * fx.pd + i] = rng.NextFloat();
+			}
+		}
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		Workspace wsBatch;
+		std::vector<Hit> batchHits(static_cast<size_t>(m) * k);
+		std::vector<int32_t> batchCounts(m);
+		CHECK(QueryBatch(snap, queries.data(), m, p, wsBatch, batchHits.data(),
+				batchCounts.data()) == Status::Ok);
+		for (int32_t q = 0; q < m; ++q)
+		{
+			Workspace wsSingle;
+			std::vector<Hit> single(k);
+			int32_t nSingle = 0;
+			CHECK(Query(snap, queries.data() + static_cast<size_t>(q) * fx.pd, p, wsSingle,
+					single.data(), &nSingle) == Status::Ok);
+			CHECK(nSingle == batchCounts[static_cast<size_t>(q)]);
+			for (int32_t i = 0; i < nSingle; ++i)
+			{
+				CHECK(single[static_cast<size_t>(i)].index ==
+						batchHits[static_cast<size_t>(q) * k + i].index &&
+					single[static_cast<size_t>(i)].score ==
+						batchHits[static_cast<size_t>(q) * k + i].score);
+			}
+		}
+	}
+
+	// 4) Decomposition: per-channel contributions sum bit-exactly to the same
+	// total the scan produced, over a scratch snapshot.
+	{
+		const QuerySegment segs2[2] = {
+			{fx.channels[0].offset, fx.channels[0].length, 1.0f},
+			{fx.channels[1].offset, fx.channels[1].length, 0.5f},
+		};
+		QueryParams p;
+		p.k = 1;
+		p.segments = segs2;
+		p.segmentCount = 2;
+		Workspace ws;
+		Hit top[1];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, top, &n) == Status::Ok);
+		if (n == 1)
+		{
+			float contributions[2] = {0.0f, 0.0f};
+			const float total = DecomposeRowScore(snap, qbuf.F32(), top[0].index, segs2, 2,
+				contributions);
+			CHECK(total == top[0].score);
+			CHECK((contributions[0] + contributions[1]) == total);
+		}
+	}
+
+	// 5) Intersection (G-2): queryCount==1 degenerates to Query() bit-
+	// identically (the core composition law), and a two-query fused call is
+	// reachable (Status::Ok) over the channel-carrying scratch snapshot.
+	{
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		Workspace ws1, wsI;
+		Hit plainHits[10], interHits[10];
+		int32_t nPlain = 0, nInter = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws1, plainHits, &nPlain) == Status::Ok);
+		CHECK(QueryIntersect(snap, qbuf.F32(), 1, p, wsI, interHits, &nInter) == Status::Ok);
+		CHECK(nPlain == nInter);
+		for (int32_t i = 0; i < nPlain && i < nInter; ++i)
+		{
+			CHECK(plainHits[i].index == interHits[i].index &&
+				plainHits[i].score == interHits[i].score);
+		}
+
+		std::vector<float> queries2(2 * static_cast<size_t>(fx.pd));
+		std::memcpy(queries2.data(), qbuf.F32(), static_cast<size_t>(fx.pd) * sizeof(float));
+		std::vector<float> q2Raw(dims);
+		for (auto& v : q2Raw)
+		{
+			v = rng.NextFloat();
+		}
+		AlignedBuf qbuf2(static_cast<size_t>(fx.pd) * sizeof(float));
+		PadQuery(q2Raw, fx.pd, qbuf2.F32());
+		std::memcpy(queries2.data() + fx.pd, qbuf2.F32(),
+			static_cast<size_t>(fx.pd) * sizeof(float));
+		Workspace wsI2;
+		Hit fusedHits[10];
+		int32_t nFused = 0;
+		CHECK(QueryIntersect(snap, queries2.data(), 2, p, wsI2, fusedHits, &nFused) ==
+			Status::Ok);
+	}
+
+	// 6) Metric override (G-2): ScoreAs::Dot on the Cosine channel scratch
+	// snapshot folds to raw projection, bit-identical to the same channel
+	// query run on a channel-less copy of the snapshot with the same
+	// override (the TestPerChannelCosine cell, ported to scratch).
+	{
+		QueryParams po;
+		po.k = k;
+		po.segments = seg;
+		po.segmentCount = 1;
+		po.scoreAs = ScoreAs::Dot;
+		Workspace wsO;
+		Hit projHits[10];
+		int32_t nProj = 0;
+		CHECK(Query(snap, qbuf.F32(), po, wsO, projHits, &nProj) == Status::Ok);
+
+		BankView bare = snap;
+		bare.channels = nullptr;
+		bare.channelCount = 0;
+		bare.channelInvNorms = nullptr;
+		Workspace wsB;
+		Hit bareHits[10];
+		int32_t nBare = 0;
+		CHECK(Query(bare, qbuf.F32(), po, wsB, bareHits, &nBare) == Status::Ok);
+		CHECK(nProj == nBare);
+		for (int32_t i = 0; i < nProj && i < nBare; ++i)
+		{
+			CHECK(projHits[i].index == bareHits[i].index &&
+				projHits[i].score == bareHits[i].score);
+		}
+	}
+
+	// 7) Channel query x per-row bias (Forge W2, N-3): both the dense
+	// (count-length view) and sparse ((index,bias) pairs) forms compose --
+	// the composed score is unbiased-channel-score + bias, bitwise, for
+	// every returned hit.
+	{
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		Workspace wsUnbiased;
+		std::vector<Hit> all(count);
+		int32_t nAll = 0;
+		QueryParams full = p;
+		full.k = count;
+		CHECK(Query(snap, qbuf.F32(), full, wsUnbiased, all.data(), &nAll) == Status::Ok);
+
+		// Dense.
+		{
+			std::vector<float> dense(count, 0.0f);
+			for (auto& b : dense)
+			{
+				b = rng.NextFloat() * 0.2f;
+			}
+			RowBias rb;
+			rb.dense = dense.data();
+			QueryParams pb = p;
+			pb.bias = &rb;
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), pb, ws, hits, &n) == Status::Ok);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				float unbiased = 0.0f;
+				bool found = false;
+				for (int32_t j = 0; j < nAll; ++j)
+				{
+					if (all[static_cast<size_t>(j)].index == hits[i].index)
+					{
+						unbiased = all[static_cast<size_t>(j)].score;
+						found = true;
+						break;
+					}
+				}
+				CHECK(found);
+				CHECK(hits[i].score == unbiased + dense[static_cast<size_t>(hits[i].index)]);
+			}
+		}
+		// Sparse.
+		{
+			std::vector<BiasPair> pairs;
+			for (int32_t r = 0; r < count; r += 11)
+			{
+				pairs.push_back({r, 0.15f * static_cast<float>((r % 3) + 1)});
+			}
+			RowBias rb;
+			rb.pairs = pairs.data();
+			rb.pairCount = static_cast<int32_t>(pairs.size());
+			QueryParams pb = p;
+			pb.bias = &rb;
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), pb, ws, hits, &n) == Status::Ok);
+			for (int32_t i = 0; i < n; ++i)
+			{
+				float unbiased = 0.0f;
+				bool found = false;
+				for (int32_t j = 0; j < nAll; ++j)
+				{
+					if (all[static_cast<size_t>(j)].index == hits[i].index)
+					{
+						unbiased = all[static_cast<size_t>(j)].score;
+						found = true;
+						break;
+					}
+				}
+				CHECK(found);
+				float expectedBias = 0.0f;
+				for (const BiasPair& bp : pairs)
+				{
+					if (bp.index == hits[i].index)
+					{
+						expectedBias = bp.bias;
+						break;
+					}
+				}
+				CHECK(hits[i].score == unbiased + expectedBias);
+			}
+		}
+	}
+}
+
+// T-V3-8 -- lifetime/reuse (dim 1), shape/platform extremes (dim 4), and
+// contract-claim regressions (dim 7) reachable at slot 2.
+static void TestScratchChannelLifetimeShapeContracts()
+{
+	Rng rng(0x11FE7C0Dull);
+	const int32_t dims = 64;
+
+	// dim 1 -- flat AllocationCount across appends (with the sub-norm write)
+	// and across channel queries of differing segment shapes, once warm.
+	{
+		const int32_t count = 64;
+		ScratchChannelFixture fx;
+			MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine, Quantization::Int8,
+				count + 32);
+		if (fx.createStatus != Status::Ok)
+		{
+			return;
+		}
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count + 32), 0u);
+		CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+		AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+		std::vector<float> qraw(fx.rawSource.begin(), fx.rawSource.begin() + dims);
+		PadQuery(qraw, fx.pd, qbuf.F32());
+
+		const QuerySegment single[1] = {{fx.channels[0].offset, fx.channels[0].length, 1.0f}};
+		const QuerySegment both[2] = {
+			{fx.channels[0].offset, fx.channels[0].length, 1.0f},
+			{fx.channels[1].offset, fx.channels[1].length, 1.0f},
+		};
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		QueryParams p1;
+		p1.k = 10;
+		p1.segments = single;
+		p1.segmentCount = 1;
+		CHECK(Query(snap, qbuf.F32(), p1, ws, hits, &n) == Status::Ok); // warm-up
+		QueryParams p2 = p1;
+		p2.segments = both;
+		p2.segmentCount = 2;
+		CHECK(Query(snap, qbuf.F32(), p2, ws, hits, &n) == Status::Ok); // warm-up (differing shape)
+
+		const uint64_t allocsBefore = AllocationCount();
+		int32_t extraIdx = -1;
+		float extra[dims];
+		std::memcpy(extra, fx.rawSource.data(), static_cast<size_t>(dims) * sizeof(float));
+		CHECK(fx.bank.Append(extra, dims, &extraIdx) == Status::Ok); // append with sub-norm write
+		CHECK(Query(snap, qbuf.F32(), p1, ws, hits, &n) == Status::Ok);
+		CHECK(Query(snap, qbuf.F32(), p2, ws, hits, &n) == Status::Ok);
+		CHECK_MSG(AllocationCount() == allocsBefore,
+			"channel append/query allocated: %llu -> %llu",
+			static_cast<unsigned long long>(allocsBefore),
+			static_cast<unsigned long long>(AllocationCount()));
+	}
+
+	// Grow preserves the sub-norm arena (parity with T-044 W4 index
+	// preservation, extended to the sub-norm array): original rows' per-
+	// channel sub-norms are bit-unchanged after Grow.
+	{
+		const int32_t count = 40;
+		ScratchChannelFixture fx;
+			MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine, Quantization::Int8);
+		if (fx.createStatus != Status::Ok)
+		{
+			return;
+		}
+		BankView preGrow;
+		std::vector<uint32_t> preTombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(fx.bank.Snapshot(&preGrow, preTombs.data()) == Status::Ok);
+		if (preGrow.channelInvNorms == nullptr)
+		{
+			return;
+		}
+		std::vector<float> before(
+			preGrow.channelInvNorms,
+			preGrow.channelInvNorms + static_cast<size_t>(count) * preGrow.channelCount);
+
+		CHECK(fx.bank.Grow(count + 32) == Status::Ok);
+		BankView postGrow;
+		std::vector<uint32_t> postTombs(ScratchBank::TombstoneWords(count + 32), 0u);
+		CHECK(fx.bank.Snapshot(&postGrow, postTombs.data()) == Status::Ok);
+		if (postGrow.channelInvNorms == nullptr)
+		{
+			return;
+		}
+		CHECK_MSG(std::memcmp(before.data(), postGrow.channelInvNorms,
+					  before.size() * sizeof(float)) == 0,
+			"Grow did not preserve the per-channel sub-norm arena bit-for-bit");
+	}
+
+	// dim 4 extremes.
+	{
+		// One-16-grid-unit channel (the smallest legal channel).
+		{
+			const int32_t d = kAlignment; // exactly one grid unit, Int8
+			const ChannelInfo one[1] = {{0, kAlignment}};
+			ScratchBank bank;
+			CHECK(bank.Create(4, d, Metric::Cosine, Quantization::Int8, one, 1) ==
+				Status::Ok);
+		}
+		// Whole-row-covering single channel bit-equals the whole-vector path.
+		{
+			const int32_t count = 32;
+			ScratchChannelFixture wholeFx;
+			MakeChannelScratchBank(wholeFx, rng, count, dims, Metric::Dot, Quantization::Float32);
+			if (wholeFx.createStatus == Status::Ok)
+			{
+				// Override to a single channel spanning the whole row.
+				ScratchBank singleChan;
+				const ChannelInfo whole[1] = {{0, wholeFx.pd}};
+				CHECK(singleChan.Create(count, dims, Metric::Dot, Quantization::Float32,
+						whole, 1) == Status::Ok);
+				for (int32_t r = 0; r < count; ++r)
+				{
+					CHECK(singleChan.Append(
+							  wholeFx.rawSource.data() + static_cast<size_t>(r) * dims, dims,
+							  nullptr) == Status::Ok);
+				}
+				BankView snap;
+				std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(singleChan.Snapshot(&snap, tombs.data()) == Status::Ok);
+
+				AlignedBuf qbuf(static_cast<size_t>(wholeFx.pd) * sizeof(float));
+				std::vector<float> qraw(wholeFx.rawSource.begin(),
+					wholeFx.rawSource.begin() + dims);
+				PadQuery(qraw, wholeFx.pd, qbuf.F32());
+
+				const QuerySegment segFull[1] = {{0, wholeFx.pd, 1.0f}};
+				QueryParams segParams;
+				segParams.k = 5;
+				segParams.segments = segFull;
+				segParams.segmentCount = 1;
+				QueryParams plainParams;
+				plainParams.k = 5;
+
+				Workspace ws1, ws2;
+				Hit segHits[5], plainHits[5];
+				int32_t nSeg = 0, nPlain = 0;
+				CHECK(Query(snap, qbuf.F32(), segParams, ws1, segHits, &nSeg) == Status::Ok);
+				CHECK(Query(snap, qbuf.F32(), plainParams, ws2, plainHits, &nPlain) ==
+					Status::Ok);
+				CHECK(nSeg == nPlain);
+				for (int32_t i = 0; i < nSeg && i < nPlain; ++i)
+				{
+					CHECK(segHits[i].index == plainHits[i].index &&
+						segHits[i].score == plainHits[i].score);
+				}
+			}
+		}
+		// One live row.
+		{
+			const ChannelInfo channels[1] = {{0, PaddedDims(dims, Quantization::Float32)}};
+			ScratchBank bank;
+			CHECK(bank.Create(1, dims, Metric::Dot, Quantization::Float32, channels, 1) ==
+				Status::Ok);
+			float row[dims];
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				row[i] = 1.0f;
+			}
+			CHECK(bank.Append(row, dims, nullptr) == Status::Ok);
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(1), 0u);
+			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			AlignedBuf q(static_cast<size_t>(PaddedDims(dims, Quantization::Float32)) *
+				sizeof(float));
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				q.F32()[i] = 1.0f;
+			}
+			const QuerySegment seg[1] = {{0, PaddedDims(dims, Quantization::Float32), 1.0f}};
+			QueryParams p;
+			p.k = 5;
+			p.segments = seg;
+			p.segmentCount = 1;
+			Workspace ws;
+			Hit hits[5];
+			int32_t n = 0;
+			CHECK(Query(snap, q.F32(), p, ws, hits, &n) == Status::Ok);
+			CHECK(n == 1);
+		}
+		// Fully-tombstoned channel bank: 0 hits, defined, no crash/NaN.
+		{
+			const int32_t count = 8;
+			ScratchChannelFixture fx;
+			MakeChannelScratchBank(fx, rng, count, dims, Metric::Cosine,				Quantization::Int8);
+			if (fx.createStatus == Status::Ok)
+			{
+				for (int32_t r = 0; r < count; ++r)
+				{
+					CHECK(fx.bank.Remove(r) == Status::Ok);
+				}
+				BankView snap;
+				std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+				AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
+				std::vector<float> qraw(fx.rawSource.begin(), fx.rawSource.begin() + dims);
+				PadQuery(qraw, fx.pd, qbuf.F32());
+				const QuerySegment seg[1] = {{fx.channels[0].offset, fx.channels[0].length, 1.0f}};
+				QueryParams p;
+				p.k = 5;
+				p.segments = seg;
+				p.segmentCount = 1;
+				p.excludeBits = tombs.data();
+				Workspace ws;
+				Hit hits[5];
+				int32_t n = 0;
+				CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+				CHECK(n == 0);
+			}
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -7549,6 +8814,13 @@ int main()
 	TestSegmentedScan();
 	TestPerChannelCosine();
 	TestScratchBanks();
+	TestScratchChannelCreateRejections();
+	TestScratchChannelAppendSubNorms();
+	TestScratchChannelSnapshotBakedTwin();
+	TestScratchChannelFeatureOracle();
+	TestScratchChannelDegenerateAndRuntimeRejections();
+	TestScratchChannelComposition();
+	TestScratchChannelLifetimeShapeContracts();
 	TestPinDrainLitmus();
 	TestPerRowBias();
 	TestWorkspaceReuseAcrossShapes();

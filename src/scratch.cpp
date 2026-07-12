@@ -241,6 +241,24 @@ Status ScratchBank::Create(
 	return Status::Ok;
 }
 
+// SCAFFOLD (Curie, slot-2 red suite, §23.9): the channel-capable Create overload
+// is declared in scratch.h so the slot-2 red suite compiles and links, but its
+// real body -- channel-table construction-time validation, the sub-norm-arena
+// sizing into ArenaBytes, and binding the table/arena into the single allocation
+// (§23.4) -- is not implemented here. It unconditionally returns OutOfMemory, a
+// status no §23.8 slot-2 cell expects (Ok on a valid table, InvalidArgument on a
+// malformed one), so every test against this overload fails at a specific
+// runtime assertion for the one true reason -- the feature does not exist yet --
+// never at compile or link time. Hastings replaces this body with the real
+// implementation (§23.4); this comment is removed with it.
+Status ScratchBank::Create(
+	int32_t /*capacity*/, int32_t /*dims*/, Metric /*metric*/, Quantization /*quant*/,
+	const ChannelInfo* /*channels*/, int32_t /*channelCount*/, bool /*retainFloats*/,
+	const Allocator& /*allocator*/)
+{
+	return Status::OutOfMemory;
+}
+
 void ScratchBank::Destroy()
 {
 	if (Arena_ != nullptr)
