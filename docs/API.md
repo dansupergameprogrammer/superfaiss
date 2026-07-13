@@ -377,10 +377,12 @@ Status SpreadCrossDeviceChannel(const BankView&, const int32_t* rows, int32_t ro
 The `channel` indexes the bank's channel table. For Dot/L2 it is a sub-range of the
 existing integer accumulation (the overflow bound only shrinks). **For Cosine the reduction
 recomputes the sub-range integer self-dot and applies one IEEE correctly-rounded `sqrt` —
-`1 − crossDot / sqrt(aSq·bSq)` — it does NOT read the per-row `channelInvNorms`;** the
-integer-exact sub-range accumulation + correctly-rounded double `sqrt` is the
-cross-device-exact reference, while the per-row float sub-norms are a query-path scoring
-convenience that is not cross-device-exact. Scratch sizing matches the whole-vector
+`1 − crossDot / sqrt(aSq·bSq)` — it does NOT read the per-row `channelInvNorms`.** Both
+paths are cross-device-reproducible; the distinction is precision and reference status: the
+analytics recompute the sub-range self-dot in the int→double domain for a full-precision,
+bit-exact double reference (the one the analytics REF checks against), whereas the per-row
+`channelInvNorms` are the float32-precision query-path scoring convenience (and pooled
+payloads carry no per-row sub-norm). Scratch sizing matches the whole-vector
 operators. A channel outside `[0, channelCount)`, or a bank with no channel table, is
 `InvalidArgument`; a degenerate zero-sub-norm channel member floors to a defined `0` in a
 reduction (a single per-channel query on a zero-norm sub-vector is still `ZeroNormQuery`).
@@ -528,12 +530,14 @@ graduates the bank to a `schemaVersion 2` baked asset, re-deriving the
 per-channel sub-norms over the compacted (live) rows;
 `MeasureScratchRecallPerChannel` and the channel-aware `FreezeWithRecall` report
 recall@k per channel over each sub-range (a retention-enabled Cosine channel
-bank; `InvalidArgument` otherwise). **Cost, stated plainly:** append-time only —
-the per-channel sub-norm adds ~14% (~194 ns) to a Cosine int8 append at 4
-channels / 256 dims and never touches the read path; the sub-norm arena is
-`channelCount × 4` bytes/row (16 B/row at 4 channels — 1.6% of the §20 retention
-arena, never the shipping default). Archive format: [FORMAT.md](FORMAT.md) §3;
-channel-scoped analytics: the `analytics.h` section above.
+bank; `InvalidArgument` otherwise). **Cost, stated plainly:** the per-channel
+sub-norm is an append-time compute cost — it adds ~14% (~194 ns) to a Cosine int8
+append at 4 channels / 256 dims; the query path reads the sub-norm arena but does
+no sub-norm work. The arena is `channelCount × 4` bytes/row (16 B/row at 4
+channels — mandatory on a Cosine channel bank, ~6% of the int8 row it sits beside,
+and ~1.6% the size of the optional retention arena). Dot/L2 channel banks carry no
+sub-norm arena at all. Archive format: [FORMAT.md](FORMAT.md) §3; channel-scoped
+analytics: the `analytics.h` section above.
 
 ## alloc.h — memory policy
 

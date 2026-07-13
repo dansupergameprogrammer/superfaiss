@@ -100,11 +100,12 @@ Status SpreadCrossDevice(
 // pools and scores over that sub-range only. Dot/L2 are a sub-range of the same integer
 // accumulation (the overflow bound only shrinks); Cosine recomputes the sub-range integer
 // self-dot and applies one IEEE correctly-rounded sqrt (1 - crossDot/sqrt(aSq*bSq)) -- it
-// does NOT read the per-row channelInvNorms (C-4/D-V3-10): the integer-exact sub-range
-// accumulation + correctly-rounded double sqrt is the cross-device reference, while the
-// per-row float channelInvNorms are a query-path scoring convenience that is not
-// cross-device-exact. Channel-scoped Cosine therefore depends only on the channel table,
-// not the sub-norm arena. New surface for ALL banks (baked + scratch); a scratch snapshot
+// does NOT read the per-row channelInvNorms (C-4/D-V3-10). Both paths are
+// cross-device-reproducible; the analytics recompute in the int->double domain for a
+// full-precision bit-exact double reference (the REF checks against it), whereas the
+// per-row channelInvNorms are the float32-precision query-path scoring convenience.
+// Channel-scoped Cosine therefore depends only on the channel table, not the sub-norm
+// arena. New surface for ALL banks (baked + scratch); a scratch snapshot
 // inherits it once Tier 1 put the channel table on the snapshot. A bank with no channel
 // table, or `channel` outside [0, channelCount), is InvalidArgument; a zero-sub-norm
 // channel member floors to a defined 0 in a reduction (C-5/D-V3-11), while a single
