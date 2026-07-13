@@ -9961,6 +9961,316 @@ static void TestChannelScopedAnalyticsRefFeat()
 	}
 }
 
+// --- T-V3-A1-COS-REF: the bit-exact channel-scoped Cosine analytics REF (C-4/D-V3-10) ---
+//
+// An INDEPENDENT recode of the pinned channel-scoped Cosine epilogue, authored from the
+// section 23.5 contract -- NOT by calling the operator or reusing its file-local helpers.
+// The arithmetic pinned by C-4 / D-V3-10: a channel-scoped Cosine distance over the sub-range
+// [offset, offset+length) is
+//     1 - crossDot / sqrt(aSq * bSq)
+// where crossDot, aSq, bSq are the INTEGER sub-range cross-dot / self-dots recomputed over the
+// channel's int8 lanes, closed with ONE IEEE correctly-rounded double sqrt. It does NOT read
+// the per-row float channelInvNorms.
+//
+// The recode below uses its own integer dot loop (CosRefDotI8) and its own std::sqrt, so it is
+// a genuine second implementation -- not a consistency check against the operator's own
+// XdCosineDistance. A bug shared by both cannot pass this.
+//
+// Why this REF exists (it DISCRIMINATES where the FEAT cannot): were the operator to normalize
+// a scored member by its precomputed channelInvNorms -- the float 1/sqrt(sub-self-dot) baked
+// per row on the query/scoring path -- instead of this recomputed double sqrt of the integer
+// self-dot, the two would differ only in the low mantissa bits (float-vs-double rounding of the
+// norm). The T-V3-A1 FEAT's CAL band absorbs that difference; only a bit-exact (==) REF detects
+// it. The centroid pooling is obtained from the metric-agnostic MakeCentroidCrossDevice primitive
+// (pooling is not the arithmetic C-4 disputes -- both metrics pool identically; the discrimination
+// lives entirely in the recoded epilogue applied to the pooled int8 image).
+namespace
+{
+	// Independent integer sub-range dot (own recode of the int8 accumulation). int64 so a
+	// zero-norm test is exact; the values fit int32 in the operator's guarded regime, so the
+	// double cast below is bit-identical to the operator's int32 DotI8I8 -> double.
+	int64_t CosRefDotI8(const int8_t* a, const int8_t* b, int32_t n)
+	{
+		int64_t acc = 0;
+		for (int32_t i = 0; i < n; ++i)
+		{
+			acc += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+		}
+		return acc;
+	}
+
+	// Own recode of the cross-device subnormal floor (XdFloor): |x| < FLT_MIN -> exactly 0.0f.
+	float CosRefXdFloor(double score)
+	{
+		const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly
+		if (score < lim && score > -lim)
+		{
+			return 0.0f;
+		}
+		return static_cast<float>(score);
+	}
+
+	// The pinned channel-scoped Cosine pair distance over two int8 sub-images of `length` lanes.
+	// A zero sub-norm member floors to a defined 0 (C-5/D-V3-11), matching XdChannelPairScore.
+	float CosRefChannelPair(const int8_t* a, const int8_t* b, int32_t length)
+	{
+		const int64_t cross = CosRefDotI8(a, b, length);
+		const int64_t aSq = CosRefDotI8(a, a, length);
+		const int64_t bSq = CosRefDotI8(b, b, length);
+		if (aSq == 0 || bSq == 0)
+		{
+			return 0.0f; // zero sub-norm member: defined 0, never NaN (C-5)
+		}
+		const double denom = std::sqrt(static_cast<double>(aSq) * static_cast<double>(bSq));
+		return CosRefXdFloor(1.0 - (static_cast<double>(cross) / denom));
+	}
+
+	// Pointer to a snapshot row's channel sub-image (int8, `length` contiguous lanes).
+	const int8_t* CosRefSubImage(const BankView& v, int32_t r, const ChannelInfo& ch)
+	{
+		return static_cast<const int8_t*>(v.rows) +
+			static_cast<int64_t>(r) * v.paddedDims + ch.offset;
+	}
+
+	// Builds the REF centroid over a channel sub-range via the metric-agnostic pooling
+	// primitive, mirroring the operator's MakeChannelCentroid: a ZeroNormQuery pool becomes a
+	// zeroed sub-image (self-dot 0 -> the epilogue floors it to 0). Writes `ch.length` int8
+	// lanes at outQ8[0..length). Returns false only on an unexpected error status.
+	bool CosRefCentroid(const BankView& v, const int32_t* idx, int32_t n, const ChannelInfo& ch,
+		int8_t* outQ8)
+	{
+		double scale = 0.0;
+		int64_t sq = 0;
+		const Status s = MakeCentroidCrossDevice(v, idx, n, nullptr, nullptr, outQ8, &scale, &sq,
+			ch.offset, ch.length);
+		if (s == Status::ZeroNormQuery)
+		{
+			std::memset(outQ8, 0, static_cast<size_t>(ch.length));
+			return true;
+		}
+		return s == Status::Ok;
+	}
+} // namespace
+
+// T-V3-A1-COS-REF -- bit-exact Cosine REF for the four channel-scoped operators (dim 10,
+// C-4/D-V3-10), plus the C-5 zero-sub-norm-member floor in a reduction (D-V3-11). Asserts
+// exact == between each operator's float result and the independent int->double recode
+// (CosRefChannelPair), across both channels of both banks. Expected GREEN on the shipped
+// pinned arithmetic; a disagreement is a genuine finding (operator vs the independent recode),
+// not a REF to adjust.
+static void TestChannelScopedAnalyticsCosineRef()
+{
+	Rng rng(0xC05E7ull);
+	const int32_t dims = 64;
+	const int32_t count = 48;
+
+	// Two Cosine channel banks (source/A and target/B) sharing the same channel table.
+	ScratchChannelFixture srcFx;
+	ScratchChannelFixture tgtFx;
+	MakeChannelScratchBank(srcFx, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	MakeChannelScratchBank(tgtFx, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	if (srcFx.createStatus == Status::Ok && tgtFx.createStatus == Status::Ok)
+	{
+		BankView src, tgt;
+		std::vector<uint32_t> srcTombs(ScratchBank::TombstoneWords(count), 0u);
+		std::vector<uint32_t> tgtTombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(srcFx.bank.Snapshot(&src, srcTombs.data()) == Status::Ok);
+		CHECK(tgtFx.bank.Snapshot(&tgt, tgtTombs.data()) == Status::Ok);
+
+		const int32_t idxA[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t idxB[6] = {2, 7, 12, 20, 25, 31};
+		std::vector<int32_t> allRows(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i)
+		{
+			allRows[static_cast<size_t>(i)] = i;
+		}
+
+		for (int32_t c = 0; c < static_cast<int32_t>(srcFx.channels.size()); ++c)
+		{
+			const ChannelInfo& ch = srcFx.channels[static_cast<size_t>(c)];
+			const int32_t length = ch.length;
+
+			// --- CentroidDistance channel: exact == vs the recoded epilogue over pooled centroids.
+			{
+				AlignedBuf sA(static_cast<size_t>(src.paddedDims));
+				AlignedBuf sB(static_cast<size_t>(src.paddedDims));
+				float cd = 0.0f;
+				const Status s = CentroidDistanceCrossDeviceChannel(
+					src, idxA, 6, nullptr, nullptr, src, idxB, 6, nullptr, nullptr,
+					Metric::Cosine, c, sA.I8(), sB.I8(), &cd);
+				CHECK_MSG(s == Status::Ok,
+					"CentroidDistance channel Cosine failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(s));
+				if (s == Status::Ok)
+				{
+					AlignedBuf ra(static_cast<size_t>(src.paddedDims));
+					AlignedBuf rb(static_cast<size_t>(src.paddedDims));
+					CHECK(CosRefCentroid(src, idxA, 6, ch, ra.I8()));
+					CHECK(CosRefCentroid(src, idxB, 6, ch, rb.I8()));
+					const float ref = CosRefChannelPair(ra.I8(), rb.I8(), length);
+					CHECK_MSG(cd == ref,
+						"CentroidDistance channel Cosine REF mismatch (ch=%d): %.9g != %.9g",
+						c, static_cast<double>(cd), static_cast<double>(ref));
+				}
+			}
+
+			// --- Spread channel: exact == vs the recoded per-member floor then double-mean floor.
+			{
+				AlignedBuf cs(static_cast<size_t>(src.paddedDims));
+				float sp = 0.0f;
+				const Status s = SpreadCrossDeviceChannel(src, allRows.data(), count, nullptr,
+					Reduce::Mean, c, cs.I8(), &sp);
+				CHECK_MSG(s == Status::Ok,
+					"Spread channel Cosine failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(s));
+				if (s == Status::Ok)
+				{
+					AlignedBuf cen(static_cast<size_t>(src.paddedDims));
+					CHECK(CosRefCentroid(src, allRows.data(), count, ch, cen.I8()));
+					double acc = 0.0;
+					for (int32_t r = 0; r < count; ++r)
+					{
+						acc += static_cast<double>(
+							CosRefChannelPair(CosRefSubImage(src, r, ch), cen.I8(), length));
+					}
+					const float ref = CosRefXdFloor(acc / static_cast<double>(count));
+					CHECK_MSG(sp == ref,
+						"Spread channel Cosine REF mismatch (ch=%d): %.9g != %.9g",
+						c, static_cast<double>(sp), static_cast<double>(ref));
+				}
+			}
+
+			// --- MeanNN / MaxNN channel (source -> target): exact == vs the recoded nearest.
+			{
+				std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+				std::vector<Hit> hbuf(static_cast<size_t>(count));
+				std::vector<int32_t> nbuf(static_cast<size_t>(count));
+				Workspace ws;
+				float mn = 0.0f, mx = 0.0f;
+				const Status sMean = MeanNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &mn);
+				const Status sMax = MaxNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &mx);
+				CHECK_MSG(sMean == Status::Ok,
+					"MeanNN channel Cosine failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(sMean));
+				CHECK_MSG(sMax == Status::Ok,
+					"MaxNN channel Cosine failed (unimplemented, slot 4): status=%d",
+					static_cast<int>(sMax));
+				if (sMean == Status::Ok && sMax == Status::Ok)
+				{
+					// Recode NNDivergenceChannel's Cosine path: for each source sub-row, its
+					// nearest (min-distance) target sub-row; skip a zero-sub-norm target (the
+					// operator continues past it); reduce by mean / order-free max, each closed
+					// with the subnormal floor, exactly where the operator floors.
+					double acc = 0.0, best = 0.0;
+					bool have = false;
+					int32_t counted = 0;
+					for (int32_t s = 0; s < src.count; ++s)
+					{
+						const int8_t* srcSub = CosRefSubImage(src, s, ch);
+						double nn = 0.0;
+						bool haveNn = false;
+						for (int32_t t = 0; t < tgt.count; ++t)
+						{
+							const int8_t* tgtSub = CosRefSubImage(tgt, t, ch);
+							if (CosRefDotI8(tgtSub, tgtSub, length) == 0)
+							{
+								continue; // zero sub-norm target: undefined, skipped (never NaN)
+							}
+							const double d =
+								static_cast<double>(CosRefChannelPair(srcSub, tgtSub, length));
+							if (!haveNn || d < nn) // Cosine: nearest = min distance
+							{
+								nn = d;
+							}
+							haveNn = true;
+						}
+						if (!haveNn)
+						{
+							continue;
+						}
+						acc += nn;
+						if (!have || nn > best)
+						{
+							best = nn;
+						}
+						have = true;
+						++counted;
+					}
+					CHECK(counted > 0);
+					const float refMean = CosRefXdFloor(acc / static_cast<double>(counted));
+					const float refMax = CosRefXdFloor(best);
+					CHECK_MSG(mn == refMean,
+						"MeanNN channel Cosine REF mismatch (ch=%d): %.9g != %.9g",
+						c, static_cast<double>(mn), static_cast<double>(refMean));
+					CHECK_MSG(mx == refMax,
+						"MaxNN channel Cosine REF mismatch (ch=%d): %.9g != %.9g",
+						c, static_cast<double>(mx), static_cast<double>(refMax));
+				}
+			}
+		}
+	}
+
+	// C-5 (D-V3-11): a zero-sub-norm Cosine channel MEMBER floors to a defined 0 in a
+	// reduction (not ZeroNormQuery). A hand Cosine channel bank: row 0 has zero energy in
+	// channel 0 (its sub-norm is 0) but nonzero energy in channel 1, so the whole ROW
+	// normalizes and Append succeeds. A channel-0 Spread must stay defined; the zero-norm
+	// member scores exactly 0, and the operator equals the independent recode bit for bit.
+	{
+		const int32_t d = 32; // two int8 channels of 16 lanes each
+		const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+		ScratchBank bank;
+		CHECK(bank.Create(4, d, Metric::Cosine, Quantization::Int8, channels, 2) == Status::Ok);
+		for (int32_t r = 0; r < 4; ++r)
+		{
+			float row[d] = {};
+			row[16 + (r % 16)] = 1.0f + 0.1f * static_cast<float>(r); // channel-1 energy: always
+			if (r >= 1)
+			{
+				row[r % 16] = 0.5f + 0.1f * static_cast<float>(r); // channel-0 energy: r>=1 only
+			}
+			CHECK(bank.Append(row, d, nullptr) == Status::Ok);
+		}
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(4), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		const int32_t idx[4] = {0, 1, 2, 3};
+
+		// The channel-0 sub-image of row 0 must be exactly zero (the member under test).
+		CHECK_MSG(CosRefDotI8(CosRefSubImage(snap, 0, channels[0]), CosRefSubImage(snap, 0, channels[0]), 16) == 0,
+			"C-5 fixture: row 0 channel-0 sub-image must be zero-norm");
+
+		AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
+		float sp = 0.0f;
+		const Status s = SpreadCrossDeviceChannel(snap, idx, 4, nullptr, Reduce::Mean, 0,
+			cs.I8(), &sp);
+		CHECK_MSG(s == Status::Ok,
+			"C-5 Cosine zero-sub-norm member must keep the reduction defined (not ZeroNormQuery), "
+			"got status=%d",
+			static_cast<int>(s));
+		if (s == Status::Ok)
+		{
+			CHECK_MSG(sp == sp, "C-5 Spread produced NaN");
+			AlignedBuf cen(static_cast<size_t>(snap.paddedDims));
+			CHECK(CosRefCentroid(snap, idx, 4, channels[0], cen.I8()));
+			// The zero-sub-norm member (row 0) floors to exactly 0 in the recode.
+			CHECK_MSG(CosRefChannelPair(CosRefSubImage(snap, 0, channels[0]), cen.I8(), 16) == 0.0f,
+				"C-5: zero-sub-norm Cosine member must floor to 0 in the recode");
+			double acc = 0.0;
+			for (int32_t r = 0; r < 4; ++r)
+			{
+				acc += static_cast<double>(
+					CosRefChannelPair(CosRefSubImage(snap, r, channels[0]), cen.I8(), 16));
+			}
+			const float ref = CosRefXdFloor(acc / 4.0);
+			CHECK_MSG(sp == ref,
+				"C-5 Spread Cosine REF mismatch (zero-member floor): %.9g != %.9g",
+				static_cast<double>(sp), static_cast<double>(ref));
+		}
+	}
+}
+
 // T-V3-A2 -- per-channel determinism (dim 6, section 23.7/section 22.5): each
 // channel-scoped Cosine operator crosses the forced-path sweep bit-identical (the
 // per-channel cosine sqrt limb is exercised). Red until slot 4: the operators stub before
@@ -10649,6 +10959,7 @@ int main()
 	TestScratchChannelPersistenceReservedBit();
 	TestScratchChannelPerChannelRecall();
 	TestChannelScopedAnalyticsRefFeat();
+	TestChannelScopedAnalyticsCosineRef();
 	TestChannelScopedAnalyticsDeterminism();
 	TestChannelScopedAnalyticsComposition();
 	TestChannelScopedAnalyticsRejections();
