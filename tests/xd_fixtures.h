@@ -720,4 +720,16 @@ inline constexpr uint64_t kGoldenPoolXdHash = 0x9cf4eeddc1132a03ull;
 // the battery (Japp G1), so the hash moved once with cause.
 inline constexpr uint64_t kGoldenAnalyticsXdHash = 0xcd995d373f06df97ull;
 
+// Pinned cross-device hash over the CHANNEL-scoped analytics battery (T-V3-A-XD-GOLD): the
+// scalar outputs of all four channel operators -- CentroidDistanceCrossDeviceChannel,
+// SpreadCrossDeviceChannel (mean + max), MeanNNCrossDeviceChannel, MaxNNCrossDeviceChannel --
+// over NON-degenerate Int8 channel banks (Dot, Cosine, L2), every channel, across the
+// forced-path sweep. The whole-vector kGoldenAnalyticsXdHash proves the whole-row operators
+// agree across paths but pins nothing for the channel operators; this locks the channel
+// operators' cross-device value (notably the per-channel cosine sqrt path). The fixture is
+// non-degenerate (no zero-energy channels), so the pin is invariant under the v3.0.1
+// zero-energy-channel fix (B1/B2 touch only degenerate math). Same capture/re-pin discipline
+// as kGoldenAnalyticsXdHash; 0 means 'not yet pinned' (the test prints the value).
+inline constexpr uint64_t kGoldenChannelAnalyticsXdHash = 0x634b7c67d544d074ull;
+
 } // namespace xdfix

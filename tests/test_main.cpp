@@ -10922,6 +10922,631 @@ static void TestScratchChannelSaveVersionSelection()
 	}
 }
 
+// ===========================================================================
+// v3.0.1 red suite (Curie): two P1 correctness bugs + three coverage holes.
+//   [P1-B1] TestChannelNNZeroEnergyFloor           -- RED (floors, not rejects)
+//   [P1-B2] TestScratchChannelPerChannelRecallZeroEnergy -- RED (skips, not aborts)
+//   [hole]  TestChannelAnalyticsCrossDeviceGolden  -- GREEN (pins cross-device channel golden)
+//   [hole]  TestPerChannelRecallOracle             -- GREEN (independent recall@k oracle)
+//   [hole]  TestVersionHeaderCoherence             -- RED (version.h says 2/5/0; must be 3/0/0)
+// Reuses the earlier anonymous-namespace helpers CosRefChannelPair / CosRefSubImage /
+// CosRefXdFloor (defined with T-V3-A1-COS-REF) and the slot-2/3 helpers
+// (ScratchChannelFixture / MakeChannelScratchBank).
+// ===========================================================================
+
+namespace
+{
+	// Independent floored channel-NN recode to the CORRECT C-5/D-V3-11 semantics: NO
+	// zero-sub-norm skip and NO pre-rejection. For Cosine, nearest = minimum distance, and
+	// CosRefChannelPair floors any zero-sub-norm member (source OR target) to distance 0 -- so a
+	// zero-energy target is nearest to every source at distance 0, and a zero-energy source's
+	// every pair is 0 (its NN is 0). Reduced over ascending source order, closed with the
+	// subnormal floor -- bit-for-bit what a fixed MeanNN/MaxNNCrossDeviceChannel must return.
+	void ChannelNNFlooredRef(const BankView& src, const BankView& tgt, const ChannelInfo& ch,
+		float* outMean, float* outMax)
+	{
+		double acc = 0.0;
+		double best = 0.0;
+		bool have = false;
+		int32_t counted = 0;
+		for (int32_t s = 0; s < src.count; ++s)
+		{
+			const int8_t* srcSub = CosRefSubImage(src, s, ch);
+			double nn = 0.0;
+			bool haveNn = false;
+			for (int32_t t = 0; t < tgt.count; ++t)
+			{
+				const int8_t* tgtSub = CosRefSubImage(tgt, t, ch);
+				const double d =
+					static_cast<double>(CosRefChannelPair(srcSub, tgtSub, ch.length));
+				if (!haveNn || d < nn) // Cosine: nearest = minimum distance
+				{
+					nn = d;
+				}
+				haveNn = true;
+			}
+			if (!haveNn)
+			{
+				continue;
+			}
+			acc += nn;
+			if (!have || nn > best)
+			{
+				best = nn;
+			}
+			have = true;
+			++counted;
+		}
+		*outMean = counted > 0 ? CosRefXdFloor(acc / static_cast<double>(counted)) : 0.0f;
+		*outMax = have ? CosRefXdFloor(best) : 0.0f;
+	}
+
+	// Hand-builds a 2-channel (16+16 lane) Cosine Int8 scratch bank. Channel 1 (lanes 16..31)
+	// always carries energy so the whole row normalizes and Append succeeds; channel 0 (lanes
+	// 0..15) is EXACTLY zero on the rows flagged in zeroC0 (a valid row with a zero sub-norm
+	// channel member -- the C-5 shape) and informative elsewhere. seedMix varies the informative
+	// content so a source bank and a target bank point in different directions.
+	void BuildZeroEnergyChannelBank(ScratchBank& bank, const bool* zeroC0, int32_t n,
+		int32_t seedMix)
+	{
+		const int32_t d = 32;
+		const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+		CHECK(bank.Create(n, d, Metric::Cosine, Quantization::Int8, channels, 2) == Status::Ok);
+		for (int32_t r = 0; r < n; ++r)
+		{
+			float row[32] = {};
+			// Channel 1: always nonzero, varied per row (keeps the whole-row norm > 0).
+			row[16 + (r % 16)] = 1.0f + 0.07f * static_cast<float>((r + seedMix) % 11);
+			row[16 + ((r * 5 + 3) % 16)] += 0.5f + 0.03f * static_cast<float>(r % 7);
+			if (!zeroC0[r])
+			{
+				// Channel 0: informative, varied so cosine distances differ across rows/banks.
+				row[(r + seedMix) % 16] = 0.6f + 0.05f * static_cast<float>((r * 3) % 13);
+				row[(r * 7 + 1) % 16] += 0.4f + 0.02f * static_cast<float>((r + 2) % 9);
+			}
+			CHECK(bank.Append(row, d, nullptr) == Status::Ok);
+		}
+	}
+} // namespace
+
+// [P1-B1] Zero-energy channel NN divergence must FLOOR, not reject (C-5/D-V3-11).
+// NNDivergenceChannel currently returns ZeroNormQuery for a zero-sub-norm source sub-row
+// (analytics.cpp:523) and continue-skips a zero-sub-norm target (analytics.cpp:548), aborting
+// with InvalidArgument when every target is skipped -- contradicting C-5, which floors a zero
+// sub-norm MEMBER to a defined 0 in a reduction (as CentroidDistance/Spread already do through
+// XdChannelPairScore). Authored to the CORRECT behavior. RED now: scenario B fails on status
+// (ZeroNormQuery from the source pre-check); scenario A fails on value (the skipped zero target
+// yields a nonzero NN instead of the floored 0). GREEN once the operator floors instead of
+// rejecting/skipping.
+static void TestChannelNNZeroEnergyFloor()
+{
+	const int32_t n = 12;
+	const ChannelInfo ch0 = {0, 16};
+	Workspace ws;
+
+	// --- Scenario A: a zero-energy channel-0 TARGET row. The zero-energy target floors its pair
+	// to distance 0 (the Cosine minimum), so it is nearest to every source at distance 0 =>
+	// MeanNN and MaxNN over channel 0 are both exactly 0. Source is fully informative on ch 0.
+	{
+		bool srcZero[n] = {};
+		bool tgtZero[n] = {};
+		tgtZero[3] = true;
+		ScratchBank srcBank, tgtBank;
+		BuildZeroEnergyChannelBank(srcBank, srcZero, n, 0);
+		BuildZeroEnergyChannelBank(tgtBank, tgtZero, n, 4);
+		BankView src, tgt;
+		std::vector<uint32_t> st(ScratchBank::TombstoneWords(n), 0u);
+		std::vector<uint32_t> tt(ScratchBank::TombstoneWords(n), 0u);
+		CHECK(srcBank.Snapshot(&src, st.data()) == Status::Ok);
+		CHECK(tgtBank.Snapshot(&tgt, tt.data()) == Status::Ok);
+
+		std::vector<XdQuery> qbuf(n);
+		std::vector<Hit> hbuf(n);
+		std::vector<int32_t> nbuf(n);
+		float mn = -1.0f, mx = -1.0f;
+		const Status sMean = MeanNNCrossDeviceChannel(src, nullptr, tgt, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &mn);
+		const Status sMax = MaxNNCrossDeviceChannel(src, nullptr, tgt, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &mx);
+		CHECK_MSG(sMean == Status::Ok,
+			"B1-A: MeanNN over a zero-energy channel-0 target must FLOOR (Ok), not reject; "
+			"got status=%d", static_cast<int>(sMean));
+		CHECK_MSG(sMax == Status::Ok,
+			"B1-A: MaxNN over a zero-energy channel-0 target must FLOOR (Ok), not reject; "
+			"got status=%d", static_cast<int>(sMax));
+		if (sMean == Status::Ok && sMax == Status::Ok)
+		{
+			float refMean = 0.0f, refMax = 0.0f;
+			ChannelNNFlooredRef(src, tgt, ch0, &refMean, &refMax);
+			CHECK_MSG(refMean == 0.0f && refMax == 0.0f,
+				"B1-A fixture: a zero-energy target should make every NN 0 (ref mean %.9g max "
+				"%.9g)", static_cast<double>(refMean), static_cast<double>(refMax));
+			CHECK_MSG(mn == refMean,
+				"B1-A MeanNN != floored recode (zero target skipped instead of floored): "
+				"%.9g != %.9g", static_cast<double>(mn), static_cast<double>(refMean));
+			CHECK_MSG(mx == refMax,
+				"B1-A MaxNN != floored recode: %.9g != %.9g", static_cast<double>(mx),
+				static_cast<double>(refMax));
+		}
+	}
+
+	// --- Scenario B: two zero-energy channel-0 SOURCE rows, all targets informative on ch 0.
+	// Each zero-energy source's every pair floors to 0, so ITS nearest is 0; informative sources
+	// keep genuine (nonzero) nearest distances. The reduction must stay DEFINED (Ok) and equal
+	// the floored recode -- currently the source pre-check (analytics.cpp:523) aborts the whole
+	// reduction with ZeroNormQuery.
+	{
+		bool srcZero[n] = {};
+		srcZero[2] = true;
+		srcZero[9] = true;
+		bool tgtZero[n] = {};
+		ScratchBank srcBank, tgtBank;
+		BuildZeroEnergyChannelBank(srcBank, srcZero, n, 1);
+		BuildZeroEnergyChannelBank(tgtBank, tgtZero, n, 6);
+		BankView src, tgt;
+		std::vector<uint32_t> st(ScratchBank::TombstoneWords(n), 0u);
+		std::vector<uint32_t> tt(ScratchBank::TombstoneWords(n), 0u);
+		CHECK(srcBank.Snapshot(&src, st.data()) == Status::Ok);
+		CHECK(tgtBank.Snapshot(&tgt, tt.data()) == Status::Ok);
+
+		std::vector<XdQuery> qbuf(n);
+		std::vector<Hit> hbuf(n);
+		std::vector<int32_t> nbuf(n);
+		float mn = -1.0f, mx = -1.0f;
+		const Status sMean = MeanNNCrossDeviceChannel(src, nullptr, tgt, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &mn);
+		const Status sMax = MaxNNCrossDeviceChannel(src, nullptr, tgt, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &mx);
+		CHECK_MSG(sMean == Status::Ok,
+			"B1-B: a zero-energy channel-0 SOURCE row must be floored (its NN is 0), not reject "
+			"the whole reduction; MeanNN status=%d", static_cast<int>(sMean));
+		CHECK_MSG(sMax == Status::Ok,
+			"B1-B: a zero-energy channel-0 SOURCE row must be floored, not reject; MaxNN "
+			"status=%d", static_cast<int>(sMax));
+		if (sMean == Status::Ok && sMax == Status::Ok)
+		{
+			float refMean = 0.0f, refMax = 0.0f;
+			ChannelNNFlooredRef(src, tgt, ch0, &refMean, &refMax);
+			CHECK_MSG(refMax > 0.0f,
+				"B1-B fixture should have informative (nonzero) source NNs (recode max=%.9g)",
+				static_cast<double>(refMax));
+			CHECK_MSG(mn == refMean,
+				"B1-B MeanNN != floored recode: %.9g != %.9g", static_cast<double>(mn),
+				static_cast<double>(refMean));
+			CHECK_MSG(mx == refMax,
+				"B1-B MaxNN != floored recode: %.9g != %.9g", static_cast<double>(mx),
+				static_cast<double>(refMax));
+			// Independent spot check of "a zero-energy source's NN is 0": row 2's every pair
+			// floors to 0.
+			double nn2 = 1e30;
+			for (int32_t t = 0; t < tgt.count; ++t)
+			{
+				const double d = static_cast<double>(CosRefChannelPair(
+					CosRefSubImage(src, 2, ch0), CosRefSubImage(tgt, t, ch0), 16));
+				if (d < nn2)
+				{
+					nn2 = d;
+				}
+			}
+			CHECK_MSG(nn2 == 0.0, "B1-B: zero-energy source row NN should be 0, got %.9g", nn2);
+		}
+	}
+}
+
+// [P1-B2] Zero-energy per-channel recall must SKIP the sample, not abort (D-V3-7 / C-5).
+// MeasureScratchRecallPerChannel and FreezeWithRecall issue a segmented self-query per sampled
+// row; a sampled row whose channel sub-vector is zero-energy makes that per-channel Cosine
+// self-query ZeroNormQuery, and MeasureRecallLockedChannel (scratch.cpp:1503) returns it,
+// aborting the WHOLE audit. The API admits such rows (a valid row with a zero sub-norm channel).
+// Authored to the CORRECT behavior: the zero-energy self-query rows are excluded from that
+// channel's sample, not fatal. liveRows <= 1000 forces the reservoir to sample EVERY live row,
+// so the zero-energy rows are certainly hit. RED now (ZeroNormQuery), GREEN once the audit skips.
+static void TestScratchChannelPerChannelRecallZeroEnergy()
+{
+	Rng rng(0xB2E0E0ull);
+	const int32_t dims = 128;
+	const int32_t count = 160;
+	const ChannelInfo channels[2] = {{0, 64}, {64, 64}};
+	const uint64_t seed = ScratchBank::kDefaultRecallSeed;
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	int32_t zeroC0Rows = 0;
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims), 0.0f);
+		for (int32_t i = 64; i < 128; ++i)
+		{
+			row[static_cast<size_t>(i)] = rng.NextFloat(); // channel 1: always informative
+		}
+		const bool zeroC0 = (r % 11) == 0; // ~15 zero-energy channel-0 rows
+		if (!zeroC0)
+		{
+			for (int32_t i = 0; i < 64; ++i)
+			{
+				row[static_cast<size_t>(i)] = rng.NextFloat();
+			}
+		}
+		else
+		{
+			++zeroC0Rows;
+		}
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	CHECK(zeroC0Rows > 0);
+	// Tombstone a scatter (excluded from sampling) but never a zero-energy row -- those must stay
+	// live so they are sampled and force the abort under the current code.
+	for (int32_t r = 3; r < count; r += 17)
+	{
+		if ((r % 11) != 0)
+		{
+			CHECK(bank.Remove(r) == Status::Ok);
+		}
+	}
+
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	const Status s = bank.MeasureScratchRecallPerChannel(ws, reports, 2, seed);
+	CHECK_MSG(s == Status::Ok,
+		"B2: MeasureScratchRecallPerChannel must COMPLETE with zero-energy-channel rows sampled "
+		"(the zero self-query rows are skipped, not fatal); got status=%d", static_cast<int>(s));
+	if (s == Status::Ok)
+	{
+		for (int32_t c = 0; c < 2; ++c)
+		{
+			CHECK_MSG(reports[c].recall >= 0.0f && reports[c].recall <= 1.0f,
+				"B2 channel %d recall out of [0,1]: %g", c,
+				static_cast<double>(reports[c].recall));
+			CHECK(reports[c].seed == seed);
+			CHECK(reports[c].generation == bank.Generation());
+		}
+	}
+
+	// FreezeWithRecall re-measures per-channel recall over the compacted rows -- same audit, same
+	// abort bug. It too must complete.
+	{
+		const int32_t live = bank.FreezeLiveCount();
+		AlignedBuf frozenRows(static_cast<size_t>(live) *
+			PaddedDims(dims, Quantization::Int8) * ElementSize(Quantization::Int8));
+		std::vector<float> frozenScales(static_cast<size_t>(live));
+		std::vector<int32_t> indexMap(static_cast<size_t>(count), -2);
+		std::vector<float> frozenInvNorms(static_cast<size_t>(live) * 2);
+		ScratchRecallReport freezeReports[2];
+		const Status fs = bank.FreezeWithRecall(frozenRows.ptr, frozenScales.data(),
+			indexMap.data(), frozenInvNorms.data(), freezeReports, 2, ws, seed);
+		CHECK_MSG(fs == Status::Ok,
+			"B2: FreezeWithRecall must COMPLETE with zero-energy-channel rows sampled; "
+			"got status=%d", static_cast<int>(fs));
+		if (fs == Status::Ok)
+		{
+			for (int32_t c = 0; c < 2; ++c)
+			{
+				CHECK(freezeReports[c].recall >= 0.0f && freezeReports[c].recall <= 1.0f);
+			}
+		}
+	}
+}
+
+// [hole] Cross-device CHANNEL-analytics golden. The forced-path channel tests prove local
+// scalar/SSE/AVX agreement but pin NO golden constant for the channel operators -- a platform
+// can be self-consistent yet differ from another device (notably the per-channel cosine sqrt
+// path), and v3.0 makes cross-device claims. This pins a golden over all four
+// *CrossDeviceChannel operators (Dot, Cosine, L2), every channel, across the forced-SIMD sweep --
+// the channel analog of kGoldenAnalyticsXdHash. The fixture is NON-degenerate (every channel
+// carries energy on every row) so the pin is invariant under the B1/B2 zero-energy fix, which
+// touches only degenerate math. GREEN: it locks the channel operators' cross-device value.
+namespace
+{
+	uint64_t ChannelAnalyticsBattery(const BankView& src, const BankView& tgt,
+		const std::vector<ChannelInfo>& channels, Metric metric, Workspace& ws, uint64_t h)
+	{
+		const int32_t count = src.count;
+		const int32_t idxA[6] = {0, 4, 9, 17, 22, 30};
+		const int32_t idxB[6] = {2, 7, 12, 20, 25, 31};
+		std::vector<int32_t> allRows(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i)
+		{
+			allRows[static_cast<size_t>(i)] = i;
+		}
+		for (int32_t c = 0; c < static_cast<int32_t>(channels.size()); ++c)
+		{
+			AlignedBuf a(static_cast<size_t>(src.paddedDims));
+			AlignedBuf b(static_cast<size_t>(src.paddedDims));
+			float cd = 0.0f;
+			CentroidDistanceCrossDeviceChannel(src, idxA, 6, nullptr, nullptr, src, idxB, 6,
+				nullptr, nullptr, metric, c, a.I8(), b.I8(), &cd);
+			an::Hash(h, cd);
+
+			AlignedBuf cs(static_cast<size_t>(src.paddedDims));
+			float sm = 0.0f, sx = 0.0f;
+			SpreadCrossDeviceChannel(src, allRows.data(), count, nullptr, Reduce::Mean, c,
+				cs.I8(), &sm);
+			SpreadCrossDeviceChannel(src, allRows.data(), count, nullptr, Reduce::Max, c,
+				cs.I8(), &sx);
+			an::Hash(h, sm);
+			an::Hash(h, sx);
+
+			std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+			std::vector<Hit> hbuf(static_cast<size_t>(count));
+			std::vector<int32_t> nbuf(static_cast<size_t>(count));
+			float mn = 0.0f, mx = 0.0f;
+			MeanNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c, qbuf.data(), hbuf.data(),
+				nbuf.data(), ws, &mn);
+			MaxNNCrossDeviceChannel(src, nullptr, tgt, nullptr, c, qbuf.data(), hbuf.data(),
+				nbuf.data(), ws, &mx);
+			an::Hash(h, mn);
+			an::Hash(h, mx);
+		}
+		return h;
+	}
+} // namespace
+
+static void TestChannelAnalyticsCrossDeviceGolden()
+{
+	Rng rng(0x043A9A17ull); // fixed seed -> deterministic, pinnable fixture
+	const int32_t dims = 64;
+	const int32_t count = 48;
+
+	ScratchChannelFixture dotSrc, dotTgt, cosSrc, cosTgt, l2Src, l2Tgt;
+	MakeChannelScratchBank(dotSrc, rng, count, dims, Metric::Dot, Quantization::Int8);
+	MakeChannelScratchBank(dotTgt, rng, count, dims, Metric::Dot, Quantization::Int8);
+	MakeChannelScratchBank(cosSrc, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	MakeChannelScratchBank(cosTgt, rng, count, dims, Metric::Cosine, Quantization::Int8);
+	MakeChannelScratchBank(l2Src, rng, count, dims, Metric::L2, Quantization::Int8);
+	MakeChannelScratchBank(l2Tgt, rng, count, dims, Metric::L2, Quantization::Int8);
+	if (dotSrc.createStatus != Status::Ok)
+	{
+		return; // slot-2 unbuilt: nothing to pin
+	}
+
+	struct Pair
+	{
+		ScratchChannelFixture* s;
+		ScratchChannelFixture* t;
+		Metric m;
+	};
+	Pair pairs[3] = {{&dotSrc, &dotTgt, Metric::Dot}, {&cosSrc, &cosTgt, Metric::Cosine},
+		{&l2Src, &l2Tgt, Metric::L2}};
+
+	// Snapshot each pair once: bank construction is not the SIMD-sensitive part; only the
+	// operators are, and they run under the forced paths below.
+	BankView srcV[3], tgtV[3];
+	std::vector<uint32_t> st[3], tt[3];
+	for (int32_t p = 0; p < 3; ++p)
+	{
+		st[p].assign(ScratchBank::TombstoneWords(count), 0u);
+		tt[p].assign(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(pairs[p].s->bank.Snapshot(&srcV[p], st[p].data()) == Status::Ok);
+		CHECK(pairs[p].t->bank.Snapshot(&tgtV[p], tt[p].data()) == Status::Ok);
+	}
+
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+
+	Workspace ws;
+	uint64_t hashes[4] = {};
+	for (size_t i = 0; i < paths.size(); ++i)
+	{
+		detail::ForceXdSimdPath(paths[i]);
+		uint64_t h = 0xcbf29ce484222325ull;
+		for (int32_t p = 0; p < 3; ++p)
+		{
+			h = ChannelAnalyticsBattery(srcV[p], tgtV[p], pairs[p].s->channels, pairs[p].m, ws, h);
+		}
+		hashes[i] = h;
+		detail::ClearForcedXdSimdPath();
+		if (i > 0)
+		{
+			CHECK_MSG(hashes[i] == hashes[0],
+				"channel analytics forced path %d hash %016llx != %016llx",
+				static_cast<int>(paths[i]),
+				static_cast<unsigned long long>(hashes[i]),
+				static_cast<unsigned long long>(hashes[0]));
+		}
+	}
+	uint64_t def = 0xcbf29ce484222325ull;
+	for (int32_t p = 0; p < 3; ++p)
+	{
+		def = ChannelAnalyticsBattery(srcV[p], tgtV[p], pairs[p].s->channels, pairs[p].m, ws, def);
+	}
+	CHECK(def == hashes[0]);
+	std::printf("channel analytics cross-device hash: %016llx (%d forced paths agree)\n",
+		static_cast<unsigned long long>(def), static_cast<int>(paths.size()));
+	if constexpr (xdfix::kGoldenChannelAnalyticsXdHash != 0)
+	{
+		CHECK_MSG(def == xdfix::kGoldenChannelAnalyticsXdHash,
+			"channel analytics hash %016llx != pinned golden %016llx",
+			static_cast<unsigned long long>(def),
+			static_cast<unsigned long long>(xdfix::kGoldenChannelAnalyticsXdHash));
+	}
+}
+
+// [hole] Per-channel recall INDEPENDENT oracle. The shipped per-channel recall test smoke-checks
+// [0,1] + metadata only. This recomputes recall@k independently -- a float64 brute-force top-k
+// over each channel's sub-range on the RETAINED rows (bank.RetainedRow) vs the bank's own
+// quantized per-channel scan (public Query on the snapshot) -- with the SAME seed/sample
+// discipline, and asserts MeasureScratchRecallPerChannel's number equals it bit-for-bit. The
+// fixture keeps liveRows <= 1000 so the reservoir samples EVERY live row (sampleTarget ==
+// liveRows => rng.Unit()*remaining < needed always), making the sample set the whole live
+// population -- independent of the internal RNG. GREEN: the recall math is correct; this locks it.
+static void TestPerChannelRecallOracle()
+{
+	Rng rng(0x0BAC1E5ull);
+	const int32_t dims = 128;
+	const int32_t count = 240; // <= 1000 -> all live rows sampled; >= kRecallInformativeRows live
+	const ChannelInfo channels[2] = {{0, 64}, {64, 64}};
+	const uint64_t seed = ScratchBank::kDefaultRecallSeed;
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source)
+	{
+		v = rng.NextFloat();
+	}
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	for (int32_t r = 7; r < count; r += 19)
+	{
+		CHECK(bank.Remove(r) == Status::Ok);
+	}
+
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	CHECK(bank.MeasureScratchRecallPerChannel(ws, reports, 2, seed) == Status::Ok);
+
+	BankView view;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(bank.Count()), 0u);
+	CHECK(bank.Snapshot(&view, tombs.data()) == Status::Ok);
+	const int32_t snapCount = view.count;
+
+	auto isDead = [&](int32_t i) -> bool {
+		return (tombs[static_cast<size_t>(i >> 5)] & (1u << (i & 31))) != 0;
+	};
+	int32_t liveRows = 0;
+	for (int32_t i = 0; i < snapCount; ++i)
+	{
+		if (!isDead(i))
+		{
+			++liveRows;
+		}
+	}
+	CHECK(liveRows <= 1000); // the all-rows-sampled precondition
+	const int32_t k = liveRows - 1 < 10 ? (liveRows - 1) : 10;
+
+	for (int32_t c = 0; c < 2; ++c)
+	{
+		const ChannelInfo& ch = channels[c];
+		const int32_t lo = ch.offset;
+		const int32_t hi = ch.offset + ch.length < dims ? ch.offset + ch.length : dims;
+
+		std::vector<uint32_t> exclude = tombs;
+		const QuerySegment seg[1] = {{ch.offset, ch.length, 1.0f}};
+		QueryParams params;
+		params.k = k;
+		params.segments = seg;
+		params.segmentCount = 1;
+		params.excludeBits = exclude.data();
+		params.exactness = Exactness::CrossDevice;
+
+		std::vector<float> query(static_cast<size_t>(view.paddedDims));
+		int64_t totalHits = 0;
+		int64_t totalPossible = 0;
+
+		struct Cand
+		{
+			double score;
+			int32_t idx;
+		};
+		std::vector<Cand> cands;
+		for (int32_t si = 0; si < snapCount; ++si)
+		{
+			if (isDead(si))
+			{
+				continue;
+			}
+			const float* self = bank.RetainedRow(si);
+			CHECK(self != nullptr);
+			for (int32_t d = 0; d < dims; ++d)
+			{
+				query[static_cast<size_t>(d)] = self[d];
+			}
+			for (int32_t d = dims; d < view.paddedDims; ++d)
+			{
+				query[static_cast<size_t>(d)] = 0.0f;
+			}
+
+			// Independent float64 reference top-k over the channel sub-range on the RETAINED
+			// rows, with RecallTopK's exact ordering (score desc for Cosine; lower index wins
+			// ties). Same score formula and accumulation order as the audit's own reference.
+			cands.clear();
+			for (int32_t j = 0; j < snapCount; ++j)
+			{
+				if (j == si || isDead(j))
+				{
+					continue;
+				}
+				const float* rrow = bank.RetainedRow(j);
+				double dot = 0.0, subNorm = 0.0;
+				for (int32_t d = lo; d < hi; ++d)
+				{
+					dot += static_cast<double>(self[d]) * rrow[d];
+					subNorm += static_cast<double>(rrow[d]) * rrow[d];
+				}
+				const double score = subNorm > 0.0 ? dot / std::sqrt(subNorm) : 0.0;
+				cands.push_back({score, j});
+			}
+			std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+				if (a.score != b.score)
+				{
+					return a.score > b.score;
+				}
+				return a.idx < b.idx;
+			});
+			const int32_t refCount =
+				k < static_cast<int32_t>(cands.size()) ? k : static_cast<int32_t>(cands.size());
+
+			// The bank's own quantized per-channel scan (identical params to the audit).
+			exclude[static_cast<size_t>(si >> 5)] |= 1u << (si & 31);
+			std::vector<Hit> heap(static_cast<size_t>(k > 0 ? k : 1));
+			int32_t got = 0;
+			const Status qs = Query(view, query.data(), params, ws, heap.data(), &got);
+			exclude[static_cast<size_t>(si >> 5)] &= ~(1u << (si & 31));
+			CHECK(qs == Status::Ok);
+
+			for (int32_t i = 0; i < got; ++i)
+			{
+				for (int32_t rr = 0; rr < refCount; ++rr)
+				{
+					if (cands[static_cast<size_t>(rr)].idx == heap[static_cast<size_t>(i)].index)
+					{
+						++totalHits;
+						break;
+					}
+				}
+			}
+			totalPossible += refCount;
+		}
+
+		const float oracle =
+			totalPossible > 0 ? static_cast<float>(static_cast<double>(totalHits) /
+									static_cast<double>(totalPossible))
+							  : 0.0f;
+		CHECK_MSG(oracle == reports[c].recall,
+			"per-channel recall oracle mismatch (ch=%d): independent %.9g != report %.9g "
+			"(hits=%lld possible=%lld)",
+			c, static_cast<double>(oracle), static_cast<double>(reports[c].recall),
+			static_cast<long long>(totalHits), static_cast<long long>(totalPossible));
+	}
+}
+
+// [hole] Version/header coherence. version.h must declare v3.0.0 for the v3.0 release. RED now
+// (it reads 2/5/0); Hastings bumps it. Kept as a standalone assertion so the release-version
+// truth has a test, not just a header edit.
+static void TestVersionHeaderCoherence()
+{
+	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.0, got %d", SUPERFAISS_VERSION_MAJOR);
+	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 0,
+		"SUPERFAISS_VERSION_MINOR should be 0 for v3.0, got %d", SUPERFAISS_VERSION_MINOR);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
+		"SUPERFAISS_VERSION_PATCH should be 0 for v3.0, got %d", SUPERFAISS_VERSION_PATCH);
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -10987,6 +11612,12 @@ int main()
 	TestBankAnalytics();
 	TestProjectionReport();
 	TestAnalyticsScratchSnapshot();
+	// v3.0.1 red suite (Curie): two P1 correctness bugs + three coverage holes.
+	TestChannelNNZeroEnergyFloor();
+	TestScratchChannelPerChannelRecallZeroEnergy();
+	TestChannelAnalyticsCrossDeviceGolden();
+	TestPerChannelRecallOracle();
+	TestVersionHeaderCoherence();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
