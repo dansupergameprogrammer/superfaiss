@@ -360,6 +360,34 @@ zero-norm centroid (antipodal members cancelling) is `ZeroNormQuery`; a desynced
 `XdQuery` payload (scale/self-dot mismatch) is `InvalidArgument`. Over a mutable bank,
 take a `ScratchBank::Snapshot()` first and pass its tombstone words as the exclude bits.
 
+**Channel-scoped analytics (v3.0).** Each operator gains a `channel`-parameterized form
+that pools or scores over `[channel.offset, channel.offset + channel.length)` instead of
+the whole row — new surface for baked banks and scratch snapshots alike:
+
+```cpp
+Status CentroidDistanceCrossDeviceChannel(/* CentroidDistanceCrossDevice args */,
+    Metric, int32_t channel, int8_t* scratchA, int8_t* scratchB, float* out);
+Status MeanNNCrossDeviceChannel(const BankView& source, const uint32_t* srcExclude,
+    const BankView& target, const uint32_t* tgtExclude, int32_t channel,
+    XdQuery*, Hit*, int32_t*, Workspace&, float* out);   // MaxNNCrossDeviceChannel: order-free max
+Status SpreadCrossDeviceChannel(const BankView&, const int32_t* rows, int32_t rowCount,
+    const uint32_t* exclude, Reduce, int32_t channel, int8_t* scratch, float* out);
+```
+
+The `channel` indexes the bank's channel table. For Dot/L2 it is a sub-range of the
+existing integer accumulation (the overflow bound only shrinks). **For Cosine the reduction
+recomputes the sub-range integer self-dot and applies one IEEE correctly-rounded `sqrt` —
+`1 − crossDot / sqrt(aSq·bSq)` — it does NOT read the per-row `channelInvNorms`;** the
+integer-exact sub-range accumulation + correctly-rounded double `sqrt` is the
+cross-device-exact reference, while the per-row float sub-norms are a query-path scoring
+convenience that is not cross-device-exact. Scratch sizing matches the whole-vector
+operators. A channel outside `[0, channelCount)`, or a bank with no channel table, is
+`InvalidArgument`; a degenerate zero-sub-norm channel member floors to a defined `0` in a
+reduction (a single per-channel query on a zero-norm sub-vector is still `ZeroNormQuery`).
+"This mind's identity is drifting but its appearance is stable" is a `CentroidDistanceCross
+DeviceChannel` over the identity channel versus the appearance channel across checkpoints.
+Determinism per channel: [DETERMINISM.md §2e](DETERMINISM.md).
+
 ## pca.h — inspection projections (v1.1)
 
 ```cpp
@@ -384,6 +412,9 @@ class ScratchBank {              // single writer, lock-free readers
                   const Allocator& = DefaultAllocator());   // ONE arena allocation
     Status Create(int32_t capacity, int32_t dims, Metric, Quantization,
                   bool retainFloats, const Allocator& = ...); // v2.3 retention overload
+    Status Create(int32_t capacity, int32_t dims, Metric, Quantization,   // v3.0 channel overload
+                  const ChannelInfo* channels, int32_t channelCount,       //   table fixed at Create
+                  bool retainFloats = false, const Allocator& = ...);
     Status Append(const float* row, int32_t dims, int32_t* outIndex);
     Status Remove(int32_t index);                 // atomic tombstone; idempotent
     Status Snapshot(BankView* outView, uint32_t* outTombstones) const;
@@ -393,6 +424,15 @@ class ScratchBank {              // single writer, lock-free readers
                   ScratchRecallReport* outReport = nullptr,   // v2.3: fresh number
                   Workspace* recallWs = nullptr,              //   over the compacted rows
                   uint64_t recallSeed = kDefaultRecallSeed) const;
+    Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap,   // v3.0 channel-aware:
+                  float* outChannelInvNorms, ScratchRecallReport* = nullptr,//   sub-norms re-derived
+                  Workspace* = nullptr, uint64_t = kDefaultRecallSeed) const;//  over compacted rows
+    Status FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap, // v3.0 (D-V3-7)
+                  float* outChannelInvNorms, ScratchRecallReport* outRecallReports, //  per-channel
+                  int32_t reportCount, Workspace&, uint64_t = kDefaultRecallSeed) const;
+    int32_t GetChannelCount() const;  const ChannelInfo* GetChannels() const;       // v3.0 table read-back
+    Status MeasureScratchRecallPerChannel(Workspace&, ScratchRecallReport* outReports, // v3.0 (D-V3-7)
+                  int32_t reportCount, uint64_t seed = kDefaultRecallSeed);          //   recall@k per channel
     Status Save(const ScratchArchive&) const;     // writer-side
     Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE
     int32_t Count(); int32_t LiveCount(); int32_t Capacity();
@@ -471,6 +511,29 @@ with retention absent — defined), hard-rejects anything else as `BadFormat`,
 and bounds the archive geometry before any allocation arithmetic
 (`paddedDims <= kMaxCrossDeviceDims`, capacity <= 2^28 rows — absurd headers
 are a format defect, not an allocator outcome).
+
+**Channels on a mutable bank (v3.0):** the channel table — a partition of the
+row into named sub-ranges (`ChannelInfo` = offset + length, ascending,
+non-overlapping, on the 16-byte element grid, up to `kMaxChannels = 8`) —
+becomes a scratch-bank property set at `Create` and **fixed for the bank's
+lifetime**; `Append` validates each row against it. On a Cosine channel bank,
+`Append` computes the appended row's per-channel inverse sub-norms
+per-row-standalone from the quantized bytes and folds a `capacity × channelCount`
+sub-norm arena into the same single allocation (Dot/L2 channel banks carry none —
+a per-channel Dot/L2 score is a plain segment dot / squared distance). `Snapshot`
+populates the view's channel fields, so every query entry point and every
+channel-scoped analytics operator serves named-channel and raw-range queries on
+the snapshot with the exact code baked banks use. Channel-aware `Freeze`
+graduates the bank to a `schemaVersion 2` baked asset, re-deriving the
+per-channel sub-norms over the compacted (live) rows;
+`MeasureScratchRecallPerChannel` and the channel-aware `FreezeWithRecall` report
+recall@k per channel over each sub-range (a retention-enabled Cosine channel
+bank; `InvalidArgument` otherwise). **Cost, stated plainly:** append-time only —
+the per-channel sub-norm adds ~14% (~194 ns) to a Cosine int8 append at 4
+channels / 256 dims and never touches the read path; the sub-norm arena is
+`channelCount × 4` bytes/row (16 B/row at 4 channels — 1.6% of the §20 retention
+arena, never the shipping default). Archive format: [FORMAT.md](FORMAT.md) §3;
+channel-scoped analytics: the `analytics.h` section above.
 
 ## alloc.h — memory policy
 

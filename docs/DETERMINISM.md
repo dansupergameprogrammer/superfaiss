@@ -134,6 +134,12 @@ Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
 after the `Remove`, and a snapshot, once taken, is immutable — querying it
 twice is bit-identical regardless of concurrent writer activity.
 
+Channels (v3.0) ride the same guarantee: a scratch bank's fixed channel table
+and its per-channel inverse sub-norms — computed per-row-standalone at append
+from the quantized bytes, re-derived identically on `Load` and at `Freeze` —
+make a named-channel query on a snapshot bit-identical to the same query on a
+bank baked from the same live rows.
+
 One quiescence caveat (v2.3): `MeasureScratchRecall` sweeps many self-queries
 under a reader pin, not exclusivity, so its number is well-defined — and
 reproducible given history — only when no writer runs concurrently; a racing
@@ -174,6 +180,16 @@ substitute an `rsqrt` and diverge cosine scores across machines, and `-ffp-contr
 alone does not stop that substitution. The core suite proves the result: the analytics
 battery carries its own pinned hash (`kGoldenAnalyticsXdHash`), asserted bit-identical across
 the CI matrix and across MSVC / GCC / AppleClang, the cosine pair (with its `sqrt`) included.
+
+Channel-scoped analytics (v3.0) are the same operators over a sub-range and carry the same
+contract per channel. Dot/L2 are a sub-range of the identical integer accumulation. The
+Cosine limb recomputes the channel sub-range's integer self-dot and applies the same true
+IEEE-754 correctly-rounded `sqrt` per channel — `1 − crossDot / sqrt(aSq·bSq)` over
+`[offset, offset+length)`, NOT the per-row `channelInvNorms` — so it inherits the build
+condition above (no `rsqrt`, no fast-math) once per channel. The per-channel cosine `sqrt`
+is proven across the CI forced-path + cross-runner golden battery with an adversarial
+tiny-channel-norm member, and a bit-exact Cosine channel-analytics REF (an independent
+integer-domain recode of the epilogue) asserts the operator matches the contract.
 
 `ProjectionReport` (v2.5) is per-device float only — an offline authoring/inspection tool
 with no cross-device claim — and stands outside this contract.

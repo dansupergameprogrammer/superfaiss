@@ -114,6 +114,15 @@ default; measure recall@10 of the quantized bank against its float32 source with
 re-imports are no-ops; reject malformed input with a specific diagnostic and no partial
 asset.
 
+**Channel-capable scratch (v3.0).** If your consumer partitions a vector into named
+sub-spaces (identity vs appearance, belief vs precedent), set the channel table at
+`ScratchBank::Create` — it is fixed for the bank's lifetime. Named-channel and whole-vector
+queries then both dispatch on a snapshot, and the channel-scoped analytics operators give
+per-channel drift/spread/divergence. Budget the append-time sub-norm cost (Cosine only,
+~14% per append at 4 channels / 256 dims, never on the read path) and the `channelCount × 4`
+bytes/row sub-norm arena. The scratch concurrency contract is unchanged — single writer,
+lock-free snapshot readers, exclusive `Grow`/`Freeze`/`Load` (§3, and DETERMINISM.md §2b).
+
 ## 5. The performance model (what to expect, and why batch exists)
 
 A flat scan is a memory stream: cost ≈ bank bytes ÷ bandwidth, until SIMD makes it

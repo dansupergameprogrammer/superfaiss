@@ -111,22 +111,36 @@ file, save-game blob, network; the bank owns the format):
 | Field | Type | Notes |
 |---|---|---|
 | magic | u32 | `0x42535346` |
-| version | u32 | `1`, or `2` when the bank retains floats (v2.3) |
+| version | u32 | `1`; `2` when the bank retains floats (v2.3); `3` when it carries channels (v3.0) |
 | capacity | i32 | arena capacity restored on load; `<= 2^28` |
 | count | i32 | published rows; `0 <= count <= capacity` |
 | dims | i32 | logical dims |
 | paddedDims | i32 | must equal `PaddedDims(dims, quant)`; `<= 131072` |
 | metric, quant | u8, u8 | enum values; 6 reserved bytes follow |
+| flags | u8 | **`reserved[0]` (header offset 26), v3.0:** bit 0 = retention present, bit 1 = channels present; bits 2–7 reserved and tolerated. Authoritative when `version` is 3 |
+| channelCount | i32 | **flag bit 1 only:** entries in the channel table that follows |
+| channel table | ChannelInfo[channelCount] | **flag bit 1 only:** the fixed channel partition (`offset` + `length` per entry) |
 | rows | payload | `count x paddedDims` elements, baked layout (section 2) |
 | scales | f32[count] | int8 banks only |
 | tombstones | u32[ceil(count/32)] | bit set = removed row |
-| retained floats | f32[count x dims] | **version 2 only** (v2.3 recall audit): the post-normalization source rows, index-aligned with `rows` |
+| retained floats | f32[count x dims] | **flag bit 0 (version 2, or version 3 with retention)** (v2.3 recall audit): the post-normalization source rows, index-aligned with `rows` |
 
 Versioning (v2.3): a bank created with float retention writes version 2 and
 appends the retained rows; a bank without retention still writes version 1,
 byte-identical to pre-v2.3. The reader accepts versions 1 and 2 — a version-1
 blob loads with retention absent (defined) — and hard-rejects anything else
 (`BadFormat`), the standing old-reader/new-data law.
+
+Versioning (v3.0): a channel-carrying bank writes version 3 and sets flag bit 1;
+the `channelCount` and channel table are serialized after the header. Retention
+and channels are independent flag bits, so a channels-and-retention bank (a valid
+config a linear version integer could not encode) round-trips. The per-channel
+sub-norm arena is **not** serialized — `Load` re-derives it from the loaded
+quantized rows + channel table + scales (the same per-row-standalone computation
+as `Append`) and asserts it bit-equals a fresh derivation, removing an
+archive-size cost and a desync surface. `Load` re-validates the channel table with
+the `Create` rules (reject-over-degrade); old v1/v2 readers hard-reject version 3,
+and a legacy v1/v2 archive still loads on a v3 reader.
 
 Load is reject-over-degrade: a bad magic/version, inconsistent or out-of-bounds
 header geometry (the capacity/paddedDims ceilings above are checked before any

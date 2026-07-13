@@ -9,6 +9,41 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.0.0] — 2026-07-12
+
+### Added
+- **Channel-capable scratch banks** — the channel table (a bank-side partition of the row
+  into named sub-ranges, `ChannelInfo` = offset + length, up to `kMaxChannels = 8`) becomes
+  a mutable-bank property set at `Create` and fixed for the bank's lifetime. A new `Create`
+  overload validates the table with the importer's rules (in-bounds, ascending,
+  non-overlapping, on the 16-byte element grid). On a Cosine bank, `Append` computes the
+  appended row's per-channel inverse sub-norms per-row-standalone from the quantized row and
+  folds a `capacity × channelCount` sub-norm arena into the single allocation (Dot/L2 channel
+  banks need none). `Snapshot` carries the table, so every query and analytics entry point
+  serves named-channel and raw-range queries on a scratch snapshot with the exact code baked
+  banks use. Channel-aware `Freeze` graduates a channel scratch bank to a `schemaVersion 2`
+  baked asset, re-deriving the per-channel sub-norms over the compacted rows. Per-channel
+  recall audit (`MeasureScratchRecallPerChannel`, and the channel-aware `FreezeWithRecall`)
+  reports recall@k per channel over each sub-range.
+- **Channel-scoped analytics** — every v2.5 analytics operator gains a channel-scoped form
+  (`CentroidDistanceCrossDeviceChannel`, `MeanNNCrossDeviceChannel`, `MaxNNCrossDeviceChannel`,
+  `SpreadCrossDeviceChannel`) that pools/scores over one channel's sub-range instead of the
+  whole row — new surface for baked and scratch banks alike. "This mind's identity is drifting
+  but its appearance is stable" is a channel-scoped centroid distance over the identity channel
+  versus the appearance channel. Dot/L2 are a sub-range of the same integer accumulation;
+  Cosine recomputes the sub-range integer self-dot and applies one IEEE correctly-rounded
+  `sqrt`, cross-device bit-exact per channel (it does not read the per-row `channelInvNorms`).
+  A degenerate (zero-sub-norm) channel member floors to a defined `0` in a reduction, while a
+  single per-channel query on a zero-norm sub-vector is still rejected (`ZeroNormQuery`).
+
+### Changed
+- The scratch-bank archive gains a **presence-flags byte** (`reserved[0]`, header offset 26:
+  bit 0 retention, bit 1 channels) and writes **version 3** when the bank carries channels; a
+  channel-less bank still writes version 1/2 byte-identically. The channel table is serialized
+  when its flag is set; the per-channel sub-norm arena is NOT serialized — it is re-derived on
+  `Load` from the quantized rows + channel table + scales and asserted bit-equal to a fresh
+  derivation. Old v1/v2 readers hard-reject version 3.
+
 ## [2.5.0] — 2026-07-12
 
 ### Added

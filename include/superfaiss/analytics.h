@@ -98,13 +98,18 @@ Status SpreadCrossDevice(
 // [bank.channels[channel].offset, +length) instead of [0, paddedDims). `channel`
 // indexes the bank's channel table (bank.channels / bank.channelCount); the operator
 // pools and scores over that sub-range only. Dot/L2 are a sub-range of the same integer
-// accumulation (the overflow bound only shrinks); Cosine uses the per-channel inverse
-// sub-norms the channel table carries (bank.channelInvNorms baked / the scratch sub-norm
-// arena on a snapshot), so the Cosine forms depend on Tier-1's sub-norm machinery. New
-// surface for ALL banks (baked + scratch); a scratch snapshot inherits it once Tier 1 put
-// the channel table on the snapshot. A bank with no channel table, or `channel` outside
-// [0, channelCount), is InvalidArgument; an all-zero-norm channel scores 0 (defined). The
-// scratch scratch-buffer sizing matches the whole-vector operators.
+// accumulation (the overflow bound only shrinks); Cosine recomputes the sub-range integer
+// self-dot and applies one IEEE correctly-rounded sqrt (1 - crossDot/sqrt(aSq*bSq)) -- it
+// does NOT read the per-row channelInvNorms (C-4/D-V3-10): the integer-exact sub-range
+// accumulation + correctly-rounded double sqrt is the cross-device reference, while the
+// per-row float channelInvNorms are a query-path scoring convenience that is not
+// cross-device-exact. Channel-scoped Cosine therefore depends only on the channel table,
+// not the sub-norm arena. New surface for ALL banks (baked + scratch); a scratch snapshot
+// inherits it once Tier 1 put the channel table on the snapshot. A bank with no channel
+// table, or `channel` outside [0, channelCount), is InvalidArgument; a zero-sub-norm
+// channel member floors to a defined 0 in a reduction (C-5/D-V3-11), while a single
+// per-channel query on a zero-norm sub-vector still rejects (ZeroNormQuery). The scratch
+// scratch-buffer sizing matches the whole-vector operators.
 Status CentroidDistanceCrossDeviceChannel(
 	const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
 	const int32_t* weightsA, const uint32_t* excludeBitsA,
