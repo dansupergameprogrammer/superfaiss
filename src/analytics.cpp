@@ -453,10 +453,14 @@ Status MakeChannelCentroid(const BankView& bank, const int32_t* rowIndices, int3
 Status NNDivergenceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel, Reduce reduce,
-	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, float* outValue)
+	XdQuery* queryScratch, float* outValue)
 {
-	if (outValue == nullptr || queryScratch == nullptr || hitScratch == nullptr ||
-		countScratch == nullptr || !IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
+	// Unlike the whole-vector NNDivergence (which routes through QueryXdBatch), the channel
+	// path scores each nearest in place, so it needs only the source-lift buffer
+	// (queryScratch) — the Hit/count/Workspace scratch the public signature carries for
+	// parity with the whole-vector twin is unused here and not required non-null (Poirot #2).
+	if (outValue == nullptr || queryScratch == nullptr ||
+		!IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
 		source.paddedDims != target.paddedDims)
 	{
 		return Status::InvalidArgument;
@@ -625,21 +629,21 @@ Status CentroidDistanceCrossDeviceChannel(
 Status MeanNNCrossDeviceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
-	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace&,
+	XdQuery* queryScratch, Hit*, int32_t*, Workspace&,
 	float* outValue)
 {
 	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
-		Reduce::Mean, queryScratch, hitScratch, countScratch, outValue);
+		Reduce::Mean, queryScratch, outValue);
 }
 
 Status MaxNNCrossDeviceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
-	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace&,
+	XdQuery* queryScratch, Hit*, int32_t*, Workspace&,
 	float* outValue)
 {
 	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
-		Reduce::Max, queryScratch, hitScratch, countScratch, outValue);
+		Reduce::Max, queryScratch, outValue);
 }
 
 Status SpreadCrossDeviceChannel(
