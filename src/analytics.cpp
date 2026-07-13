@@ -382,44 +382,329 @@ Status SpreadCrossDevice(
 	return Status::Ok;
 }
 
-// SCAFFOLD (Curie, slot-4 red suite, plan section 23.9): the four channel-scoped Tier-2
-// operators are declared in analytics.h so the slot-4 suite compiles and links against the
-// interface the plan specifies (section 23.5), but their bodies -- pooling/scoring over
-// [channel.offset, +length), the Dot/L2 sub-range integer path and the Cosine per-channel
-// sub-norm path -- are not implemented. All four unconditionally return BadAlignment, a
-// status no section 23.8 slot-4 cell expects (Ok on a valid channel bank; InvalidArgument
-// on a no-table / out-of-range channel; ZeroNormQuery on a zero-norm Cosine channel), so
-// every REF/FEAT/composition/determinism cell fails at a specific runtime assertion for the
-// one true reason -- the operators do not exist yet -- never at compile or link time.
-// Hastings replaces these bodies with the real section-23.5 implementation; this comment is
-// removed with them.
-Status CentroidDistanceCrossDeviceChannel(
-	const BankView&, const int32_t*, int32_t, const int32_t*, const uint32_t*,
-	const BankView&, const int32_t*, int32_t, const int32_t*, const uint32_t*,
-	Metric, int32_t, int8_t*, int8_t*, float*)
+// --- V3.0 Tier 2: channel-scoped analytics (plan section 23.5) ---
+
+namespace
 {
-	return Status::BadAlignment;
+
+// Resolves `channel` against the bank's channel table to its element sub-range. False when
+// the bank carries no channel table or the selector is out of [0, channelCount) -- the
+// InvalidArgument the section 23.8 rejection cells require.
+inline bool ChannelSubRange(const BankView& bank, int32_t channel, int32_t* outOffset,
+	int32_t* outLength)
+{
+	if (bank.channels == nullptr || bank.channelCount <= 0 || channel < 0 ||
+		channel >= bank.channelCount)
+	{
+		return false;
+	}
+	*outOffset = bank.channels[channel].offset;
+	*outLength = bank.channels[channel].length;
+	return true;
+}
+
+// Pair score over a `length`-lane channel sub-range: the whole-vector cross-device epilogue
+// (bit-identical to the shipped scan for Dot/L2), except a zero sub-norm member under Cosine
+// scores a DEFINED 0 distance instead of the public boundary's ZeroNormQuery -- the plan's
+// "all-zero channel scores 0, never NaN". Linear metrics never hit the guard, so the Dot/L2
+// repack REF stays bit-exact.
+inline float XdChannelPairScore(const XdQuery& a, const XdQuery& b, int32_t length,
+	Metric metric)
+{
+	if (metric == Metric::Cosine && (a.sqSum == 0 || b.sqSum == 0))
+	{
+		return 0.0f;
+	}
+	return XdPairScore(a, b, length, metric);
+}
+
+// Pools a channel sub-range via MakeCentroidCrossDevice's sub-range path. A genuinely zero
+// sub-vector (the pooler's ZeroNormQuery: an all-zero-norm channel, or antipodal cancel) is
+// a defined zero centroid here (image zeroed, scale 0, self-dot 0) -- the whole-vector
+// rejection is relaxed because Dot/L2 of a zero sub-vector is well defined and Cosine floors
+// to 0 (XdChannelPairScore). Empty selections and bad arguments still propagate.
+Status MakeChannelCentroid(const BankView& bank, const int32_t* rowIndices, int32_t rowCount,
+	const int32_t* weights, const uint32_t* excludeBits, int32_t offset, int32_t length,
+	int8_t* outQ8, double* outScale, int64_t* outSqSum)
+{
+	const Status s = MakeCentroidCrossDevice(bank, rowIndices, rowCount, weights, excludeBits,
+		outQ8, outScale, outSqSum, offset, length);
+	if (s == Status::ZeroNormQuery)
+	{
+		for (int32_t j = 0; j < length; ++j)
+		{
+			outQ8[j] = 0;
+		}
+		*outScale = 0.0;
+		*outSqSum = 0;
+		return Status::Ok;
+	}
+	return s;
+}
+
+// Directed nearest-neighbour channel divergence: for each non-excluded source sub-row, its
+// nearest target sub-row distance (over the same channel sub-range), reduced by mean
+// (ascending source order) or max (order-free). Mirrors NNDivergence's whole-vector
+// semantics, but scores the sub-range in place (source/target rows keep their paddedDims
+// stride, scored from `offset` over `length`) with the transcribed epilogue -- bit-equal to
+// the whole-vector operator on a contiguous repack for Dot/L2. The nearest is selected in
+// the target metric's better-direction (Dot: max similarity; L2/Cosine: min distance),
+// matching the QueryXdBatch k=1 selection the repack REF runs.
+Status NNDivergenceChannel(
+	const BankView& source, const uint32_t* sourceExcludeBits,
+	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel, Reduce reduce,
+	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, float* outValue)
+{
+	if (outValue == nullptr || queryScratch == nullptr || hitScratch == nullptr ||
+		countScratch == nullptr || !IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
+		source.paddedDims != target.paddedDims)
+	{
+		return Status::InvalidArgument;
+	}
+	int32_t sOff = 0, sLen = 0, tOff = 0, tLen = 0;
+	if (!ChannelSubRange(source, channel, &sOff, &sLen) ||
+		!ChannelSubRange(target, channel, &tOff, &tLen) || sLen != tLen)
+	{
+		return Status::InvalidArgument;
+	}
+	const int32_t length = sLen;
+	const Metric metric = target.metric;
+
+	// The target must have at least one non-excluded row, or no nearest neighbour exists.
+	bool targetHasRow = false;
+	for (int32_t r = 0; r < target.count; ++r)
+	{
+		if (!IsExcluded(targetExcludeBits, r))
+		{
+			targetHasRow = true;
+			break;
+		}
+	}
+	if (!targetHasRow)
+	{
+		return Status::InvalidArgument;
+	}
+
+	const int8_t* srcRows = static_cast<const int8_t*>(source.rows);
+	const int8_t* tgtRows = static_cast<const int8_t*>(target.rows);
+	const int32_t spd = source.paddedDims;
+	const int32_t tpd = target.paddedDims;
+
+	// Lift non-excluded source sub-rows in ascending index order (trusted-internal, the
+	// self-dot over the sub-range).
+	int32_t m = 0;
+	for (int32_t r = 0; r < source.count; ++r)
+	{
+		if (IsExcluded(sourceExcludeBits, r))
+		{
+			continue;
+		}
+		const int8_t* img = srcRows + static_cast<int64_t>(r) * spd + sOff;
+		XdQuery& q = queryScratch[m];
+		q.q8 = img;
+		q.scale = detail::FloatBitsToDouble(source.scales[r]);
+		q.sqSum = detail::DotI8I8(img, img, length);
+		++m;
+	}
+	if (m == 0)
+	{
+		return Status::InvalidArgument; // empty source
+	}
+	// Cosine: a zero sub-norm source cannot be scored -- the bank's ZeroNormQuery law,
+	// mirrored from QueryXdBatch's per-member rejection on a Cosine bank.
+	if (metric == Metric::Cosine)
+	{
+		for (int32_t i = 0; i < m; ++i)
+		{
+			if (queryScratch[i].sqSum == 0)
+			{
+				return Status::ZeroNormQuery;
+			}
+		}
+	}
+
+	double acc = 0.0;
+	double best = 0.0;
+	bool have = false;
+	int32_t counted = 0;
+	for (int32_t i = 0; i < m; ++i)
+	{
+		const XdQuery& q = queryScratch[i];
+		double nn = 0.0;
+		bool haveNn = false;
+		for (int32_t r = 0; r < target.count; ++r)
+		{
+			if (IsExcluded(targetExcludeBits, r))
+			{
+				continue;
+			}
+			const int8_t* timg = tgtRows + static_cast<int64_t>(r) * tpd + tOff;
+			const XdQuery tq{timg, detail::FloatBitsToDouble(target.scales[r]),
+				detail::DotI8I8(timg, timg, length)};
+			if (metric == Metric::Cosine && tq.sqSum == 0)
+			{
+				continue; // zero sub-norm target: distance undefined, skip (never NaN)
+			}
+			const double d = static_cast<double>(XdChannelPairScore(q, tq, length, metric));
+			const bool better = !haveNn || (metric == Metric::Dot ? d > nn : d < nn);
+			if (better)
+			{
+				nn = d;
+			}
+			haveNn = true;
+		}
+		if (!haveNn)
+		{
+			continue; // no scorable target
+		}
+		if (reduce == Reduce::Mean)
+		{
+			acc += nn;
+		}
+		else if (!have || nn > best)
+		{
+			best = nn;
+		}
+		have = true;
+		++counted;
+	}
+	if (counted == 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outValue = reduce == Reduce::Mean ? XdFloor(acc / static_cast<double>(counted))
+	                                   : XdFloor(best);
+	return Status::Ok;
+}
+
+} // namespace
+
+Status CentroidDistanceCrossDeviceChannel(
+	const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
+	const int32_t* weightsA, const uint32_t* excludeBitsA,
+	const BankView& bankB, const int32_t* rowIndicesB, int32_t rowCountB,
+	const int32_t* weightsB, const uint32_t* excludeBitsB,
+	Metric metric, int32_t channel, int8_t* centroidScratchA, int8_t* centroidScratchB,
+	float* outDistance)
+{
+	if (outDistance == nullptr || centroidScratchA == nullptr || centroidScratchB == nullptr ||
+		!IsInt8CrossDevice(bankA) || !IsInt8CrossDevice(bankB) ||
+		bankA.paddedDims != bankB.paddedDims)
+	{
+		return Status::InvalidArgument;
+	}
+	int32_t offA = 0, lenA = 0, offB = 0, lenB = 0;
+	if (!ChannelSubRange(bankA, channel, &offA, &lenA) ||
+		!ChannelSubRange(bankB, channel, &offB, &lenB) || lenA != lenB)
+	{
+		return Status::InvalidArgument;
+	}
+	const int32_t length = lenA;
+	double scaleA = 0.0;
+	int64_t sqA = 0;
+	Status s = MakeChannelCentroid(bankA, rowIndicesA, rowCountA, weightsA, excludeBitsA,
+		offA, length, centroidScratchA, &scaleA, &sqA);
+	if (s != Status::Ok)
+	{
+		return s;
+	}
+	double scaleB = 0.0;
+	int64_t sqB = 0;
+	s = MakeChannelCentroid(bankB, rowIndicesB, rowCountB, weightsB, excludeBitsB,
+		offB, length, centroidScratchB, &scaleB, &sqB);
+	if (s != Status::Ok)
+	{
+		return s;
+	}
+	const XdQuery a{centroidScratchA, scaleA, sqA};
+	const XdQuery b{centroidScratchB, scaleB, sqB};
+	*outDistance = XdChannelPairScore(a, b, length, metric);
+	return Status::Ok;
 }
 
 Status MeanNNCrossDeviceChannel(
-	const BankView&, const uint32_t*, const BankView&, const uint32_t*, int32_t,
-	XdQuery*, Hit*, int32_t*, Workspace&, float*)
+	const BankView& source, const uint32_t* sourceExcludeBits,
+	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
+	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace&,
+	float* outValue)
 {
-	return Status::BadAlignment;
+	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
+		Reduce::Mean, queryScratch, hitScratch, countScratch, outValue);
 }
 
 Status MaxNNCrossDeviceChannel(
-	const BankView&, const uint32_t*, const BankView&, const uint32_t*, int32_t,
-	XdQuery*, Hit*, int32_t*, Workspace&, float*)
+	const BankView& source, const uint32_t* sourceExcludeBits,
+	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
+	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace&,
+	float* outValue)
 {
-	return Status::BadAlignment;
+	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
+		Reduce::Max, queryScratch, hitScratch, countScratch, outValue);
 }
 
 Status SpreadCrossDeviceChannel(
-	const BankView&, const int32_t*, int32_t, const uint32_t*, Reduce, int32_t,
-	int8_t*, float*)
+	const BankView& bank, const int32_t* rowIndices, int32_t rowCount,
+	const uint32_t* excludeBits, Reduce reduce, int32_t channel, int8_t* centroidScratch,
+	float* outValue)
 {
-	return Status::BadAlignment;
+	if (outValue == nullptr || centroidScratch == nullptr || rowIndices == nullptr ||
+		rowCount <= 0 || !IsInt8CrossDevice(bank))
+	{
+		return Status::InvalidArgument;
+	}
+	int32_t offset = 0, length = 0;
+	if (!ChannelSubRange(bank, channel, &offset, &length))
+	{
+		return Status::InvalidArgument;
+	}
+	double cScale = 0.0;
+	int64_t cSq = 0;
+	const Status s = MakeChannelCentroid(bank, rowIndices, rowCount, nullptr, excludeBits,
+		offset, length, centroidScratch, &cScale, &cSq);
+	if (s != Status::Ok)
+	{
+		return s;
+	}
+	const Metric metric = bank.metric;
+	const XdQuery centroid{centroidScratch, cScale, cSq};
+
+	const int8_t* rows = static_cast<const int8_t*>(bank.rows);
+	const int32_t pd = bank.paddedDims;
+	bool haveFirst = false;
+	double acc = 0.0;
+	double best = 0.0;
+	int32_t counted = 0;
+	// Reduce over the selection in ascending order about the channel centroid, dropping the
+	// same excluded/out-of-range rows the pooling dropped (matching SpreadCrossDevice).
+	for (int32_t i = 0; i < rowCount; ++i)
+	{
+		const int32_t r = rowIndices[i];
+		if (r < 0 || r >= bank.count || IsExcluded(excludeBits, r))
+		{
+			continue;
+		}
+		const int8_t* img = rows + static_cast<int64_t>(r) * pd + offset;
+		const XdQuery rowQ{img, detail::FloatBitsToDouble(bank.scales[r]),
+			detail::DotI8I8(img, img, length)};
+		const double d = static_cast<double>(XdChannelPairScore(rowQ, centroid, length, metric));
+		if (reduce == Reduce::Mean)
+		{
+			acc += d;
+		}
+		else if (!haveFirst || d > best)
+		{
+			best = d;
+		}
+		haveFirst = true;
+		++counted;
+	}
+	if (counted == 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outValue = reduce == Reduce::Mean ? XdFloor(acc / static_cast<double>(counted))
+	                                   : XdFloor(best);
+	return Status::Ok;
 }
 
 Status ProjectionReport(const BankView& bank, const float* paddedDirection,

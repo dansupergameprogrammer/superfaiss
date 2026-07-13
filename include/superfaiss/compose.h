@@ -76,6 +76,16 @@ inline constexpr int64_t kMaxPooledRows = int64_t{1} << 20;
 // not scan cost. This operator is a versioned composition operator: any change to
 // its accumulation, epilogue, or quantization is a space-version change for
 // consumers (see docs/DETERMINISM.md section 2d).
+//
+// Sub-range pooling (V3.0 Tier 2, plan section 23.5): `offset`/`length` restrict the
+// accumulation to a channel's element sub-range instead of the whole [0, dims). The
+// defaults (offset 0, length < 0 -> whole dims) leave the whole-vector path bit-identical
+// -- every existing caller passes them and the produced centroid, scale, and self-dot are
+// unchanged. When set, the centroid is `length` lanes written at outQ8[0..length) with its
+// self-dot over the same range; outQ8 must still hold bank.paddedDims bytes (lanes past
+// `length` are zeroed). The per-row scales, weights, and the requantization are the
+// whole-vector math on the sub-range, so pooling a channel sub-range equals pooling a
+// contiguous repack of that sub-range bit for bit.
 Status MakeCentroidCrossDevice(
 	const BankView& bank,
 	const int32_t* rowIndices,
@@ -84,7 +94,9 @@ Status MakeCentroidCrossDevice(
 	const uint32_t* excludeBits, // optional exclusion words (e.g. snapshot tombstones)
 	int8_t* outQ8,
 	double* outScale,
-	int64_t* outSqSum);
+	int64_t* outSqSum,
+	int32_t offset = 0,          // sub-range start element (V3.0); 0 = whole vector
+	int32_t length = -1);        // sub-range length; < 0 = bank.dims (whole vector)
 
 // normalize(a - b) written as a padded query: the unit direction from b toward a, for
 // axis-projection queries ("most a-like relative to b"). Inputs are padded vectors

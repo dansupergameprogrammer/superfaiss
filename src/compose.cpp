@@ -144,7 +144,9 @@ Status MakeCentroidCrossDevice(
 	const uint32_t* excludeBits,
 	int8_t* outQ8,
 	double* outScale,
-	int64_t* outSqSum)
+	int64_t* outSqSum,
+	int32_t offset,
+	int32_t length)
 {
 	if (rowIndices == nullptr || rowCount <= 0 || outQ8 == nullptr ||
 		outScale == nullptr || outSqSum == nullptr)
@@ -157,6 +159,14 @@ Status MakeCentroidCrossDevice(
 	}
 	// CrossDevice laws: int8 banks only, under the accumulator-proof dims ceiling.
 	if (bank.quant != Quantization::Int8 || bank.paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	// Sub-range (V3.0): default (length < 0) pools the whole [0, dims) -- byte-identical
+	// to the shipped path (chOff 0, chDims bank.dims). A channel restricts the range.
+	const int32_t chOff = offset;
+	const int32_t chDims = length < 0 ? bank.dims : length;
+	if (chOff < 0 || chDims < 0 || chOff + chDims > bank.paddedDims)
 	{
 		return Status::InvalidArgument;
 	}
@@ -215,9 +225,9 @@ Status MakeCentroidCrossDevice(
 	constexpr int32_t kChunk = 512;
 	int64_t acc[kChunk];
 	int64_t maxAcc = 0;
-	for (int32_t base = 0; base < bank.dims; base += kChunk)
+	for (int32_t base = 0; base < chDims; base += kChunk)
 	{
-		const int32_t width = (bank.dims - base) < kChunk ? (bank.dims - base) : kChunk;
+		const int32_t width = (chDims - base) < kChunk ? (chDims - base) : kChunk;
 		for (int32_t j = 0; j < width; ++j)
 		{
 			acc[j] = 0;
@@ -240,7 +250,7 @@ Status MakeCentroidCrossDevice(
 			for (int32_t j = 0; j < width; ++j)
 			{
 				// Exact and order-free: |sum| <= sum(w) * 127 * 2^24 <= 2^51 (FAI-5).
-				acc[j] += static_cast<int64_t>(r[base + j]) * m;
+				acc[j] += static_cast<int64_t>(r[chOff + base + j]) * m;
 			}
 		}
 		for (int32_t j = 0; j < width; ++j)
@@ -263,9 +273,9 @@ Status MakeCentroidCrossDevice(
 	// RHE(acc_j * 127 / maxAcc) — exact rational, integer rounding; the max-magnitude
 	// dim maps to exactly +-127. No float touches an element on this path.
 	int64_t sqSum = 0;
-	for (int32_t base = 0; base < bank.dims; base += kChunk)
+	for (int32_t base = 0; base < chDims; base += kChunk)
 	{
-		const int32_t width = (bank.dims - base) < kChunk ? (bank.dims - base) : kChunk;
+		const int32_t width = (chDims - base) < kChunk ? (chDims - base) : kChunk;
 		for (int32_t j = 0; j < width; ++j)
 		{
 			acc[j] = 0;
@@ -287,7 +297,7 @@ Status MakeCentroidCrossDevice(
 				static_cast<int64_t>(row) * bank.paddedDims;
 			for (int32_t j = 0; j < width; ++j)
 			{
-				acc[j] += static_cast<int64_t>(r[base + j]) * m;
+				acc[j] += static_cast<int64_t>(r[chOff + base + j]) * m;
 			}
 		}
 		for (int32_t j = 0; j < width; ++j)
@@ -297,9 +307,9 @@ Status MakeCentroidCrossDevice(
 			sqSum += q * q;
 		}
 	}
-	if (bank.paddedDims > bank.dims)
+	if (bank.paddedDims > chDims)
 	{
-		std::memset(outQ8 + bank.dims, 0, static_cast<size_t>(bank.paddedDims - bank.dims));
+		std::memset(outQ8 + chDims, 0, static_cast<size_t>(bank.paddedDims - chDims));
 	}
 
 	// The dequant scale, kept in double (no float round-trip, the XdQuery discipline):
