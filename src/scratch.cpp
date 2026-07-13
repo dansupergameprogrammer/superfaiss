@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "superfaiss/bake.h"
+#include "superfaiss/kernels.h"   // detail::FloatBitsToDouble (DAZ-safe scale decode, Poirot #1)
 #include "superfaiss/query.h"
 #include "superfaiss/validate.h"
 
@@ -497,7 +498,9 @@ Status ScratchBank::AppendValidated(const float* row, int32_t* outIndex)
 			{
 				const int8_t* qrow =
 					static_cast<const int8_t*>(Rows_) + static_cast<int64_t>(index) * PaddedDims_;
-				const double scale = Scales_[index];
+				// DAZ-safe scale decode (Poirot #1), matching bake.cpp's reference and the
+				// scoring epilogue — keeps this recode bit-equal to ComputeChannelInverseNorms.
+				const double scale = detail::FloatBitsToDouble(Scales_[index]);
 				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
 				{
 					const double v = scale * qrow[j];
