@@ -10928,7 +10928,7 @@ static void TestScratchChannelSaveVersionSelection()
 //   [P1-B2] TestScratchChannelPerChannelRecallZeroEnergy -- RED (skips, not aborts)
 //   [hole]  TestChannelAnalyticsCrossDeviceGolden  -- GREEN (pins cross-device channel golden)
 //   [hole]  TestPerChannelRecallOracle             -- GREEN (independent recall@k oracle)
-//   [hole]  TestVersionHeaderCoherence             -- RED (version.h says 2/5/0; must be 3/0/0)
+//   [hole]  TestVersionHeaderCoherence             -- version.h must match the release (3/0/1)
 // Reuses the earlier anonymous-namespace helpers CosRefChannelPair / CosRefSubImage /
 // CosRefXdFloor (defined with T-V3-A1-COS-REF) and the slot-2/3 helpers
 // (ScratchChannelFixture / MakeChannelScratchBank).
@@ -11543,8 +11543,8 @@ static void TestVersionHeaderCoherence()
 		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.0, got %d", SUPERFAISS_VERSION_MAJOR);
 	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 0,
 		"SUPERFAISS_VERSION_MINOR should be 0 for v3.0, got %d", SUPERFAISS_VERSION_MINOR);
-	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
-		"SUPERFAISS_VERSION_PATCH should be 0 for v3.0, got %d", SUPERFAISS_VERSION_PATCH);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 1,
+		"SUPERFAISS_VERSION_PATCH should be 1 for v3.0.1, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 int main()
