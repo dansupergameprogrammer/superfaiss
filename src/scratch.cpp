@@ -1500,6 +1500,15 @@ Status ScratchBank::MeasureRecallLockedChannel(
 		int32_t got = 0;
 		const Status qs = Query(view, query, params, ws, heap, &got);
 		exclude[si >> 5] &= ~(1u << (si & 31));
+		if (qs == Status::ZeroNormQuery)
+		{
+			// This is a VALID row (whole-row Cosine normalization succeeded) whose sub-vector
+			// in THIS channel is exactly zero, so the per-channel self-query is a ZeroNormQuery
+			// (the query-side law, C-5). Exclude it from the sample rather than abort the whole
+			// audit; the reservoir budget refills from scorable rows. The API permits such rows.
+			--selected;
+			continue;
+		}
 		if (qs != Status::Ok)
 		{
 			return qs;
@@ -1515,6 +1524,10 @@ Status ScratchBank::MeasureRecallLockedChannel(
 		totalPossible += refHits.Count();
 	}
 
+	// Report the samples that actually scored: zero-energy-channel rows excluded above are
+	// not part of this channel's sample (honest metadata; equals the pre-set target when no
+	// row is degenerate in this channel).
+	out->sampleCount = selected;
 	out->recall = totalPossible > 0
 		? static_cast<float>(static_cast<double>(totalHits) / static_cast<double>(totalPossible))
 		: 0.0f;

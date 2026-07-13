@@ -514,18 +514,11 @@ Status NNDivergenceChannel(
 	{
 		return Status::InvalidArgument; // empty source
 	}
-	// Cosine: a zero sub-norm source cannot be scored -- the bank's ZeroNormQuery law,
-	// mirrored from QueryXdBatch's per-member rejection on a Cosine bank.
-	if (metric == Metric::Cosine)
-	{
-		for (int32_t i = 0; i < m; ++i)
-		{
-			if (queryScratch[i].sqSum == 0)
-			{
-				return Status::ZeroNormQuery;
-			}
-		}
-	}
+	// A zero sub-norm member (source or target) is NOT rejected here: this is a reduction
+	// (a set statistic), and C-5/D-V3-11 floors a degenerate Cosine member to a defined 0
+	// via XdChannelPairScore -- consistent with CentroidDistance/Spread. The query-side
+	// ZeroNormQuery rejection is for a SINGLE per-channel query, not a reduction over a pool
+	// (a valid row can have a whole-row-normalized image with one channel exactly zero).
 
 	double acc = 0.0;
 	double best = 0.0;
@@ -545,10 +538,9 @@ Status NNDivergenceChannel(
 			const int8_t* timg = tgtRows + static_cast<int64_t>(r) * tpd + tOff;
 			const XdQuery tq{timg, detail::FloatBitsToDouble(target.scales[r]),
 				detail::DotI8I8(timg, timg, length)};
-			if (metric == Metric::Cosine && tq.sqSum == 0)
-			{
-				continue; // zero sub-norm target: distance undefined, skip (never NaN)
-			}
+			// A zero sub-norm target is NOT skipped: XdChannelPairScore floors a degenerate
+			// Cosine member to a defined 0 (C-5), so a zero-energy target scores distance 0
+			// and is the nearest -- consistent with Centroid/Spread and never NaN.
 			const double d = static_cast<double>(XdChannelPairScore(q, tq, length, metric));
 			const bool better = !haveNn || (metric == Metric::Dot ? d > nn : d < nn);
 			if (better)
