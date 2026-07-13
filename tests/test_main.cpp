@@ -10236,17 +10236,24 @@ static void TestChannelScopedAnalyticsRejections()
 	}
 }
 
-// T-V3-A5 (D-V3-8 (a)) -- channel-query-only storm: the shipped slot-2 channel query over a
-// HELD snapshot is stable under concurrent append/remove (result == the serial baseline).
-// GREEN on the current code (a coverage patch owed before slot 3's gate closed). TSan-clean
-// is the CI property; this functional form runs under build.bat, like the shipped scratch
-// concurrency tests.
+// T-V3-A5 (D-V3-8 (a)) -- channel-query-only storm: a reader RE-SNAPSHOTS in the loop,
+// repeatedly observing freshly-published rows while a writer appends (within the pre-sized
+// arena, no Grow) and removes. The forcing invariant (Japp P-1): for every fresh snapshot,
+// the arena's per-channel sub-norms bit-equal a fresh ComputeChannelInverseNorms over that
+// snapshot's own published rows -- i.e. a row NEVER appears in a snapshot without its
+// sub-norm. This directly exercises the append-time sub-norm-write-BEFORE-PublishedCount_
+// store-release ordering D-V3-8 commissioned: were the sub-norm write moved AFTER the count
+// publish, a snapshot acquiring the new count would read the just-published row with a stale
+// / unwritten sub-norm slot, and the recompute would disagree. GREEN on the current code
+// (correct ordering); the reader reads rows/sub-norms below the acquired count, which are
+// immutable, so the recompute is race-free. TSan-clean is the CI property; this functional
+// form runs under build.bat, like the shipped scratch concurrency tests.
 static void TestChannelQueryOnlyStorm()
 {
 	Rng rng(0x570A11ull);
 	const int32_t dims = 64;
-	const int32_t capacity = 512;
-	const int32_t appended = 200;
+	const int32_t capacity = 4096;
+	const int32_t appended = 64; // start with content; the writer publishes the rest live
 
 	ScratchChannelFixture fx;
 	MakeChannelScratchBank(fx, rng, appended, dims, Metric::Cosine, Quantization::Int8,
@@ -10255,9 +10262,7 @@ static void TestChannelQueryOnlyStorm()
 	{
 		return;
 	}
-	BankView snap;
-	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
-	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	const int32_t cc = static_cast<int32_t>(fx.channels.size());
 
 	std::vector<float> queryRaw(dims);
 	for (auto& v : queryRaw)
@@ -10267,21 +10272,11 @@ static void TestChannelQueryOnlyStorm()
 	AlignedBuf qbuf(static_cast<size_t>(fx.pd) * sizeof(float));
 	PadQuery(queryRaw, fx.pd, qbuf.F32());
 	const QuerySegment seg[1] = {{fx.channels[0].offset, fx.channels[0].length, 1.0f}};
-	QueryParams params;
-	params.k = 10;
-	params.segments = seg;
-	params.segmentCount = 1;
-	params.excludeBits = tombs.data();
-
-	Workspace wsBase;
-	Hit baseHits[10];
-	int32_t baseN = 0;
-	CHECK(Query(snap, qbuf.F32(), params, wsBase, baseHits, &baseN) == Status::Ok);
 
 	std::atomic<bool> stop{false};
 	std::thread writer([&]() {
 		Rng wrng(0x999ull);
-		int32_t next = appended;
+		int32_t next = fx.bank.Count();
 		std::vector<float> row(dims);
 		while (!stop.load(std::memory_order_relaxed))
 		{
@@ -10291,37 +10286,75 @@ static void TestChannelQueryOnlyStorm()
 				{
 					v = wrng.NextFloat();
 				}
-				fx.bank.Append(row.data(), dims, &next);
-				++next;
+				row[0] += 1.5f; // guarantee a non-zero Cosine norm
+				if (fx.bank.Append(row.data(), dims, &next) == Status::Ok)
+				{
+					++next;
+				}
 			}
 			fx.bank.Remove(next > appended ? appended - 1 : 0);
 		}
 	});
-	for (int32_t iter = 0; iter < 200; ++iter)
+
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
+	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
+	int32_t maxCountSeen = 0;
+	for (int32_t iter = 0; iter < 300; ++iter)
 	{
+		BankView snap;
+		CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		const int32_t C = snap.count;
+		maxCountSeen = C > maxCountSeen ? C : maxCountSeen;
+		CHECK(snap.channelCount == cc && snap.channelInvNorms != nullptr);
+
+		// FORCING INVARIANT: the published sub-norm arena is consistent with the published
+		// rows for EVERY fresh snapshot -- no row visible without its correct sub-norm.
+		CHECK(ComputeChannelInverseNorms(snap, recomputed.data()) == Status::Ok);
+		CHECK_MSG(std::memcmp(recomputed.data(), snap.channelInvNorms,
+					  static_cast<size_t>(C) * cc * sizeof(float)) == 0,
+			"a fresh snapshot observed a row without its correct sub-norm (iter %d, count %d)",
+			iter, C);
+
+		// The channel query over the fresh snapshot succeeds with finite scores (a torn /
+		// stale sub-norm would surface here as a non-finite or wrong score).
 		Workspace ws;
 		Hit hits[10];
 		int32_t n = 0;
+		QueryParams params;
+		params.k = 10;
+		params.segments = seg;
+		params.segmentCount = 1;
+		params.excludeBits = tombs.data();
 		CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
-		CHECK(n == baseN);
-		for (int32_t i = 0; i < n && i < baseN; ++i)
+		for (int32_t i = 0; i < n; ++i)
 		{
-			CHECK(hits[i].index == baseHits[i].index && hits[i].score == baseHits[i].score);
+			CHECK(std::isfinite(hits[i].score));
 		}
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
+	// The reader must have observed the count ADVANCE past the initial rows, or the storm
+	// never exercised a concurrent publish (the P-1 defect this rewrite fixes).
+	CHECK_MSG(maxCountSeen > appended,
+		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
 
-// T-V3-A6 (D-V3-8 (b)) -- full storm: a channel-SCOPED REDUCTION over a HELD snapshot is
-// stable under concurrent append/remove (result == the serial baseline). RED until slot 4
-// (the reduction stubs before producing a value). TSan-clean is the CI property.
+// T-V3-A6 (D-V3-8 (b)) -- full storm: a reader RE-SNAPSHOTS in the loop and runs a
+// channel-SCOPED REDUCTION over each fresh snapshot, concurrent with a writer's
+// append/remove. Two forcing checks (Japp P-1): (1) the arena sub-norms bit-equal a fresh
+// recompute over each snapshot's published rows (the ordering invariant, as in T-V3-A5);
+// and (2) the live reduction (which reads the arena's stored sub-norms) equals a serial
+// TWIN reduction over the SAME snapshot rows with FRESHLY-recomputed sub-norms -- so a
+// stale sub-norm on a just-published row would make the live result diverge from the twin.
+// GREEN on the current code (correct ordering); rows/sub-norms below the acquired count are
+// immutable, so both the recompute and the twin are race-free. TSan-clean is the CI
+// property; runs functionally under build.bat.
 static void TestChannelScopedReductionStorm()
 {
 	Rng rng(0x570A22ull);
 	const int32_t dims = 64;
-	const int32_t capacity = 512;
-	const int32_t appended = 200;
+	const int32_t capacity = 1024;
+	const int32_t appended = 32;
 
 	ScratchChannelFixture fx;
 	MakeChannelScratchBank(fx, rng, appended, dims, Metric::Cosine, Quantization::Int8,
@@ -10330,31 +10363,17 @@ static void TestChannelScopedReductionStorm()
 	{
 		return;
 	}
-	BankView snap;
-	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
-	CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
-	std::vector<int32_t> rows(static_cast<size_t>(appended));
-	for (int32_t i = 0; i < appended; ++i)
+	const int32_t cc = static_cast<int32_t>(fx.channels.size());
+	std::vector<int32_t> rowIdx(static_cast<size_t>(capacity));
+	for (int32_t i = 0; i < capacity; ++i)
 	{
-		rows[static_cast<size_t>(i)] = i;
-	}
-
-	AlignedBuf csBase(static_cast<size_t>(snap.paddedDims));
-	float baseline = 0.0f;
-	const Status sBase = SpreadCrossDeviceChannel(snap, rows.data(), appended, tombs.data(),
-		Reduce::Mean, 0, csBase.I8(), &baseline);
-	CHECK_MSG(sBase == Status::Ok,
-		"channel-scoped reduction storm baseline failed (unimplemented, slot 4): status=%d",
-		static_cast<int>(sBase));
-	if (sBase != Status::Ok)
-	{
-		return; // red-unimplemented: no baseline to hold the storm against
+		rowIdx[static_cast<size_t>(i)] = i;
 	}
 
 	std::atomic<bool> stop{false};
 	std::thread writer([&]() {
 		Rng wrng(0x888ull);
-		int32_t next = appended;
+		int32_t next = fx.bank.Count();
 		std::vector<float> row(dims);
 		while (!stop.load(std::memory_order_relaxed))
 		{
@@ -10364,22 +10383,233 @@ static void TestChannelScopedReductionStorm()
 				{
 					v = wrng.NextFloat();
 				}
-				fx.bank.Append(row.data(), dims, &next);
-				++next;
+				row[0] += 1.5f; // guarantee a non-zero Cosine norm
+				if (fx.bank.Append(row.data(), dims, &next) == Status::Ok)
+				{
+					++next;
+				}
 			}
 			fx.bank.Remove(next > appended ? appended - 1 : 0);
 		}
 	});
+
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
+	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
+	int32_t maxCountSeen = 0;
 	for (int32_t iter = 0; iter < 200; ++iter)
 	{
-		AlignedBuf cs(static_cast<size_t>(snap.paddedDims));
-		float v = 0.0f;
-		CHECK(SpreadCrossDeviceChannel(snap, rows.data(), appended, tombs.data(), Reduce::Mean,
-				  0, cs.I8(), &v) == Status::Ok);
-		CHECK(v == baseline); // the held snapshot is stable under concurrent writes
+		BankView snap;
+		CHECK(fx.bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		const int32_t C = snap.count;
+		maxCountSeen = C > maxCountSeen ? C : maxCountSeen;
+		CHECK(snap.channelCount == cc && snap.channelInvNorms != nullptr);
+
+		// (1) FORCING INVARIANT: sub-norm arena consistent with the published rows.
+		CHECK(ComputeChannelInverseNorms(snap, recomputed.data()) == Status::Ok);
+		CHECK_MSG(std::memcmp(recomputed.data(), snap.channelInvNorms,
+					  static_cast<size_t>(C) * cc * sizeof(float)) == 0,
+			"reduction storm: a fresh snapshot observed a row without its sub-norm "
+			"(iter %d, count %d)", iter, C);
+
+		// (2) Live reduction (arena sub-norms) == serial twin (recomputed sub-norms over the
+		// SAME immutable rows). Diverges iff a stored sub-norm is stale.
+		AlignedBuf csLive(static_cast<size_t>(snap.paddedDims));
+		AlignedBuf csTwin(static_cast<size_t>(snap.paddedDims));
+		float rLive = 0.0f, rTwin = 0.0f;
+		const Status sLive = SpreadCrossDeviceChannel(snap, rowIdx.data(), C, tombs.data(),
+			Reduce::Mean, 0, csLive.I8(), &rLive);
+		BankView twin = snap;
+		twin.channelInvNorms = recomputed.data(); // correct sub-norms, same rows/scales
+		const Status sTwin = SpreadCrossDeviceChannel(twin, rowIdx.data(), C, tombs.data(),
+			Reduce::Mean, 0, csTwin.I8(), &rTwin);
+		CHECK(sLive == Status::Ok && sTwin == Status::Ok);
+		CHECK_MSG(rLive == rTwin,
+			"reduction over the live snapshot != serial twin (iter %d, count %d): %.9g != %.9g",
+			iter, C, static_cast<double>(rLive), static_cast<double>(rTwin));
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
+	CHECK_MSG(maxCountSeen > appended,
+		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
+}
+
+
+// T-V3-Persist-4 (Japp P-2, dims 2/9) -- Load re-validates the serialized channel table:
+// a malformed channelCount or a malformed ChannelInfo geometry in the blob -> BadFormat,
+// and the target bank is left unchanged (reject-over-degrade). The scratch archive layout
+// (v3): a 32-byte header {..., reserved[6] at offset 26}, then int32 channelCount at offset
+// 32, then channelCount ChannelInfo (offset,length; 8 bytes each) from offset 36.
+static void TestScratchChannelLoadRejectsMalformedTable()
+{
+	Rng rng(0xBAD7AB1eull);
+	const int32_t dims = 64;
+	const int32_t count = 16;
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2) ==
+		Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source)
+	{
+		v = rng.NextFloat();
+	}
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	MemArchive good;
+	CHECK(bank.Save(good.Writer()) == Status::Ok);
+
+	// A target bank in a known-good state, to prove reject-over-degrade.
+	ScratchBank target;
+	CHECK(target.Load(good.Reader()) == Status::Ok);
+	auto targetChannelCount = [&]() {
+		BankView v;
+		std::vector<uint32_t> t(ScratchBank::TombstoneWords(target.Count()), 0u);
+		CHECK(target.Snapshot(&v, t.data()) == Status::Ok);
+		return v.channelCount;
+	};
+	const int32_t count0 = target.Count();
+	CHECK(targetChannelCount() == 2);
+
+	auto writeI32 = [](MemArchive& a, size_t off, int32_t val) {
+		std::memcpy(a.bytes.data() + off, &val, sizeof(val));
+	};
+	// Layout offsets in the serialized blob.
+	const size_t kOffChannelCount = 32;
+	const size_t kOffChan1Offset = 44; // header(32) + channelCount(4) + chan0{off,len}(8) -> chan1.offset
+	const size_t kOffChan0Length = 40; // chan0.length
+
+	auto expectRejectUnchanged = [&](MemArchive& corrupt, const char* why) {
+		CHECK_MSG(target.Load(corrupt.Reader()) == Status::BadFormat,
+			"%s: expected BadFormat on Load", why);
+		CHECK_MSG(target.Count() == count0 && targetChannelCount() == 2,
+			"%s: target bank changed despite a rejected Load (reject-over-degrade)", why);
+	};
+
+	// (1) Out-of-range channelCount (99 > kMaxChannels).
+	{
+		MemArchive a;
+		a.bytes = good.bytes;
+		writeI32(a, kOffChannelCount, 99);
+		expectRejectUnchanged(a, "channelCount=99");
+	}
+	// (2) Zero channelCount (a v3/channels blob must carry >= 1 channel).
+	{
+		MemArchive a;
+		a.bytes = good.bytes;
+		writeI32(a, kOffChannelCount, 0);
+		expectRejectUnchanged(a, "channelCount=0");
+	}
+	// (3) Overlapping / non-ascending channel: channel[1].offset 32 -> 16 (overlaps [0,32)).
+	{
+		MemArchive a;
+		a.bytes = good.bytes;
+		writeI32(a, kOffChan1Offset, 16);
+		expectRejectUnchanged(a, "overlapping channel geometry");
+	}
+	// (4) Off-grid channel: channel[0].length 32 -> 30 (not a multiple of the int8 grid, 16).
+	{
+		MemArchive a;
+		a.bytes = good.bytes;
+		writeI32(a, kOffChan0Length, 30);
+		expectRejectUnchanged(a, "off-grid channel length");
+	}
+	// (5) Out-of-bounds channel: channel[1].length 32 -> 1024 (extends past paddedDims).
+	{
+		MemArchive a;
+		a.bytes = good.bytes;
+		writeI32(a, kOffChan1Offset + 4, 1024); // channel[1].length
+		expectRejectUnchanged(a, "out-of-bounds channel length");
+	}
+	// A clean re-load still succeeds after the rejected attempts.
+	MemArchive again;
+	CHECK(bank.Save(again.Writer()) == Status::Ok);
+	CHECK(target.Load(again.Reader()) == Status::Ok);
+	CHECK(targetChannelCount() == 2);
+}
+
+// T-V3-Persist-5 (Japp P-3, dim 9) -- the writer's version-selection, asserted directly on
+// the serialized version integer (little-endian u32 at byte 4) and the flags byte
+// (reserved[0] at byte 26): a feature-less bank emits version 1; a retention-only bank emits
+// version 2; a channel bank emits version 3 with the channels flag set (bit 1), the
+// retention flag reflecting retention (bit 0). Catches an always-emit-v3 regression that
+// would break real pre-v3 readers.
+static void TestScratchChannelSaveVersionSelection()
+{
+	Rng rng(0x5E1EC7edull);
+	const int32_t dims = 48;
+	const ChannelInfo channels[2] = {{0, 32}, {32, 16}};
+
+	auto versionOf = [](const MemArchive& a) {
+		uint32_t v = 0;
+		std::memcpy(&v, a.bytes.data() + 4, sizeof(v));
+		return v;
+	};
+	auto flagsOf = [](const MemArchive& a) { return a.bytes[26]; }; // reserved[0]
+
+	auto fill = [&](ScratchBank& b, int32_t n) {
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < n; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			row[0] += 1.5f;
+			CHECK(b.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+	};
+
+	// (a) feature-less (no channels, no retention) -> version 1, flags 0.
+	{
+		ScratchBank b;
+		CHECK(b.Create(8, dims, Metric::Dot, Quantization::Int8) == Status::Ok);
+		fill(b, 4);
+		MemArchive a;
+		CHECK(b.Save(a.Writer()) == Status::Ok);
+		CHECK_MSG(versionOf(a) == 1u, "feature-less bank must Save version 1, got %u",
+			versionOf(a));
+		CHECK(flagsOf(a) == 0u);
+	}
+	// (b) retention-only (no channels) -> version 2, flags 0 (legacy encoding).
+	{
+		ScratchBank b;
+		CHECK(b.Create(8, dims, Metric::Dot, Quantization::Int8, /*retain=*/true) ==
+			Status::Ok);
+		fill(b, 4);
+		MemArchive a;
+		CHECK(b.Save(a.Writer()) == Status::Ok);
+		CHECK_MSG(versionOf(a) == 2u, "retention-only bank must Save version 2, got %u",
+			versionOf(a));
+		CHECK(flagsOf(a) == 0u);
+	}
+	// (c) channels, no retention -> version 3, flags = channels bit only (0x02).
+	{
+		ScratchBank b;
+		CHECK(b.Create(8, dims, Metric::Cosine, Quantization::Int8, channels, 2) == Status::Ok);
+		fill(b, 4);
+		MemArchive a;
+		CHECK(b.Save(a.Writer()) == Status::Ok);
+		CHECK_MSG(versionOf(a) == 3u, "channel bank must Save version 3, got %u", versionOf(a));
+		CHECK_MSG(flagsOf(a) == 0x02, "channels-only flags byte should be 0x02, got 0x%02x",
+			flagsOf(a));
+	}
+	// (d) channels + retention -> version 3, flags = retention|channels (0x03).
+	{
+		ScratchBank b;
+		CHECK(b.Create(8, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+				/*retain=*/true) == Status::Ok);
+		fill(b, 4);
+		MemArchive a;
+		CHECK(b.Save(a.Writer()) == Status::Ok);
+		CHECK_MSG(versionOf(a) == 3u, "channel+retention bank must Save version 3, got %u",
+			versionOf(a));
+		CHECK_MSG(flagsOf(a) == 0x03, "channel+retention flags byte should be 0x03, got 0x%02x",
+			flagsOf(a));
+	}
 }
 
 int main()
@@ -10424,6 +10654,8 @@ int main()
 	TestChannelScopedAnalyticsRejections();
 	TestChannelQueryOnlyStorm();
 	TestChannelScopedReductionStorm();
+	TestScratchChannelLoadRejectsMalformedTable();
+	TestScratchChannelSaveVersionSelection();
 	TestPinDrainLitmus();
 	TestPerRowBias();
 	TestWorkspaceReuseAcrossShapes();
