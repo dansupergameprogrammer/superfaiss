@@ -736,8 +736,9 @@ inline constexpr uint64_t kGoldenChannelAnalyticsXdHash = 0x634b7c67d544d074ull;
 // 2026-07-13): the per-channel Cosine sqrt query path over a bank carrying an
 // adversarial tiny-channel-norm member produced by a boundary-move Relabel, across
 // the forced-path sweep. Same capture/re-pin discipline as kGoldenXdHash; 0 means
-// 'not yet pinned' (the test prints the value instead of asserting). Left at 0 —
-// pin once Relabel is built to green (§24.9 slots 1-2) and the test re-run green.
-inline constexpr uint64_t kGoldenRelabelXdHash = 0ull;
+// 'not yet pinned' (the test prints the value instead of asserting). Pinned once
+// Relabel was built to green (§24.9 slots 1-2) and the value reproduced bit-identical
+// under MSVC (cl) and clang-cl.
+inline constexpr uint64_t kGoldenRelabelXdHash = 0x959e49c5184bbd9aull;
 
 } // namespace xdfix
