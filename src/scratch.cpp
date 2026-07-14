@@ -785,10 +785,16 @@ Status ScratchBank::Relabel(const ChannelInfo* newChannels, int32_t newChannelCo
 		cview.channels = Channels_;
 		cview.channelCount = ChannelCount_;
 		const Status subNorm = ComputeChannelInverseNorms(cview, ChannelInvNorms_);
-		if (subNorm != Status::Ok)
-		{
-			return subNorm;
-		}
+		// Total over these validated inputs (non-null rows, a valid table) — the same
+		// call Create+Append and Load run, and it cannot fail here. A soft error return
+		// would be reachable only AFTER the new table and arena are committed but before
+		// oldArena is freed and the generation advances: it would leave the bank fully
+		// mutated, leak oldArena, and skip the generation bump — the exact torn state
+		// reject-over-degrade exists to make impossible. Assert the invariant rather than
+		// encode an unreachable, contract-violating exit (Poirot M-1; closes O-1).
+		assert(subNorm == Status::Ok &&
+			"Relabel: ComputeChannelInverseNorms is total over validated inputs");
+		(void)subNorm;
 	}
 
 	detail::SeamFree(Allocator_, oldArena);
