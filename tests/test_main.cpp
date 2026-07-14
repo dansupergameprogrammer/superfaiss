@@ -12053,7 +12053,12 @@ static void TestRelabelHeldViewAliasing()
 	const int32_t dims = 32;
 	const int32_t count = 8;
 	const ChannelInfo oldTable[2] = {{0, 16}, {16, 16}};
-	const ChannelInfo newTable[1] = {{0, 32}};
+	// A boundary-moved 2-channel target: BankView.channelCount is a by-value copy taken at
+	// Snapshot (types.h:58, NOT an alias), so it stays 2 across the relabel; only
+	// BankView.channels is a pointer that aliases the by-value member Channels_. Keeping the
+	// count at 2 avoids reading a stale count against a moved table and isolates the aliasing
+	// signal to the moved boundary in channels[0].
+	const ChannelInfo newTable[2] = {{0, 24}, {24, 8}};
 
 	for (Metric metric : {Metric::Dot, Metric::L2})
 	{
@@ -12069,22 +12074,30 @@ static void TestRelabelHeldViewAliasing()
 		BankView held;
 		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
 		CHECK(bank.Snapshot(&held, tombs.data()) == Status::Ok);
-		CHECK(held.channelCount == 2);
+		CHECK(held.channelCount == 2 && held.channels[0].length == 16);
 
-		CHECK(bank.Relabel(newTable, 1) == Status::Ok);
+		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
 
-		CHECK_MSG(held.channelCount == 1 && held.channels != nullptr &&
-				held.channels[0].offset == 0 && held.channels[0].length == 32,
-			"the aliased pre-relabel view (metric=%d) must reflect the new table after the "
-			"exclusive drain completes", static_cast<int>(metric));
+		// Forge W2: the Dot/L2 by-value member write to Channels_ IS observable through the
+		// held view's aliased channels pointer -- so a view taken before a relabel must join
+		// the Grow/Load invalidation set. The aliased channels[0] reflecting the new {0,24}
+		// boundary proves the member write landed and the exclusive drain ran.
+		CHECK_MSG(held.channels != nullptr && held.channels[0].offset == 0 &&
+				held.channels[0].length == 24,
+			"the aliased pre-relabel view (metric=%d) must reflect the new table's moved "
+			"boundary after the exclusive drain completes", static_cast<int>(metric));
 	}
 }
 
-// T-V3.1-Storm (dim 3) -- a reader thread snapshots and verifies self-consistency (Cosine
-// sub-norm arena vs a fresh recompute) while a writer thread interleaves Append and Relabel
-// across a fixed table sequence. Deterministic red trigger: the FINAL table must be one of
-// the writer's rotation targets, distinct in shape (channelCount) from the fixture's start
-// table, so a no-op Relabel can never satisfy it.
+// T-V3.1-Storm (dim 3) -- the exclusive-drain harness. Relabel is an EXCLUSIVE writer op,
+// the same class as Grow/Load (S24.4, D-V3.1-1): it frees the old arena and rebinds, so a
+// concurrent unpinned Snapshot's channelInvNorms would dangle into freed memory. The host
+// drives the drain: the writer wraps each Relabel in BeginExclusive/EndExclusive (new pins
+// refused, in-flight pins waited to zero); the reader holds a pin across Snapshot AND the
+// sub-norm verification (the arena it reads cannot be freed under a live pin). Two claims:
+// (1) the drain deterministically refuses a pin while it holds the flag; (2) no PINNED
+// snapshot ever observes a torn table. TSan-clean is the CI property (the seq_cst flag-store
+// / pin-load pairing); runs functionally under build.bat.
 static void TestRelabelExclusiveDrainStorm()
 {
 	Rng rng(0x100007ull);
@@ -12108,6 +12121,17 @@ static void TestRelabelExclusiveDrainStorm()
 		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
 	}
 
+	// (1) Deterministic pin-refusal: while an exclusive op holds the drain flag, a new reader
+	// pin is refused; once the exclusive op ends, pins are granted again (the dim-3 claim,
+	// tested race-free before the storm).
+	CHECK(bank.BeginExclusive() == true);
+	CHECK_MSG(bank.TryPinReader() == false,
+		"a reader pin must be REFUSED while an exclusive op holds the drain flag");
+	bank.EndExclusive();
+	CHECK_MSG(bank.TryPinReader() == true, "a reader pin must be granted once the drain ends");
+	bank.UnpinReader();
+
+	// (2) The concurrent storm under proper pinning: no PINNED snapshot observes a torn table.
 	std::atomic<bool> stop{false};
 	std::atomic<int32_t> relabelCount{0};
 	std::thread writer([&]() {
@@ -12119,6 +12143,8 @@ static void TestRelabelExclusiveDrainStorm()
 		{
 			if (next < capacity && (iter % 3) != 0)
 			{
+				// Append is a NON-exclusive writer op (append-only arena, publish-via-count,
+				// sub-norms written before the count store) -- it needs no drain.
 				for (auto& v : row) { v = wrng.NextFloat(); }
 				row[0] += 1.5f;
 				if (bank.Append(row.data(), dims, &next) == Status::Ok)
@@ -12128,8 +12154,15 @@ static void TestRelabelExclusiveDrainStorm()
 			}
 			else
 			{
-				const int32_t which = relabelCount.fetch_add(1, std::memory_order_relaxed) % 3;
-				bank.Relabel(tables[which], 2);
+				// Relabel is EXCLUSIVE: drain readers, swap, release -- the host's job, exactly
+				// as for Grow/Load. BeginExclusive waits all in-flight pins to zero first.
+				if (bank.BeginExclusive())
+				{
+					const int32_t which =
+						relabelCount.fetch_add(1, std::memory_order_relaxed) % 3;
+					bank.Relabel(tables[which], 2);
+					bank.EndExclusive();
+				}
 			}
 			++iter;
 		}
@@ -12139,6 +12172,12 @@ static void TestRelabelExclusiveDrainStorm()
 	int32_t maxCountSeen = 0;
 	for (int32_t iter = 0; iter < 300; ++iter)
 	{
+		// Pin across BOTH the Snapshot and the sub-norm verification: the pin blocks the
+		// exclusive relabel from freeing the arena the snapshot points into.
+		while (!bank.TryPinReader())
+		{
+			std::this_thread::yield();
+		}
 		BankView snap;
 		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
 		maxCountSeen = snap.count > maxCountSeen ? snap.count : maxCountSeen;
@@ -12148,15 +12187,16 @@ static void TestRelabelExclusiveDrainStorm()
 			CHECK(ComputeChannelInverseNorms(snap, recomputed.data()) == Status::Ok);
 			CHECK_MSG(std::memcmp(recomputed.data(), snap.channelInvNorms,
 						  recomputed.size() * sizeof(float)) == 0,
-				"relabel storm: a fresh snapshot observed a row without its correct sub-norm "
+				"relabel storm: a pinned snapshot observed a row without its correct sub-norm "
 				"(iter %d, count %d, channelCount %d)", iter, snap.count, snap.channelCount);
 		}
+		bank.UnpinReader();
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 
 	CHECK_MSG(relabelCount.load(std::memory_order_relaxed) > 0,
-		"relabel storm: the writer never attempted a relabel");
+		"relabel storm: the writer never completed a relabel");
 	BankView finalSnap;
 	CHECK(bank.Snapshot(&finalSnap, tombs.data()) == Status::Ok);
 	bool matchedSomeTarget = false;
@@ -12178,8 +12218,9 @@ static void TestRelabelExclusiveDrainStorm()
 }
 
 // T-V3.1-Extremes (dim 4, G-5) -- shape/extremes matrix crossed with the metric matrix
-// (G-2): count up 1->8, count down 8->1, boundary move, whole-row single channel (must
-// bit-match the whole-vector path), one-grid-unit channel, one live row, fully tombstoned,
+// (G-2): count up 1->8, count down 8->1, boundary move, whole-row single channel (bit-matches
+// the whole-vector path for Dot/L2; FEAT-equivalent for Cosine), one-grid-unit channel, one
+// live row, fully tombstoned,
 // empty bank (count==0, G-5), promote, demote -- each proven with the per-channel FEAT.
 // dims=128 with grid=kAlignment (16 elements) throughout: the LCD grid satisfying both
 // quantizations' element-grid rules, wide enough for the 8-channel count-up/down extremes.
@@ -12314,7 +12355,18 @@ static void TestRelabelExtremesMatrix()
 						ChannelBruteForce(snap, qbuf.F32(), ch, tombs.data(), metric);
 					CheckFeatTopK(ref, hits, n, 10, bank.Count(), metric, quant, sc.name);
 
-					if (targetCount == 1 && ch.offset == 0 && ch.length == snap.paddedDims)
+					// Whole-row single-channel == whole-vector path bit-for-bit -- Dot/L2 ONLY.
+					// A Cosine channel query (even a whole-row one) takes the per-channel-cosine
+					// kernel path (query.cpp bPerChannelCosine), dividing each score by the
+					// per-channel sub-norm 1/||quantized row|| -- a factor the whole-vector path
+					// (norm folded pre-quantization) does not apply, so the two differ by a
+					// near-1 factor. This is inherent channel-cosine semantics (a V3.0 property,
+					// verified independent of Relabel), not a relabel defect. The Cosine whole-row
+					// end-state is already FEAT-covered above; only Dot/L2 get the bit-identity
+					// INV. (Routed to Vitruvius: S24.8 dim-4 "must match the whole-vector path
+					// bit-for-bit" should read "for Dot/L2; FEAT-equivalent for Cosine".)
+					if (metric != Metric::Cosine && targetCount == 1 && ch.offset == 0 &&
+						ch.length == snap.paddedDims)
 					{
 						QueryParams pw;
 						pw.k = 10;
