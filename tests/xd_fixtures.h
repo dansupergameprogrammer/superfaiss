@@ -732,4 +732,12 @@ inline constexpr uint64_t kGoldenAnalyticsXdHash = 0xcd995d373f06df97ull;
 // as kGoldenAnalyticsXdHash; 0 means 'not yet pinned' (the test prints the value).
 inline constexpr uint64_t kGoldenChannelAnalyticsXdHash = 0x634b7c67d544d074ull;
 
+// Pinned cross-device hash over the V3.1 RELABEL battery (Curie test design,
+// 2026-07-13): the per-channel Cosine sqrt query path over a bank carrying an
+// adversarial tiny-channel-norm member produced by a boundary-move Relabel, across
+// the forced-path sweep. Same capture/re-pin discipline as kGoldenXdHash; 0 means
+// 'not yet pinned' (the test prints the value instead of asserting). Left at 0 —
+// pin once Relabel is built to green (§24.9 slots 1-2) and the test re-run green.
+inline constexpr uint64_t kGoldenRelabelXdHash = 0ull;
+
 } // namespace xdfix

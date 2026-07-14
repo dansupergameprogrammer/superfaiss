@@ -11547,6 +11547,2372 @@ static void TestVersionHeaderCoherence()
 		"SUPERFAISS_VERSION_PATCH should be 1 for v3.0.1, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
+// ===========================================================================
+// V3.1 red suite (Curie, 2026-07-13): the Relabel operation (plan section 24).
+// Realizes the section 24.8 Coverage Model against the no-op stub at
+// scratch.cpp:657-662 (returns Ok without mutating) -- every test below fails for
+// its cell's reason: a rejection test sees Ok where it expects InvalidArgument/
+// OutOfMemory; a mutation test sees the OLD table where it expects the new one.
+// Test design: Claude/Curie/superfaiss-v3.1-test-design-2026-07-13.md.
+// Reuses the V3.0 channel-test helpers (ScratchChannelFixture, MakeChannelScratchBank,
+// MemArchive, RefNormalizeRow, DequantizeRow, FeatRefHit, ChannelCosineBruteForce,
+// kChannelFeatRelTolF32/I8, kScratchHeaderFlagsByteOffset, an::Hash) from the
+// translation-unit-wide anonymous namespace above.
+// ===========================================================================
+
+namespace
+{
+	// Metric-general per-channel brute-force (generalizes ChannelCosineBruteForce to
+	// Dot/L2/Cosine): the FEAT reference for any post-relabel per-channel query, computed
+	// from the DEQUANTIZED bank rows directly, from the channel-score definition -- never
+	// touching ComputeChannelInverseNorms or the kernel.
+	std::vector<FeatRefHit> ChannelBruteForce(
+		const BankView& view, const float* paddedQuery, const ChannelInfo& ch,
+		const uint32_t* excludeBits, Metric metric)
+	{
+		std::vector<FeatRefHit> ref;
+		std::vector<double> row;
+		for (int32_t r = 0; r < view.count; ++r)
+		{
+			if (IsExcluded(excludeBits, r))
+			{
+				continue;
+			}
+			DequantizeRow(view, r, row);
+			double score = 0.0;
+			if (metric == Metric::Dot)
+			{
+				for (int32_t j = ch.offset; j < ch.offset + ch.length && j < view.dims; ++j)
+				{
+					score += static_cast<double>(paddedQuery[j]) * row[static_cast<size_t>(j)];
+				}
+			}
+			else if (metric == Metric::L2)
+			{
+				for (int32_t j = ch.offset; j < ch.offset + ch.length && j < view.dims; ++j)
+				{
+					const double d =
+						static_cast<double>(paddedQuery[j]) - row[static_cast<size_t>(j)];
+					score += d * d;
+				}
+			}
+			else
+			{
+				double dot = 0.0, subNorm = 0.0;
+				for (int32_t j = ch.offset; j < ch.offset + ch.length && j < view.dims; ++j)
+				{
+					dot += static_cast<double>(paddedQuery[j]) * row[static_cast<size_t>(j)];
+					subNorm += row[static_cast<size_t>(j)] * row[static_cast<size_t>(j)];
+				}
+				score = subNorm > 0.0 ? dot / std::sqrt(subNorm) : 0.0;
+			}
+			ref.push_back({r, score});
+		}
+		std::sort(ref.begin(), ref.end(), [&](const FeatRefHit& a, const FeatRefHit& b) {
+			if (a.score != b.score)
+			{
+				return metric == Metric::L2 ? (a.score < b.score) : (a.score > b.score);
+			}
+			return a.index < b.index;
+		});
+		return ref;
+	}
+
+	// Whole-row definition-grounded brute-force (demote / whole-vector-unchanged claims):
+	// as ChannelBruteForce but over [0, dims) rather than one channel's sub-range.
+	std::vector<FeatRefHit> WholeVectorBruteForce(
+		const BankView& view, const float* paddedQuery, const uint32_t* excludeBits, Metric metric)
+	{
+		const ChannelInfo whole{0, view.dims};
+		return ChannelBruteForce(view, paddedQuery, whole, excludeBits, metric);
+	}
+
+	// Shared FEAT-vs-reference top-k check (the CAL-band comparison every FEAT cell below
+	// uses): sorted reference hits, the operator's returned hits, expected count == min(k,
+	// |ref|), every returned hit within tolerance of the definition-grounded boundary.
+	void CheckFeatTopK(const std::vector<FeatRefHit>& ref, const Hit* hits, int32_t n, int32_t k,
+		int32_t rowCount, Metric metric, Quantization quant, const char* label)
+	{
+		const double tol = quant == Quantization::Int8 ? kChannelFeatRelTolI8 : kChannelFeatRelTolF32;
+		const int32_t expected =
+			static_cast<int32_t>(ref.size()) < k ? static_cast<int32_t>(ref.size()) : k;
+		CHECK_MSG(n == expected, "%s: FEAT hit count got %d expected %d", label, n, expected);
+		if (expected == 0 || n != expected)
+		{
+			return;
+		}
+		const double boundary = ref[static_cast<size_t>(expected) - 1].score;
+		std::vector<double> refByIndex(
+			static_cast<size_t>(rowCount), metric == Metric::L2 ? 1e300 : -1e300);
+		for (const FeatRefHit& h : ref)
+		{
+			refByIndex[static_cast<size_t>(h.index)] = h.score;
+		}
+		for (int32_t i = 0; i < n; ++i)
+		{
+			const double rs = refByIndex[static_cast<size_t>(hits[i].index)];
+			const double band = tol * (1.0 + std::fabs(boundary));
+			const bool inTrueTopK =
+				metric == Metric::L2 ? (rs <= boundary + band) : (rs >= boundary - band);
+			CHECK_MSG(inTrueTopK, "%s: hit %d (row %d) not within CAL band of the FEAT reference",
+				label, i, hits[i].index);
+			CHECK_MSG(std::fabs(rs - static_cast<double>(hits[i].score)) <= band,
+				"%s: FEAT score drift got %.9g ref %.9g", label, static_cast<double>(hits[i].score),
+				rs);
+		}
+	}
+
+	// A counting allocator that fails the (failAfter)-th call (0-based) onward and forwards
+	// every earlier call to the platform aligned alloc/free -- the OOM reject-over-degrade
+	// probe (dim 5). alloc/free mirror alloc.cpp's DefaultAlloc/DefaultFree exactly so freed
+	// blocks match how they were allocated.
+	struct FailAfterState
+	{
+		std::atomic<int32_t> calls{0};
+		int32_t failAfter = 0;
+	};
+
+	void* FailAfterAlloc(size_t size, size_t alignment, void* user)
+	{
+		auto* st = static_cast<FailAfterState*>(user);
+		const int32_t call = st->calls.fetch_add(1, std::memory_order_relaxed);
+		if (call >= st->failAfter)
+		{
+			return nullptr;
+		}
+#if defined(_MSC_VER)
+		return _aligned_malloc(size, alignment);
+#else
+		const size_t rounded = ((size + alignment - 1) / alignment) * alignment;
+		return std::aligned_alloc(alignment, rounded);
+#endif
+	}
+
+	void FailAfterFree(void* ptr, void* /*user*/)
+	{
+#if defined(_MSC_VER)
+		_aligned_free(ptr);
+#else
+		std::free(ptr);
+#endif
+	}
+
+	Allocator MakeFailAfterAllocator(FailAfterState& state)
+	{
+		Allocator a;
+		a.alloc = &FailAfterAlloc;
+		a.free = &FailAfterFree;
+		a.user = &state;
+		return a;
+	}
+} // namespace
+
+// T-V3.1-Validation (dim 2, N-2) -- the full Create rule set replayed via Relabel on an
+// EXISTING bank (a Cosine channel bank, the realloc path, and a Dot single-space bank, the
+// promote case): every malformed table -> InvalidArgument, the bank fully unchanged
+// (channel count, generation). Validation symmetry across Create/Load/Relabel.
+static void TestRelabelValidationSymmetry()
+{
+	Rng rng(0x100001ull);
+	const int32_t dims = 64;
+	const ChannelInfo baseChannels[2] = {{0, 32}, {32, 32}};
+
+	ScratchBank cosineBank;
+	CHECK(cosineBank.Create(16, dims, Metric::Cosine, Quantization::Int8, baseChannels, 2) ==
+		Status::Ok);
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) { v = rng.NextFloat(); }
+		row[0] += 1.5f;
+		CHECK(cosineBank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	ScratchBank singleSpaceBank;
+	CHECK(singleSpaceBank.Create(16, dims, Metric::Dot, Quantization::Float32) == Status::Ok);
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(singleSpaceBank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	auto expectRejected = [&](ScratchBank& bank, const ChannelInfo* newChannels, int32_t newCount,
+								   const char* why) {
+		const int32_t countBefore = bank.GetChannelCount();
+		const uint64_t genBefore = bank.Generation();
+		const Status s = bank.Relabel(newChannels, newCount);
+		CHECK_MSG(s == Status::InvalidArgument, "%s: expected InvalidArgument, got %d", why,
+			static_cast<int>(s));
+		CHECK_MSG(bank.GetChannelCount() == countBefore,
+			"%s: a rejected Relabel changed ChannelCount_ (%d -> %d)", why, countBefore,
+			bank.GetChannelCount());
+		CHECK_MSG(bank.Generation() == genBefore,
+			"%s: a rejected Relabel advanced Generation()", why);
+	};
+
+	for (ScratchBank* bank : {&cosineBank, &singleSpaceBank})
+	{
+		{ const ChannelInfo bad[2] = {{0, 32}, {16, 32}}; expectRejected(*bank, bad, 2, "overlapping"); }
+		{ const ChannelInfo bad[2] = {{32, 16}, {0, 16}}; expectRejected(*bank, bad, 2, "non-ascending"); }
+		{ const ChannelInfo bad[1] = {{0, 6}}; expectRejected(*bank, bad, 1, "off-grid length"); }
+		{ const ChannelInfo bad[1] = {{2, 8}}; expectRejected(*bank, bad, 1, "off-grid offset"); }
+		{ const ChannelInfo bad[1] = {{0, dims + 64}}; expectRejected(*bank, bad, 1, "out-of-bounds"); }
+		{ const ChannelInfo bad[1] = {{0, 0}}; expectRejected(*bank, bad, 1, "zero-length"); }
+		{ const ChannelInfo bad[1] = {{-16, 16}}; expectRejected(*bank, bad, 1, "negative offset"); }
+		expectRejected(*bank, nullptr, 1, "null table, nonzero count");
+		{ const ChannelInfo t[1] = {{0, 16}}; expectRejected(*bank, t, 0, "nonzero table, zero count"); }
+		// N-2: negative count with a non-null table.
+		{ const ChannelInfo t[1] = {{0, 16}}; expectRejected(*bank, t, -1, "negative count, non-null table"); }
+	}
+
+	// >kMaxChannels, isolated from the out-of-bounds rule on a wide-dims bank (the V3.0
+	// TestScratchChannelCreateRejections precedent), so the cap fires for its own reason.
+	{
+		const int32_t wideDims = 9 * kAlignment;
+		ScratchBank wideBank;
+		CHECK(wideBank.Create(4, wideDims, Metric::Dot, Quantization::Float32) == Status::Ok);
+		ChannelInfo nine[9];
+		for (int32_t c = 0; c < 9; ++c) { nine[c] = {c * kAlignment, kAlignment}; }
+		expectRejected(wideBank, nine, 9, "exceeds kMaxChannels (isolated from OOB)");
+	}
+
+	// Positive control: exactly kMaxChannels is accepted (the cap is exclusive-above).
+	{
+		const int32_t wideDims = 8 * kAlignment;
+		ScratchBank wideBank;
+		CHECK(wideBank.Create(4, wideDims, Metric::Dot, Quantization::Float32) == Status::Ok);
+		ChannelInfo eight[8];
+		for (int32_t c = 0; c < 8; ++c) { eight[c] = {c * kAlignment, kAlignment}; }
+		CHECK_MSG(wideBank.Relabel(eight, 8) == Status::Ok,
+			"kMaxChannels boundary: Relabel of exactly 8 channels should succeed");
+	}
+}
+
+// T-V3.1-RejectQueryable (dim 5, N-1) -- after a rejected Relabel, the bank is not just
+// "unchanged" by field inspection: a whole-vector query AND a per-channel query both still
+// return the correct result under the OLD table.
+static void TestRelabelRejectionsStillQueryableUnderOldTable()
+{
+	Rng rng(0x100002ull);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+
+	const ChannelInfo badOverlap[2] = {{0, 32}, {16, 32}};
+	CHECK_MSG(bank.Relabel(badOverlap, 2) == Status::InvalidArgument,
+		"malformed relabel should reject");
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2 && snap.channels != nullptr &&
+			snap.channels[0].offset == 0 && snap.channels[0].length == 32 &&
+			snap.channels[1].offset == 32 && snap.channels[1].length == 32,
+		"a rejected Relabel must leave the OLD table on the snapshot");
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw) { v = rng.NextFloat(); }
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{0, 32, 1.0f}};
+	QueryParams p;
+	p.k = 10;
+	p.segments = seg;
+	p.segmentCount = 1;
+	p.excludeBits = tombs.data();
+	Workspace ws;
+	Hit hits[10];
+	int32_t n = 0;
+	CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+	const std::vector<FeatRefHit> ref =
+		ChannelBruteForce(snap, qbuf.F32(), oldTable[0], tombs.data(), Metric::Cosine);
+	CheckFeatTopK(ref, hits, n, 10, count, Metric::Cosine, Quantization::Int8,
+		"post-rejection old-table channel query");
+
+	QueryParams pw;
+	pw.k = 10;
+	pw.excludeBits = tombs.data();
+	Hit whits[10];
+	int32_t nw = 0;
+	CHECK(Query(snap, qbuf.F32(), pw, ws, whits, &nw) == Status::Ok);
+	const std::vector<FeatRefHit> wref =
+		WholeVectorBruteForce(snap, qbuf.F32(), tombs.data(), Metric::Cosine);
+	CheckFeatTopK(wref, whits, nw, 10, count, Metric::Cosine, Quantization::Int8,
+		"post-rejection whole-vector query");
+}
+
+// T-V3.1-OOM (dim 5) -- a Cosine relabel whose arena realloc fails returns OutOfMemory and
+// leaves the bank fully intact, still queryable under the OLD table (reject-over-degrade,
+// the Load idiom).
+static void TestRelabelOomLeavesBankIntact()
+{
+	Rng rng(0x100003ull);
+	const int32_t dims = 64;
+	const int32_t count = 24;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[3] = {{0, 16}, {16, 16}, {32, 32}}; // count UP -- forces a realloc
+
+	FailAfterState failState;
+	failState.failAfter = 1; // call 0 (Create) succeeds; call 1 (the relabel realloc) fails
+	Allocator failAlloc = MakeFailAfterAllocator(failState);
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2,
+			/*retainFloats=*/false, failAlloc) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	const uint64_t genBefore = bank.Generation();
+
+	CHECK_MSG(bank.Relabel(newTable, 3) == Status::OutOfMemory,
+		"a relabel realloc that cannot allocate must return OutOfMemory");
+	CHECK_MSG(bank.GetChannelCount() == 2,
+		"OOM relabel must leave the OLD channel count (2), got %d", bank.GetChannelCount());
+	CHECK_MSG(bank.Generation() == genBefore, "OOM relabel must not advance Generation()");
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw) { v = rng.NextFloat(); }
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{0, 32, 1.0f}};
+	QueryParams p;
+	p.k = 10;
+	p.segments = seg;
+	p.segmentCount = 1;
+	p.excludeBits = tombs.data();
+	Workspace ws;
+	Hit hits[10];
+	int32_t n = 0;
+	CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+	const std::vector<FeatRefHit> ref =
+		ChannelBruteForce(snap, qbuf.F32(), oldTable[0], tombs.data(), Metric::Cosine);
+	CheckFeatTopK(ref, hits, n, 10, count, Metric::Cosine, Quantization::Int8,
+		"post-OOM old-table channel query");
+}
+
+// T-V3.1-Lifetime (dim 1) -- a warm bank driven through Append -> Grow -> Relabel -> Append
+// -> Relabel -> Remove, correct at every step; one seam allocation per Cosine relabel, ZERO
+// per Dot/L2 relabel.
+static void TestRelabelWarmLifetimeSequence()
+{
+	Rng rng(0x100004ull);
+	const int32_t dims = 64;
+	const ChannelInfo t1[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo t2[2] = {{0, 16}, {16, 48}};
+	const ChannelInfo t3[3] = {{0, 16}, {16, 16}, {32, 32}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(16, dims, metric, Quantization::Int8, t1, 2) == Status::Ok);
+		auto appendN = [&](int32_t n) {
+			for (int32_t i = 0; i < n; ++i)
+			{
+				std::vector<float> row(static_cast<size_t>(dims));
+				for (auto& v : row) { v = rng.NextFloat(); }
+				CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+			}
+		};
+		appendN(10);
+		CHECK(bank.Grow(48) == Status::Ok);
+
+		const uint64_t before1 = AllocationCount();
+		CHECK(bank.Relabel(t2, 2) == Status::Ok);
+		const uint64_t delta1 = AllocationCount() - before1;
+		const uint64_t expected1 = metric == Metric::Cosine ? 1u : 0u;
+		CHECK_MSG(delta1 == expected1,
+			"warm relabel #1 (metric=%d): expected %llu seam alloc(s), got %llu",
+			static_cast<int>(metric), static_cast<unsigned long long>(expected1),
+			static_cast<unsigned long long>(delta1));
+		CHECK_MSG(bank.GetChannelCount() == 2 && bank.GetChannels()[0].length == 16,
+			"warm relabel #1 (metric=%d): table did not update", static_cast<int>(metric));
+
+		appendN(10);
+
+		const uint64_t before2 = AllocationCount();
+		CHECK(bank.Relabel(t3, 3) == Status::Ok);
+		const uint64_t delta2 = AllocationCount() - before2;
+		const uint64_t expected2 = metric == Metric::Cosine ? 1u : 0u;
+		CHECK_MSG(delta2 == expected2,
+			"warm relabel #2 (metric=%d): expected %llu seam alloc(s), got %llu",
+			static_cast<int>(metric), static_cast<unsigned long long>(expected2),
+			static_cast<unsigned long long>(delta2));
+		CHECK_MSG(bank.GetChannelCount() == 3, "warm relabel #2 (metric=%d): table did not update",
+			static_cast<int>(metric));
+
+		CHECK(bank.Remove(0) == Status::Ok);
+
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(bank.Count()), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+		const QuerySegment seg[1] = {{t3[0].offset, t3[0].length, 1.0f}};
+		QueryParams p;
+		p.k = 10;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		const std::vector<FeatRefHit> ref =
+			ChannelBruteForce(snap, qbuf.F32(), t3[0], tombs.data(), metric);
+		CheckFeatTopK(ref, hits, n, 10, bank.Count(), metric, Quantization::Int8,
+			"warm lifetime final channel query");
+	}
+}
+
+// T-V3.1-Toggle (dim 1, G-3) -- a warm promote(absent->present)->demote(present->absent)->
+// promote(absent->present again) sequence on ONE Cosine instance: the re-bind bug G-3
+// targets is a stale pointer or mis-sized region on the SECOND promote after a demote.
+static void TestRelabelWarmPromoteDemoteToggle()
+{
+	Rng rng(0x100005ull);
+	const int32_t dims = 64;
+	const ChannelInfo table[2] = {{0, 32}, {32, 32}};
+	const int32_t count = 24;
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	auto checkChannelQuery = [&](const char* step) {
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		if (snap.channelCount == 0)
+		{
+			return;
+		}
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+		const QuerySegment seg[1] = {{table[0].offset, table[0].length, 1.0f}};
+		QueryParams p;
+		p.k = 10;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		const std::vector<FeatRefHit> ref =
+			ChannelBruteForce(snap, qbuf.F32(), table[0], tombs.data(), Metric::Cosine);
+		CheckFeatTopK(ref, hits, n, 10, count, Metric::Cosine, Quantization::Int8, step);
+	};
+
+	CHECK(bank.Relabel(table, 2) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 2, "toggle: promote #1 did not bind the region");
+	checkChannelQuery("toggle: promote #1");
+
+	CHECK(bank.Relabel(nullptr, 0) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 0, "toggle: demote did not clear the region");
+
+	const uint64_t before = AllocationCount();
+	CHECK(bank.Relabel(table, 2) == Status::Ok);
+	const uint64_t delta = AllocationCount() - before;
+	CHECK_MSG(delta == 1u, "toggle: promote #2 should cost exactly one seam allocation, got %llu",
+		static_cast<unsigned long long>(delta));
+	CHECK_MSG(bank.GetChannelCount() == 2, "toggle: promote #2 did not re-bind the region");
+	checkChannelQuery("toggle: promote #2 (re-bind)");
+}
+
+// T-V3.1-Aliasing (Forge W2, dim 3) -- a Dot/L2 relabel is a by-value member write, aliased
+// into every live BankView. A BankView taken BEFORE a Dot/L2 relabel observes the NEW table
+// through that alias once the exclusive drain completes -- proving the drain actually ran.
+static void TestRelabelHeldViewAliasing()
+{
+	Rng rng(0x100006ull);
+	const int32_t dims = 32;
+	const int32_t count = 8;
+	const ChannelInfo oldTable[2] = {{0, 16}, {16, 16}};
+	const ChannelInfo newTable[1] = {{0, 32}};
+
+	for (Metric metric : {Metric::Dot, Metric::L2})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, metric, Quantization::Float32, oldTable, 2) == Status::Ok);
+		for (int32_t r = 0; r < count; ++r)
+		{
+			std::vector<float> row(static_cast<size_t>(dims));
+			for (auto& v : row) { v = rng.NextFloat(); }
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+
+		BankView held;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&held, tombs.data()) == Status::Ok);
+		CHECK(held.channelCount == 2);
+
+		CHECK(bank.Relabel(newTable, 1) == Status::Ok);
+
+		CHECK_MSG(held.channelCount == 1 && held.channels != nullptr &&
+				held.channels[0].offset == 0 && held.channels[0].length == 32,
+			"the aliased pre-relabel view (metric=%d) must reflect the new table after the "
+			"exclusive drain completes", static_cast<int>(metric));
+	}
+}
+
+// T-V3.1-Storm (dim 3) -- a reader thread snapshots and verifies self-consistency (Cosine
+// sub-norm arena vs a fresh recompute) while a writer thread interleaves Append and Relabel
+// across a fixed table sequence. Deterministic red trigger: the FINAL table must be one of
+// the writer's rotation targets, distinct in shape (channelCount) from the fixture's start
+// table, so a no-op Relabel can never satisfy it.
+static void TestRelabelExclusiveDrainStorm()
+{
+	Rng rng(0x100007ull);
+	const int32_t dims = 64;
+	const int32_t capacity = 512;
+	const int32_t appended = 32;
+	const ChannelInfo t0[1] = {{0, dims}}; // channelCount 1 -- distinct shape from every target
+	const ChannelInfo tables[3][2] = {
+		{{0, 16}, {16, 48}},
+		{{0, 48}, {48, 16}},
+		{{0, 32}, {32, 32}},
+	};
+
+	ScratchBank bank;
+	CHECK(bank.Create(capacity, dims, Metric::Cosine, Quantization::Int8, t0, 1) == Status::Ok);
+	for (int32_t r = 0; r < appended; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) { v = rng.NextFloat(); }
+		row[0] += 1.5f;
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	std::atomic<bool> stop{false};
+	std::atomic<int32_t> relabelCount{0};
+	std::thread writer([&]() {
+		Rng wrng(0x100107ull);
+		int32_t next = bank.Count();
+		std::vector<float> row(static_cast<size_t>(dims));
+		int32_t iter = 0;
+		while (!stop.load(std::memory_order_relaxed))
+		{
+			if (next < capacity && (iter % 3) != 0)
+			{
+				for (auto& v : row) { v = wrng.NextFloat(); }
+				row[0] += 1.5f;
+				if (bank.Append(row.data(), dims, &next) == Status::Ok)
+				{
+					++next;
+				}
+			}
+			else
+			{
+				const int32_t which = relabelCount.fetch_add(1, std::memory_order_relaxed) % 3;
+				bank.Relabel(tables[which], 2);
+			}
+			++iter;
+		}
+	});
+
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
+	int32_t maxCountSeen = 0;
+	for (int32_t iter = 0; iter < 300; ++iter)
+	{
+		BankView snap;
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		maxCountSeen = snap.count > maxCountSeen ? snap.count : maxCountSeen;
+		if (snap.channelCount > 0 && snap.channelInvNorms != nullptr && snap.count > 0)
+		{
+			std::vector<float> recomputed(static_cast<size_t>(snap.count) * snap.channelCount);
+			CHECK(ComputeChannelInverseNorms(snap, recomputed.data()) == Status::Ok);
+			CHECK_MSG(std::memcmp(recomputed.data(), snap.channelInvNorms,
+						  recomputed.size() * sizeof(float)) == 0,
+				"relabel storm: a fresh snapshot observed a row without its correct sub-norm "
+				"(iter %d, count %d, channelCount %d)", iter, snap.count, snap.channelCount);
+		}
+	}
+	stop.store(true, std::memory_order_relaxed);
+	writer.join();
+
+	CHECK_MSG(relabelCount.load(std::memory_order_relaxed) > 0,
+		"relabel storm: the writer never attempted a relabel");
+	BankView finalSnap;
+	CHECK(bank.Snapshot(&finalSnap, tombs.data()) == Status::Ok);
+	bool matchedSomeTarget = false;
+	for (const auto& t : tables)
+	{
+		if (finalSnap.channelCount == 2 && finalSnap.channels[0].offset == t[0].offset &&
+			finalSnap.channels[0].length == t[0].length)
+		{
+			matchedSomeTarget = true;
+			break;
+		}
+	}
+	CHECK_MSG(matchedSomeTarget,
+		"relabel storm: the final channel table never left the fixture's initial (1-channel) "
+		"table -- Relabel never mutated the bank under concurrent load");
+	CHECK_MSG(maxCountSeen > appended,
+		"relabel storm: reader never observed a freshly-published row (count stayed at %d)",
+		maxCountSeen);
+}
+
+// T-V3.1-Extremes (dim 4, G-5) -- shape/extremes matrix crossed with the metric matrix
+// (G-2): count up 1->8, count down 8->1, boundary move, whole-row single channel (must
+// bit-match the whole-vector path), one-grid-unit channel, one live row, fully tombstoned,
+// empty bank (count==0, G-5), promote, demote -- each proven with the per-channel FEAT.
+// dims=128 with grid=kAlignment (16 elements) throughout: the LCD grid satisfying both
+// quantizations' element-grid rules, wide enough for the 8-channel count-up/down extremes.
+static void TestRelabelExtremesMatrix()
+{
+	Rng rng(0x100008ull);
+	const int32_t dims = 128;
+	const int32_t grid = kAlignment;
+
+	struct Scenario
+	{
+		const char* name;
+		std::vector<ChannelInfo> initial; // empty = single-space
+		std::vector<ChannelInfo> target;  // empty = demote to single-space
+		int32_t count;
+		bool tombstoneAll = false;
+	};
+
+	std::vector<Scenario> scenarios;
+	{
+		Scenario s{"count up 1->8", {{0, dims}}, {}, 64};
+		for (int32_t c = 0; c < 8; ++c) { s.target.push_back({c * grid, grid}); }
+		scenarios.push_back(s);
+	}
+	{
+		Scenario s{"count down 8->1", {}, {{0, dims}}, 64};
+		for (int32_t c = 0; c < 8; ++c) { s.initial.push_back({c * grid, grid}); }
+		scenarios.push_back(s);
+	}
+	scenarios.push_back({"boundary move", {{0, 64}, {64, 64}}, {{0, 32}, {32, 96}}, 48});
+	scenarios.push_back(
+		{"single channel whole row", {{0, 64}, {64, 64}}, {{0, dims}}, 40});
+	scenarios.push_back({"one-grid-unit channel", {{0, dims}}, {{0, grid}, {grid, dims - grid}}, 24});
+	scenarios.push_back({"one live row", {{0, 64}, {64, 64}}, {{0, 32}, {32, 96}}, 1});
+	{
+		Scenario s{"fully tombstoned", {{0, 64}, {64, 64}}, {{0, 32}, {32, 96}}, 16};
+		s.tombstoneAll = true;
+		scenarios.push_back(s);
+	}
+	scenarios.push_back({"empty bank (count==0)", {{0, 64}, {64, 64}}, {{0, 32}, {32, 96}}, 0});
+	scenarios.push_back({"promote", {}, {{0, 64}, {64, 64}}, 24});
+	scenarios.push_back({"demote", {{0, 64}, {64, 64}}, {}, 24});
+
+	for (const Scenario& sc : scenarios)
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+			{
+				ScratchBank bank;
+				const Status created = sc.initial.empty()
+					? bank.Create(sc.count > 0 ? sc.count : 1, dims, metric, quant)
+					: bank.Create(sc.count > 0 ? sc.count : 1, dims, metric, quant,
+						  sc.initial.data(), static_cast<int32_t>(sc.initial.size()));
+				CHECK_MSG(created == Status::Ok, "%s: fixture Create failed", sc.name);
+				if (created != Status::Ok)
+				{
+					continue;
+				}
+				std::vector<float> source(static_cast<size_t>(sc.count) * dims);
+				for (auto& v : source) { v = rng.NextFloat(); }
+				for (int32_t r = 0; r < sc.count; ++r)
+				{
+					CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims,
+							  nullptr) == Status::Ok);
+				}
+				if (sc.tombstoneAll)
+				{
+					for (int32_t r = 0; r < sc.count; ++r)
+					{
+						CHECK(bank.Remove(r) == Status::Ok);
+					}
+				}
+
+				const ChannelInfo* targetPtr = sc.target.empty() ? nullptr : sc.target.data();
+				const int32_t targetCount = static_cast<int32_t>(sc.target.size());
+				const Status relabelStatus = bank.Relabel(targetPtr, targetCount);
+				CHECK_MSG(relabelStatus == Status::Ok,
+					"%s: Relabel failed (metric=%d quant=%d): status=%d", sc.name,
+					static_cast<int>(metric), static_cast<int>(quant),
+					static_cast<int>(relabelStatus));
+				if (relabelStatus != Status::Ok)
+				{
+					continue;
+				}
+				CHECK_MSG(bank.GetChannelCount() == targetCount,
+					"%s: GetChannelCount() should be %d after Relabel, got %d (metric=%d quant=%d)",
+					sc.name, targetCount, bank.GetChannelCount(), static_cast<int>(metric),
+					static_cast<int>(quant));
+
+				if (sc.count == 0)
+				{
+					float extra[dims];
+					for (int32_t i = 0; i < dims; ++i) { extra[i] = rng.NextFloat(); }
+					int32_t idx = -1;
+					CHECK(bank.Append(extra, dims, &idx) == Status::Ok);
+					CHECK(idx == 0);
+					continue;
+				}
+
+				BankView snap;
+				std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(bank.Count()), 0u);
+				CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+				CHECK_MSG(snap.channelCount == targetCount,
+					"%s: snapshot channelCount mismatch (metric=%d quant=%d)", sc.name,
+					static_cast<int>(metric), static_cast<int>(quant));
+
+				if (sc.tombstoneAll)
+				{
+					continue;
+				}
+
+				std::vector<float> queryRaw(dims);
+				for (auto& v : queryRaw) { v = rng.NextFloat(); }
+				AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+				PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+
+				if (targetCount > 0)
+				{
+					const ChannelInfo& ch = sc.target[0];
+					const QuerySegment seg[1] = {{ch.offset, ch.length, 1.0f}};
+					QueryParams p;
+					p.k = 10;
+					p.segments = seg;
+					p.segmentCount = 1;
+					p.excludeBits = tombs.data();
+					Workspace ws;
+					Hit hits[10];
+					int32_t n = 0;
+					CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+					const std::vector<FeatRefHit> ref =
+						ChannelBruteForce(snap, qbuf.F32(), ch, tombs.data(), metric);
+					CheckFeatTopK(ref, hits, n, 10, bank.Count(), metric, quant, sc.name);
+
+					if (targetCount == 1 && ch.offset == 0 && ch.length == snap.paddedDims)
+					{
+						QueryParams pw;
+						pw.k = 10;
+						pw.excludeBits = tombs.data();
+						Workspace wsw;
+						Hit whits[10];
+						int32_t nw = 0;
+						CHECK(Query(snap, qbuf.F32(), pw, wsw, whits, &nw) == Status::Ok);
+						CHECK_MSG(nw == n,
+							"%s: whole-row channel hit count != whole-vector path", sc.name);
+						for (int32_t i = 0; i < n && i < nw; ++i)
+						{
+							CHECK_MSG(hits[i].index == whits[i].index &&
+									hits[i].score == whits[i].score,
+								"%s: whole-row channel query not bit-identical to the "
+								"whole-vector path at hit %d", sc.name, i);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// T-V3.1-ZeroNorm (dim 4/5) -- a relabel that lands an all-zero-norm channel: inverse norm
+// stores 0, the channel scores 0, never NaN.
+static void TestRelabelAllZeroNormChannel()
+{
+	const int32_t d = 8;
+	const ChannelInfo initial[1] = {{0, 8}}; // single whole-row channel -- distinct from target
+	ScratchBank bank;
+	CHECK(bank.Create(4, d, Metric::Cosine, Quantization::Float32, initial, 1) == Status::Ok);
+
+	float row0[d] = {1, 0, 0, 0, 0, 0, 0, 0}; // channel [4,8)'s sub-vector is all zero
+	CHECK(bank.Append(row0, d, nullptr) == Status::Ok);
+
+	const ChannelInfo target[2] = {{0, 4}, {4, 4}};
+	CHECK(bank.Relabel(target, 2) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 2,
+		"zero-norm-channel fixture: table did not update, got channelCount=%d",
+		bank.GetChannelCount());
+
+	BankView snap;
+	uint32_t tombs = 0;
+	CHECK(bank.Snapshot(&snap, &tombs) == Status::Ok);
+	CHECK_MSG(snap.channelInvNorms != nullptr,
+		"zero-norm-channel relabel fixture has no sub-norm arena");
+	if (snap.channelInvNorms != nullptr)
+	{
+		CHECK_MSG(snap.channelInvNorms[1] == 0.0f,
+			"channel 1's inverse sub-norm should floor to 0 on an all-zero sub-vector, got %g",
+			static_cast<double>(snap.channelInvNorms[1]));
+		CHECK(std::isfinite(snap.channelInvNorms[0]));
+	}
+
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	float qraw[d] = {0.3f, -0.2f, 0.1f, 0.4f, 0.5f, -0.6f, 0.2f, 0.1f};
+	std::vector<float> qv(qraw, qraw + d);
+	PadQuery(qv, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{4, 4, 1.0f}};
+	QueryParams p;
+	p.k = 1;
+	p.segments = seg;
+	p.segmentCount = 1;
+	Workspace ws;
+	Hit hits[1];
+	int32_t n = 0;
+	CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+	if (n > 0)
+	{
+		CHECK_MSG(hits[0].score == 0.0f, "zero-norm channel query should score exactly 0, got %g",
+			static_cast<double>(hits[0].score));
+		CHECK(std::isfinite(hits[0].score));
+	}
+}
+
+// T-V3.1-Parity (dim 6, the crux; Loki S1 scoping) -- after Relabel(T_new),
+// ChannelInvNorms_ over the LIVE-ROW PREFIX [0, count) x newChannelCount bit-equals a fresh
+// Create(T_new)+Append of the SAME rows in the SAME order at the SAME starting capacity.
+// Scoped to the live prefix, never a full-arena memcmp: a Grow-then-Relabel bank outsizes a
+// same-content fresh twin, so a full-arena compare is ill-defined.
+static void TestRelabelParityVsFreshCreate()
+{
+	Rng rng(0x10000aull);
+	const int32_t dims = 64;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+
+	struct Scenario { const char* name; std::vector<ChannelInfo> target; bool growFirst; bool promote; };
+	std::vector<Scenario> scenarios = {
+		{"boundary move", {{0, 16}, {16, 48}}, false, false},
+		{"count up", {{0, 16}, {16, 16}, {32, 32}}, false, false},
+		{"count down", {{0, 64}}, false, false},
+		{"promote-from-single-space", {{0, 32}, {32, 32}}, false, true},
+		{"boundary move after Grow (capacity mismatch)", {{0, 16}, {16, 48}}, true, false},
+	};
+
+	for (const Scenario& sc : scenarios)
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			const int32_t startCapacity = 40;
+			const int32_t count = 24;
+
+			ScratchBank relabeled;
+			const Status created = sc.promote
+				? relabeled.Create(startCapacity, dims, Metric::Cosine, quant)
+				: relabeled.Create(startCapacity, dims, Metric::Cosine, quant, oldTable, 2);
+			CHECK_MSG(created == Status::Ok, "%s (quant=%d): fixture Create failed", sc.name,
+				static_cast<int>(quant));
+			if (created != Status::Ok)
+			{
+				continue;
+			}
+			std::vector<float> source(static_cast<size_t>(count) * dims);
+			for (auto& v : source) { v = rng.NextFloat(); }
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK(relabeled.Append(source.data() + static_cast<size_t>(r) * dims, dims,
+						  nullptr) == Status::Ok);
+			}
+			if (sc.growFirst)
+			{
+				CHECK(relabeled.Grow(startCapacity * 2) == Status::Ok);
+			}
+			CHECK_MSG(relabeled.Relabel(sc.target.data(), static_cast<int32_t>(sc.target.size())) ==
+					Status::Ok,
+				"%s (quant=%d): Relabel failed", sc.name, static_cast<int>(quant));
+
+			ScratchBank fresh;
+			CHECK(fresh.Create(startCapacity, dims, Metric::Cosine, quant, sc.target.data(),
+					  static_cast<int32_t>(sc.target.size())) == Status::Ok);
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK(fresh.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+					Status::Ok);
+			}
+
+			BankView relSnap, freshSnap;
+			std::vector<uint32_t> relTombs(ScratchBank::TombstoneWords(relabeled.Count()), 0u);
+			std::vector<uint32_t> freshTombs(ScratchBank::TombstoneWords(fresh.Count()), 0u);
+			CHECK(relabeled.Snapshot(&relSnap, relTombs.data()) == Status::Ok);
+			CHECK(fresh.Snapshot(&freshSnap, freshTombs.data()) == Status::Ok);
+
+			CHECK_MSG(relSnap.channelCount == freshSnap.channelCount,
+				"%s (quant=%d): channel count mismatch vs the fresh twin", sc.name,
+				static_cast<int>(quant));
+
+			const size_t rowBytes = static_cast<size_t>(relSnap.paddedDims) * ElementSize(quant);
+			CHECK_MSG(std::memcmp(relSnap.rows, freshSnap.rows,
+						  static_cast<size_t>(count) * rowBytes) == 0,
+				"%s (quant=%d): relabeled rows differ from a fresh twin's", sc.name,
+				static_cast<int>(quant));
+			if (quant == Quantization::Int8)
+			{
+				CHECK(std::memcmp(relSnap.scales, freshSnap.scales,
+						  static_cast<size_t>(count) * sizeof(float)) == 0);
+			}
+
+			if (relSnap.channelInvNorms != nullptr && freshSnap.channelInvNorms != nullptr)
+			{
+				const size_t liveBytes =
+					static_cast<size_t>(count) * relSnap.channelCount * sizeof(float);
+				CHECK_MSG(std::memcmp(relSnap.channelInvNorms, freshSnap.channelInvNorms,
+							  liveBytes) == 0,
+					"%s (quant=%d): live-prefix sub-norms differ from a fresh Create+Append "
+					"under the new table", sc.name, static_cast<int>(quant));
+			}
+		}
+	}
+}
+
+// T-V3.1-ParityTautology (Forge N1/N2) -- the near-tautological determinism check: the
+// relabel-derived sub-norms bit-equal ComputeChannelInverseNorms over the current rows
+// under the new table.
+static void TestRelabelParityEqualsComputeChannelInverseNorms()
+{
+	Rng rng(0x10000bull);
+	const int32_t dims = 48;
+	const int32_t count = 20;
+	const ChannelInfo oldTable[2] = {{0, 16}, {16, 32}};
+	const ChannelInfo newTable[2] = {{0, 32}, {32, 16}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2 && snap.channels[0].offset == 0 && snap.channels[0].length == 32,
+		"parity/ComputeChannelInverseNorms fixture: table did not update");
+	if (snap.channelInvNorms == nullptr)
+	{
+		return;
+	}
+	std::vector<float> ref(static_cast<size_t>(count) * 2);
+	CHECK(ComputeChannelInverseNorms(snap, ref.data()) == Status::Ok);
+	CHECK_MSG(std::memcmp(ref.data(), snap.channelInvNorms, ref.size() * sizeof(float)) == 0,
+		"relabel-derived sub-norms do not bit-equal ComputeChannelInverseNorms over the "
+		"current rows under the new table");
+}
+
+// T-V3.1-PostAppend (dim 6/8, G-4) -- Append r1..rn -> Relabel(T_new) -> Append r(n+1)..rm:
+// the row appended AFTER the relabel must derive its sub-norms under the MUTATED table,
+// bit-equal to a fresh Create(T_new)+Append of the same full history.
+static void TestRelabelPostAppendDerivation()
+{
+	Rng rng(0x10000cull);
+	const int32_t dims = 64;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+	const int32_t n1 = 12, n2 = 8;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		std::vector<float> allSource(static_cast<size_t>(n1 + n2) * dims);
+		for (auto& v : allSource) { v = rng.NextFloat(); }
+
+		ScratchBank warm;
+		CHECK(warm.Create(n1 + n2, dims, Metric::Cosine, quant, oldTable, 2) == Status::Ok);
+		for (int32_t r = 0; r < n1; ++r)
+		{
+			CHECK(warm.Append(allSource.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		CHECK(warm.Relabel(newTable, 2) == Status::Ok);
+		for (int32_t r = n1; r < n1 + n2; ++r)
+		{
+			CHECK(warm.Append(allSource.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+
+		ScratchBank fresh;
+		CHECK(fresh.Create(n1 + n2, dims, Metric::Cosine, quant, newTable, 2) == Status::Ok);
+		for (int32_t r = 0; r < n1 + n2; ++r)
+		{
+			CHECK(fresh.Append(allSource.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+
+		BankView warmSnap, freshSnap;
+		std::vector<uint32_t> wt(ScratchBank::TombstoneWords(n1 + n2), 0u);
+		std::vector<uint32_t> ft(ScratchBank::TombstoneWords(n1 + n2), 0u);
+		CHECK(warm.Snapshot(&warmSnap, wt.data()) == Status::Ok);
+		CHECK(fresh.Snapshot(&freshSnap, ft.data()) == Status::Ok);
+		CHECK_MSG(warmSnap.channelCount == 2 && warmSnap.channels[0].length == 16,
+			"post-append-derivation fixture (quant=%d): table did not update after Relabel",
+			static_cast<int>(quant));
+		if (warmSnap.channelInvNorms == nullptr || freshSnap.channelInvNorms == nullptr)
+		{
+			continue;
+		}
+		const size_t bytes = static_cast<size_t>(n1 + n2) * 2 * sizeof(float);
+		CHECK_MSG(std::memcmp(warmSnap.channelInvNorms, freshSnap.channelInvNorms, bytes) == 0,
+			"G-4 (quant=%d): a row appended AFTER Relabel must derive its sub-norms under the "
+			"MUTATED table, bit-equal to a fresh Create(T_new)+Append of the same full history",
+			static_cast<int>(quant));
+	}
+}
+
+// T-V3.1-Floor (dim 6) -- a boundary move that narrows a channel onto an adversarial
+// tiny-but-nonzero norm: a finite inverse (no Inf), scores clamped to [-1, 1].
+static void TestRelabelSubNormFloorAndClamp()
+{
+	const int32_t dims = 32;
+	const ChannelInfo oldTable[1] = {{0, 32}};
+	const ChannelInfo tinyTable[2] = {{0, 16}, {16, 16}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(4, dims, Metric::Cosine, Quantization::Float32, oldTable, 1) == Status::Ok);
+	float row[dims];
+	for (int32_t i = 0; i < 16; ++i) { row[i] = 1.0f; }
+	for (int32_t i = 16; i < dims; ++i) { row[i] = 1e-20f; }
+	CHECK(bank.Append(row, dims, nullptr) == Status::Ok);
+
+	CHECK(bank.Relabel(tinyTable, 2) == Status::Ok);
+
+	BankView snap;
+	uint32_t tombs = 0;
+	CHECK(bank.Snapshot(&snap, &tombs) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2, "tiny-norm relabel fixture: table did not update");
+	if (snap.channelInvNorms == nullptr || snap.channelCount != 2)
+	{
+		return;
+	}
+	CHECK_MSG(std::isfinite(snap.channelInvNorms[0]) && std::isfinite(snap.channelInvNorms[1]),
+		"a tiny-but-nonzero channel norm must yield a finite inverse, got [%g, %g]",
+		static_cast<double>(snap.channelInvNorms[0]), static_cast<double>(snap.channelInvNorms[1]));
+
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	std::vector<float> qv(row, row + dims);
+	PadQuery(qv, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{16, 16, 1.0f}};
+	QueryParams p;
+	p.k = 1;
+	p.segments = seg;
+	p.segmentCount = 1;
+	Workspace ws;
+	Hit hits[1];
+	int32_t n = 0;
+	CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+	if (n > 0)
+	{
+		CHECK_MSG(hits[0].score >= -1.0001f && hits[0].score <= 1.0001f,
+			"a Cosine channel score must stay in [-1, 1] on the adversarial tiny-norm "
+			"partition, got %g", static_cast<double>(hits[0].score));
+	}
+}
+
+// T-V3.1-Golden (dim 6) -- forced-path + cross-runner golden over the per-channel Cosine
+// sqrt query path on a post-relabel bank carrying an adversarial tiny-channel-norm member.
+// Golden left at 0 (not yet pinned) in xd_fixtures.h -- pin once Relabel is green.
+static void TestRelabelCrossRunnerGolden()
+{
+	Rng rng(0x10000eull);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+	const ChannelInfo oldTable[1] = {{0, dims}};
+	const ChannelInfo tinyTable[2] = {{0, 48}, {48, 16}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 1) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t i = 48; i < dims; ++i) { source[static_cast<size_t>(i)] = 1e-6f; }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	CHECK(bank.Relabel(tinyTable, 2) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2, "golden fixture: relabel did not update the table");
+	if (snap.channelCount != 2)
+	{
+		return;
+	}
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw) { v = rng.NextFloat(); }
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{tinyTable[1].offset, tinyTable[1].length, 1.0f}};
+	QueryParams p;
+	p.k = 10;
+	p.segments = seg;
+	p.segmentCount = 1;
+	p.excludeBits = tombs.data();
+
+	std::vector<SimdPath> paths;
+	paths.push_back(SimdPath::Scalar);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	paths.push_back(SimdPath::SSE);
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		paths.push_back(SimdPath::AVX2);
+	}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+	paths.push_back(SimdPath::NEON);
+#endif
+
+	uint64_t hashes[4] = {};
+	for (size_t i = 0; i < paths.size(); ++i)
+	{
+		detail::ForceXdSimdPath(paths[i]);
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		uint64_t h = 0xcbf29ce484222325ull;
+		for (int32_t j = 0; j < n; ++j)
+		{
+			an::Hash(h, hits[j].score);
+			h ^= static_cast<uint64_t>(hits[j].index) * 0x100000001b3ull;
+		}
+		hashes[i] = h;
+		detail::ClearForcedXdSimdPath();
+		if (i > 0)
+		{
+			CHECK_MSG(hashes[i] == hashes[0],
+				"relabel adversarial-tiny-norm forced path %d hash %016llx != %016llx",
+				static_cast<int>(paths[i]), static_cast<unsigned long long>(hashes[i]),
+				static_cast<unsigned long long>(hashes[0]));
+		}
+	}
+	std::printf("relabel cross-device golden hash: %016llx (%d forced paths agree)\n",
+		static_cast<unsigned long long>(hashes[0]), static_cast<int>(paths.size()));
+	if constexpr (xdfix::kGoldenRelabelXdHash != 0)
+	{
+		CHECK_MSG(hashes[0] == xdfix::kGoldenRelabelXdHash,
+			"relabel golden hash %016llx != pinned golden %016llx",
+			static_cast<unsigned long long>(hashes[0]),
+			static_cast<unsigned long long>(xdfix::kGoldenRelabelXdHash));
+	}
+}
+
+// T-V3.1-NeverTouchesRows (dim 7) -- Rows_/Scales_/Retained_ byte-identical before and
+// after a successful relabel, across the metric x quant matrix.
+static void TestRelabelNeverTouchesRows()
+{
+	Rng rng(0x10000full);
+	const int32_t dims = 64;
+	const int32_t count = 30;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[3] = {{0, 16}, {16, 16}, {32, 32}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			ScratchBank bank;
+			CHECK(bank.Create(count, dims, metric, quant, oldTable, 2, /*retainFloats=*/true) ==
+				Status::Ok);
+			std::vector<float> source(static_cast<size_t>(count) * dims);
+			for (auto& v : source) { v = rng.NextFloat(); }
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+					Status::Ok);
+			}
+
+			BankView before;
+			std::vector<uint32_t> tombsBefore(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(bank.Snapshot(&before, tombsBefore.data()) == Status::Ok);
+			const size_t rowBytes = static_cast<size_t>(before.paddedDims) * ElementSize(quant);
+			std::vector<uint8_t> rowsBefore(static_cast<size_t>(count) * rowBytes);
+			std::memcpy(rowsBefore.data(), before.rows, rowsBefore.size());
+			std::vector<float> scalesBefore;
+			if (quant == Quantization::Int8)
+			{
+				scalesBefore.assign(before.scales, before.scales + count);
+			}
+			std::vector<float> retainedBefore(static_cast<size_t>(count) * dims);
+			for (int32_t r = 0; r < count; ++r)
+			{
+				std::memcpy(retainedBefore.data() + static_cast<size_t>(r) * dims,
+					bank.RetainedRow(r), static_cast<size_t>(dims) * sizeof(float));
+			}
+
+			CHECK_MSG(bank.Relabel(newTable, 3) == Status::Ok,
+				"never-touches-rows fixture (metric=%d quant=%d): Relabel failed",
+				static_cast<int>(metric), static_cast<int>(quant));
+
+			BankView after;
+			std::vector<uint32_t> tombsAfter(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(bank.Snapshot(&after, tombsAfter.data()) == Status::Ok);
+			CHECK_MSG(after.channelCount == 3,
+				"never-touches-rows fixture (metric=%d quant=%d): table did not update",
+				static_cast<int>(metric), static_cast<int>(quant));
+			CHECK_MSG(std::memcmp(rowsBefore.data(), after.rows, rowsBefore.size()) == 0,
+				"Relabel touched the stored row bytes (metric=%d quant=%d)",
+				static_cast<int>(metric), static_cast<int>(quant));
+			if (quant == Quantization::Int8)
+			{
+				CHECK_MSG(std::memcmp(scalesBefore.data(), after.scales,
+							  scalesBefore.size() * sizeof(float)) == 0,
+					"Relabel touched the int8 scales (metric=%d quant=%d)",
+					static_cast<int>(metric), static_cast<int>(quant));
+			}
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK_MSG(std::memcmp(retainedBefore.data() + static_cast<size_t>(r) * dims,
+							  bank.RetainedRow(r), static_cast<size_t>(dims) * sizeof(float)) == 0,
+					"Relabel touched the retained float row %d (metric=%d quant=%d)", r,
+					static_cast<int>(metric), static_cast<int>(quant));
+			}
+		}
+	}
+}
+
+// T-V3.1-WholeVectorUnchanged (dim 7) -- a channel relabel leaves the whole-vector query
+// path bit-unchanged.
+static void TestRelabelWholeVectorPathUnchanged()
+{
+	Rng rng(0x100010ull);
+	const int32_t dims = 48;
+	const int32_t count = 20;
+	const ChannelInfo oldTable[2] = {{0, 16}, {16, 32}};
+	const ChannelInfo newTable[2] = {{0, 32}, {32, 16}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, metric, Quantization::Int8, oldTable, 2) == Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source) { v = rng.NextFloat(); }
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+
+		BankView before;
+		std::vector<uint32_t> tombsB(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&before, tombsB.data()) == Status::Ok);
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(before.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, before.paddedDims, qbuf.F32());
+		QueryParams p;
+		p.k = 10;
+		p.excludeBits = tombsB.data();
+		Workspace ws;
+		Hit hitsBefore[10];
+		int32_t nBefore = 0;
+		CHECK(Query(before, qbuf.F32(), p, ws, hitsBefore, &nBefore) == Status::Ok);
+
+		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+		BankView after;
+		std::vector<uint32_t> tombsA(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&after, tombsA.data()) == Status::Ok);
+		p.excludeBits = tombsA.data();
+		Hit hitsAfter[10];
+		int32_t nAfter = 0;
+		CHECK(Query(after, qbuf.F32(), p, ws, hitsAfter, &nAfter) == Status::Ok);
+
+		CHECK_MSG(after.channelCount == 2 && after.channels[0].offset == 0 &&
+				after.channels[0].length == 32,
+			"whole-vector-unchanged fixture (metric=%d): table did not update",
+			static_cast<int>(metric));
+		CHECK_MSG(nBefore == nAfter,
+			"whole-vector query hit count changed across a relabel (metric=%d)",
+			static_cast<int>(metric));
+		for (int32_t i = 0; i < nBefore && i < nAfter; ++i)
+		{
+			CHECK_MSG(hitsBefore[i].index == hitsAfter[i].index &&
+					hitsBefore[i].score == hitsAfter[i].score,
+				"the whole-vector path must be bit-unchanged by a channel relabel "
+				"(metric=%d, hit %d)", static_cast<int>(metric), i);
+		}
+	}
+}
+
+// T-V3.1-MetricMatrix (dim 7, G-2) -- explicit contract claim: Relabel + post-relabel
+// per-channel query + channel-scoped analytics all correct on Dot, Cosine, and L2 each.
+static void TestRelabelMetricMatrixContractClaim()
+{
+	Rng rng(0x100011ull);
+	const int32_t dims = 64;
+	const int32_t count = 32;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, metric, Quantization::Int8, oldTable, 2) == Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source) { v = rng.NextFloat(); }
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		CHECK_MSG(bank.Relabel(newTable, 2) == Status::Ok,
+			"metric-matrix contract (metric=%d): Relabel failed", static_cast<int>(metric));
+
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+			"metric-matrix contract (metric=%d): table did not update", static_cast<int>(metric));
+
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+		const QuerySegment seg[1] = {{newTable[0].offset, newTable[0].length, 1.0f}};
+		QueryParams p;
+		p.k = 10;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		const std::vector<FeatRefHit> ref =
+			ChannelBruteForce(snap, qbuf.F32(), newTable[0], tombs.data(), metric);
+		CheckFeatTopK(ref, hits, n, 10, count, metric, Quantization::Int8,
+			"metric-matrix contract per-channel query");
+
+		std::vector<int32_t> allRows(static_cast<size_t>(count));
+		for (int32_t i = 0; i < count; ++i) { allRows[static_cast<size_t>(i)] = i; }
+		AlignedBuf centroidScratch(static_cast<size_t>(snap.paddedDims));
+		float analyticsResult = 0.0f;
+		const Status analyticsStatus = SpreadCrossDeviceChannel(snap, allRows.data(), count,
+			tombs.data(), Reduce::Mean, 0, centroidScratch.I8(), &analyticsResult);
+		CHECK_MSG(analyticsStatus == Status::Ok,
+			"metric-matrix contract (metric=%d): channel-scoped analytics over the new "
+			"partition failed, status=%d", static_cast<int>(metric),
+			static_cast<int>(analyticsStatus));
+	}
+}
+
+// T-V3.1-CompRetention (dim 8) -- retained floats copy across index-preserving; per-channel
+// recall re-measurable under the new table.
+static void TestRelabelCompositionRetention()
+{
+	Rng rng(0x100012ull);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	std::vector<float> retainedBefore(static_cast<size_t>(count) * dims);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::memcpy(retainedBefore.data() + static_cast<size_t>(r) * dims, bank.RetainedRow(r),
+			static_cast<size_t>(dims) * sizeof(float));
+	}
+
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 2 && bank.GetChannels()[0].length == 16,
+		"relabel composition x retention: table did not update, length[0]=%d",
+		bank.GetChannelCount() == 2 ? bank.GetChannels()[0].length : -1);
+	CHECK_MSG(bank.RetainsFloats(), "a relabel must not drop the retention property");
+	for (int32_t r = 0; r < count; ++r)
+	{
+		const float* row = bank.RetainedRow(r);
+		CHECK_MSG(row != nullptr &&
+				std::memcmp(row, retainedBefore.data() + static_cast<size_t>(r) * dims,
+					static_cast<size_t>(dims) * sizeof(float)) == 0,
+			"relabel composition x retention: retained row %d changed / vanished", r);
+	}
+
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	const Status s = bank.MeasureScratchRecallPerChannel(ws, reports, 2);
+	CHECK_MSG(s == Status::Ok,
+		"relabel composition x retention: per-channel recall must be re-measurable under the "
+		"new table, got status=%d", static_cast<int>(s));
+	if (s == Status::Ok)
+	{
+		for (int32_t c = 0; c < 2; ++c)
+		{
+			CHECK(reports[c].recall >= 0.0f && reports[c].recall <= 1.0f);
+			CHECK(reports[c].generation == bank.Generation());
+		}
+	}
+}
+
+// T-V3.1-CompGrow (dim 8) -- Relabel-then-Grow and Grow-then-Relabel produce byte-identical,
+// order-independent results (both index-preserving).
+static void TestRelabelCompositionGrowOrderIndependence()
+{
+	Rng rng(0x100013ull);
+	const int32_t dims = 64;
+	const int32_t count = 16;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+
+	ScratchBank a;
+	CHECK(a.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(a.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) == Status::Ok);
+	}
+	CHECK(a.Relabel(newTable, 2) == Status::Ok);
+	CHECK(a.Grow(count * 2) == Status::Ok);
+
+	ScratchBank b;
+	CHECK(b.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(b.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) == Status::Ok);
+	}
+	CHECK(b.Grow(count * 2) == Status::Ok);
+	CHECK(b.Relabel(newTable, 2) == Status::Ok);
+
+	BankView av, bv;
+	std::vector<uint32_t> at(ScratchBank::TombstoneWords(count), 0u);
+	std::vector<uint32_t> bt(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(a.Snapshot(&av, at.data()) == Status::Ok);
+	CHECK(b.Snapshot(&bv, bt.data()) == Status::Ok);
+	CHECK_MSG(av.channelCount == 2 && bv.channelCount == 2 && av.channels[0].length == 16 &&
+			bv.channels[0].length == 16,
+		"grow/relabel order-independence fixture: table did not update in one or both orders");
+	CHECK(a.Capacity() == count * 2 && b.Capacity() == count * 2);
+	CHECK(a.Count() == count && b.Count() == count);
+
+	const size_t rowBytes = static_cast<size_t>(av.paddedDims) * ElementSize(Quantization::Int8);
+	CHECK_MSG(std::memcmp(av.rows, bv.rows, static_cast<size_t>(count) * rowBytes) == 0,
+		"Relabel-then-Grow and Grow-then-Relabel must produce byte-identical row content");
+	if (av.channelInvNorms != nullptr && bv.channelInvNorms != nullptr)
+	{
+		const size_t liveBytes = static_cast<size_t>(count) * 2 * sizeof(float);
+		CHECK_MSG(std::memcmp(av.channelInvNorms, bv.channelInvNorms, liveBytes) == 0,
+			"Relabel-then-Grow and Grow-then-Relabel must produce bit-identical live-prefix "
+			"sub-norms");
+	}
+}
+
+// T-V3.1-CompTombstones (dim 8) -- tombstones preserved index-aligned across a relabel; a
+// post-relabel channel query still excludes them.
+static void TestRelabelCompositionTombstones()
+{
+	Rng rng(0x100014ull);
+	const int32_t dims = 64;
+	const int32_t count = 24;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	std::vector<int32_t> removed;
+	for (int32_t r = 1; r < count; r += 4)
+	{
+		CHECK(bank.Remove(r) == Status::Ok);
+		removed.push_back(r);
+	}
+
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+		"tombstone-composition fixture: table did not update");
+	for (int32_t r : removed)
+	{
+		CHECK_MSG(IsExcluded(tombs.data(), r),
+			"a relabel must preserve tombstones index-aligned; row %d lost its tombstone", r);
+	}
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw) { v = rng.NextFloat(); }
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{0, 16, 1.0f}};
+	QueryParams p;
+	p.k = count;
+	p.segments = seg;
+	p.segmentCount = 1;
+	p.excludeBits = tombs.data();
+	Workspace ws;
+	std::vector<Hit> hits(static_cast<size_t>(count));
+	int32_t n = 0;
+	CHECK(Query(snap, qbuf.F32(), p, ws, hits.data(), &n) == Status::Ok);
+	for (int32_t i = 0; i < n; ++i)
+	{
+		for (int32_t r : removed)
+		{
+			CHECK_MSG(hits[static_cast<size_t>(i)].index != r,
+				"a post-relabel channel query returned tombstoned row %d", r);
+		}
+	}
+}
+
+// T-V3.1-CompFreeze (dim 8/10) -- channel-aware Freeze after a relabel emits the new table +
+// re-derived sub-norms + the frozen FEAT end-state.
+static void TestRelabelCompositionFreeze()
+{
+	Rng rng(0x100015ull);
+	const int32_t dims = 64;
+	const int32_t count = 60;
+	const int32_t k = 10;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, Metric::Cosine, quant, oldTable, 2) == Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source) { v = rng.NextFloat(); }
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+		const int32_t live = bank.FreezeLiveCount();
+		AlignedBuf frozenRows(
+			static_cast<size_t>(live > 0 ? live : 1) * bank.GetPaddedDims() * ElementSize(quant));
+		std::vector<float> frozenScales(
+			quant == Quantization::Int8 ? static_cast<size_t>(live) : size_t{1});
+		std::vector<int32_t> indexMap(static_cast<size_t>(count), -2);
+		std::vector<float> frozenInvNorms(static_cast<size_t>(live) * 2, -1.0f);
+		const Status frozenStatus = bank.Freeze(frozenRows.ptr,
+			quant == Quantization::Int8 ? frozenScales.data() : nullptr, indexMap.data(),
+			frozenInvNorms.data());
+		CHECK_MSG(frozenStatus == Status::Ok,
+			"post-relabel channel-aware Freeze failed (quant=%d): status=%d",
+			static_cast<int>(quant), static_cast<int>(frozenStatus));
+		if (frozenStatus != Status::Ok)
+		{
+			continue;
+		}
+		CHECK_MSG(bank.GetChannelCount() == 2 && bank.GetChannels()[0].length == 16,
+			"post-relabel Freeze fixture (quant=%d): table did not update before freezing",
+			static_cast<int>(quant));
+
+		BankView frozen;
+		frozen.rows = frozenRows.ptr;
+		frozen.scales = quant == Quantization::Int8 ? frozenScales.data() : nullptr;
+		frozen.count = live;
+		frozen.dims = dims;
+		frozen.paddedDims = bank.GetPaddedDims();
+		frozen.quant = quant;
+		frozen.metric = Metric::Cosine;
+		frozen.channels = bank.GetChannels();
+		frozen.channelCount = bank.GetChannelCount();
+		frozen.channelInvNorms = frozenInvNorms.data();
+		CHECK(ValidateBank(frozen) == Status::Ok);
+
+		std::vector<float> refInvNorms(static_cast<size_t>(live) * frozen.channelCount);
+		CHECK(ComputeChannelInverseNorms(frozen, refInvNorms.data()) == Status::Ok);
+		CHECK_MSG(std::memcmp(refInvNorms.data(), frozenInvNorms.data(),
+					  refInvNorms.size() * sizeof(float)) == 0,
+			"frozen sub-norms after a relabel do not bit-equal ComputeChannelInverseNorms over "
+			"the compacted rows (quant=%d)", static_cast<int>(quant));
+
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(frozen.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, frozen.paddedDims, qbuf.F32());
+		const ChannelInfo& ch = frozen.channels[0];
+		const QuerySegment seg[1] = {{ch.offset, ch.length, 1.0f}};
+		QueryParams p;
+		p.k = k;
+		p.segments = seg;
+		p.segmentCount = 1;
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(frozen, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		const std::vector<FeatRefHit> ref =
+			ChannelBruteForce(frozen, qbuf.F32(), ch, nullptr, Metric::Cosine);
+		CheckFeatTopK(ref, hits, n, k, live, Metric::Cosine, quant, "post-relabel frozen channel FEAT");
+	}
+}
+
+// T-V3.1-CompCrossDevice (dim 8) -- a CrossDevice channel query over the new partition.
+static void TestRelabelCompositionCrossDevice()
+{
+	Rng rng(0x100016ull);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+		"CrossDevice composition fixture: table did not update");
+
+	std::vector<float> queryRaw(dims);
+	for (auto& v : queryRaw) { v = rng.NextFloat(); }
+	AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+	PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+	const QuerySegment seg[1] = {{newTable[0].offset, newTable[0].length, 1.0f}};
+	QueryParams p;
+	p.k = 10;
+	p.segments = seg;
+	p.segmentCount = 1;
+	p.excludeBits = tombs.data();
+	p.exactness = Exactness::CrossDevice;
+	Workspace ws;
+	Hit hits[10];
+	int32_t n = 0;
+	const Status s = Query(snap, qbuf.F32(), p, ws, hits, &n);
+	CHECK_MSG(s == Status::Ok, "CrossDevice channel query over the new partition failed: %d",
+		static_cast<int>(s));
+	if (s == Status::Ok)
+	{
+		for (int32_t i = 0; i < n; ++i)
+		{
+			CHECK(std::isfinite(hits[i].score));
+		}
+	}
+}
+
+// T-V3.1-CompBatchIntersectMetric (dim 8) -- a per-channel query over the new partition as
+// a QueryBatch member, a QueryIntersect member, and under ScoreAs::Dot on an L2 channel bank.
+static void TestRelabelCompositionBatchIntersectionMetricOverride()
+{
+	Rng rng(0x100017ull);
+	const int32_t dims = 64;
+	const int32_t count = 40;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) ==
+			Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source) { v = rng.NextFloat(); }
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+			"batch/intersection fixture: table did not update");
+
+		const int32_t qCount = 3;
+		std::vector<float> queries(static_cast<size_t>(qCount) * dims);
+		for (auto& v : queries) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(qCount) * snap.paddedDims * sizeof(float));
+		for (int32_t qi = 0; qi < qCount; ++qi)
+		{
+			std::vector<float> qv(queries.begin() + static_cast<ptrdiff_t>(qi) * dims,
+				queries.begin() + static_cast<ptrdiff_t>(qi) * dims + dims);
+			PadQuery(qv, snap.paddedDims, qbuf.F32() + static_cast<int64_t>(qi) * snap.paddedDims);
+		}
+		const QuerySegment seg[1] = {{newTable[0].offset, newTable[0].length, 1.0f}};
+		QueryParams p;
+		p.k = 5;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+
+		Workspace wsBatch;
+		std::vector<Hit> batchHits(static_cast<size_t>(qCount) * 5);
+		std::vector<int32_t> batchCounts(static_cast<size_t>(qCount));
+		CHECK(QueryBatch(snap, qbuf.F32(), qCount, p, wsBatch, batchHits.data(),
+				  batchCounts.data()) == Status::Ok);
+
+		Workspace wsInt;
+		Hit intHits[5];
+		int32_t nInt = 0;
+		CHECK(QueryIntersect(snap, qbuf.F32(), qCount, p, wsInt, intHits, &nInt) == Status::Ok);
+	}
+
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, Metric::L2, Quantization::Int8, oldTable, 2) == Status::Ok);
+		std::vector<float> source(static_cast<size_t>(count) * dims);
+		for (auto& v : source) { v = rng.NextFloat(); }
+		for (int32_t r = 0; r < count; ++r)
+		{
+			CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+				Status::Ok);
+		}
+		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+		BankView snap;
+		std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+		CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+		CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+			"metric-override fixture: table did not update");
+
+		std::vector<float> queryRaw(dims);
+		for (auto& v : queryRaw) { v = rng.NextFloat(); }
+		AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+		PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+		const QuerySegment seg[1] = {{newTable[0].offset, newTable[0].length, 1.0f}};
+		QueryParams p;
+		p.k = 10;
+		p.segments = seg;
+		p.segmentCount = 1;
+		p.excludeBits = tombs.data();
+		p.scoreAs = ScoreAs::Dot;
+		Workspace ws;
+		Hit hits[10];
+		int32_t n = 0;
+		CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+		const std::vector<FeatRefHit> ref =
+			ChannelBruteForce(snap, qbuf.F32(), newTable[0], tombs.data(), Metric::Dot);
+		CheckFeatTopK(ref, hits, n, 10, count, Metric::Dot, Quantization::Int8,
+			"post-relabel L2-bank ScoreAs::Dot channel FEAT");
+	}
+}
+
+// T-V3.1-CompAnalytics (dim 8/10, AC-7) -- a channel-scoped analytics reduction over the new
+// partition matches a float64 definition-grounded reference.
+static void TestRelabelCompositionAnalytics()
+{
+	Rng rng(0x100018ull);
+	const int32_t dims = 64;
+	const int32_t count = 32;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+	BankView snap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+	CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+	CHECK_MSG(snap.channelCount == 2 && snap.channels[0].length == 16,
+		"analytics-composition fixture: table did not update");
+
+	std::vector<int32_t> allRows(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i) { allRows[static_cast<size_t>(i)] = i; }
+	AlignedBuf centroidScratch(static_cast<size_t>(snap.paddedDims));
+	float mean = 0.0f;
+	const Status s = SpreadCrossDeviceChannel(snap, allRows.data(), count, tombs.data(),
+		Reduce::Mean, 0, centroidScratch.I8(), &mean);
+	CHECK_MSG(s == Status::Ok, "post-relabel channel-scoped SpreadCrossDeviceChannel failed: %d",
+		static_cast<int>(s));
+	if (s != Status::Ok)
+	{
+		return;
+	}
+
+	// Definition-grounded float64 reference: mean (1 - cosine) distance-to-centroid over the
+	// DEQUANTIZED channel sub-vectors -- never touching the CrossDevice int8 pooling
+	// machinery the operator itself uses.
+	std::vector<std::vector<double>> subVecs(static_cast<size_t>(count));
+	std::vector<double> centroid(static_cast<size_t>(newTable[0].length), 0.0);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<double> full;
+		DequantizeRow(snap, r, full);
+		subVecs[static_cast<size_t>(r)].assign(full.begin() + newTable[0].offset,
+			full.begin() + newTable[0].offset + newTable[0].length);
+		for (size_t j = 0; j < centroid.size(); ++j)
+		{
+			centroid[j] += subVecs[static_cast<size_t>(r)][j];
+		}
+	}
+	for (double& c : centroid) { c /= count; }
+	double centroidNorm = 0.0;
+	for (double c : centroid) { centroidNorm += c * c; }
+	centroidNorm = std::sqrt(centroidNorm);
+	double sumDist = 0.0;
+	for (int32_t r = 0; r < count; ++r)
+	{
+		double dot = 0.0, rn = 0.0;
+		for (size_t j = 0; j < centroid.size(); ++j)
+		{
+			dot += subVecs[static_cast<size_t>(r)][j] * centroid[j];
+			rn += subVecs[static_cast<size_t>(r)][j] * subVecs[static_cast<size_t>(r)][j];
+		}
+		rn = std::sqrt(rn);
+		const double cos = (rn > 0.0 && centroidNorm > 0.0) ? dot / (rn * centroidNorm) : 0.0;
+		sumDist += 1.0 - cos;
+	}
+	const double refMean = sumDist / count;
+	CHECK_MSG(std::fabs(refMean - static_cast<double>(mean)) < 0.05 * (1.0 + std::fabs(refMean)),
+		"post-relabel channel-scoped analytics: got %.6g, definition-grounded reference %.6g",
+		static_cast<double>(mean), refMean);
+}
+
+// T-V3.1-PromoteDemoteRetention (dim 8) -- promote on a retention bank derives sub-norms and
+// keeps per-channel recall available; a demote drops both cleanly (whole-bank retention
+// itself survives).
+static void TestRelabelPromoteDemoteRetention()
+{
+	Rng rng(0x100019ull);
+	const int32_t dims = 64;
+	const int32_t count = 24;
+	const ChannelInfo table[2] = {{0, 32}, {32, 32}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, /*retainFloats=*/true) ==
+		Status::Ok);
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+
+	CHECK(bank.Relabel(table, 2) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 2, "promote x retention: table did not update");
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	CHECK_MSG(bank.MeasureScratchRecallPerChannel(ws, reports, 2) == Status::Ok,
+		"promote x retention: per-channel recall should now be available");
+
+	CHECK(bank.Relabel(nullptr, 0) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 0, "demote x retention: table did not clear");
+	CHECK_MSG(bank.MeasureScratchRecallPerChannel(ws, reports, 2) == Status::InvalidArgument,
+		"demote x retention: per-channel recall must reject once the channel table is gone");
+	CHECK_MSG(bank.RetainsFloats(),
+		"demote x retention: whole-bank retention itself must survive a demote");
+	ScratchRecallReport wholeReport;
+	CHECK_MSG(bank.MeasureScratchRecall(ws, &wholeReport) == Status::Ok,
+		"demote x retention: whole-vector recall must still work after a demote");
+}
+
+// T-V3.1-PersistRoundTrip (dim 9a) -- a relabeled channels+retention Cosine bank (tombstones
+// + Grow + Relabel history) round-trips: table survives, sub-norms re-derived bit-equal
+// fresh, per-channel recall survives.
+static void TestRelabelPersistenceValueRoundTrip()
+{
+	Rng rng(0x10001aull);
+	const int32_t dims = 64;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(48, dims, Metric::Cosine, Quantization::Int8, oldTable, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	std::vector<float> source(static_cast<size_t>(40) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < 40; ++r)
+	{
+		CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	for (int32_t r = 3; r < 40; r += 8)
+	{
+		CHECK(bank.Remove(r) == Status::Ok);
+	}
+	CHECK(bank.Grow(64) == Status::Ok);
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+	std::vector<float> more(static_cast<size_t>(8) * dims);
+	for (auto& v : more) { v = rng.NextFloat(); }
+	for (int32_t r = 0; r < 8; ++r)
+	{
+		CHECK(bank.Append(more.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+
+	MemArchive archive;
+	CHECK(bank.Save(archive.Writer()) == Status::Ok);
+	ScratchBank loaded;
+	CHECK(loaded.Load(archive.Reader()) == Status::Ok);
+
+	CHECK(loaded.Count() == bank.Count());
+	CHECK(loaded.LiveCount() == bank.LiveCount());
+	CHECK_MSG(loaded.RetainsFloats(), "relabeled channels+retention round-trip lost retention");
+
+	BankView loadedSnap;
+	std::vector<uint32_t> loadedTombs(ScratchBank::TombstoneWords(loaded.Count()), 0u);
+	CHECK(loaded.Snapshot(&loadedSnap, loadedTombs.data()) == Status::Ok);
+	CHECK_MSG(loadedSnap.channelCount == 2 && loadedSnap.channels[0].offset == 0 &&
+			loadedSnap.channels[0].length == 16,
+		"relabeled channel table did not survive the round-trip: channelCount=%d",
+		loadedSnap.channelCount);
+	if (loadedSnap.channelCount == 2 && loadedSnap.channelInvNorms != nullptr)
+	{
+		std::vector<float> fresh(static_cast<size_t>(loadedSnap.count) * loadedSnap.channelCount);
+		CHECK(ComputeChannelInverseNorms(loadedSnap, fresh.data()) == Status::Ok);
+		CHECK_MSG(std::memcmp(fresh.data(), loadedSnap.channelInvNorms,
+					  fresh.size() * sizeof(float)) == 0,
+			"loaded relabeled sub-norm arena does not bit-equal a fresh derivation");
+	}
+
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	CHECK_MSG(loaded.MeasureScratchRecallPerChannel(ws, reports, 2) == Status::Ok,
+		"per-channel recall must survive the round-trip of a relabeled bank");
+}
+
+// T-V3.1-PersistByteIdentical (dim 9b, Forge W1) -- a relabeled bank's archive is
+// byte-identical to a fresh bank's under the same table and rows, PRECONDITIONS pinned:
+// same capacity, count, append order, retention.
+static void TestRelabelArchiveByteIdenticalToFresh()
+{
+	Rng rng(0x10001bull);
+	const int32_t dims = 64;
+	const int32_t capacity = 32;
+	const int32_t count = 32;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	std::vector<float> source(static_cast<size_t>(count) * dims);
+	for (auto& v : source) { v = rng.NextFloat(); }
+
+	ScratchBank relabeled;
+	CHECK(relabeled.Create(capacity, dims, Metric::Cosine, Quantization::Int8, oldTable, 2) ==
+		Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(relabeled.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+	CHECK(relabeled.Relabel(newTable, 2) == Status::Ok);
+
+	ScratchBank fresh;
+	CHECK(fresh.Create(capacity, dims, Metric::Cosine, Quantization::Int8, newTable, 2) ==
+		Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(fresh.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+			Status::Ok);
+	}
+
+	MemArchive relArchive, freshArchive;
+	CHECK(relabeled.Save(relArchive.Writer()) == Status::Ok);
+	CHECK(fresh.Save(freshArchive.Writer()) == Status::Ok);
+	CHECK_MSG(relArchive.bytes.size() == freshArchive.bytes.size(),
+		"relabeled archive size %zu != fresh twin archive size %zu (table did not update -- "
+		"still writing the OLD table's bytes)", relArchive.bytes.size(),
+		freshArchive.bytes.size());
+	CHECK_MSG(relArchive.bytes == freshArchive.bytes,
+		"a relabeled bank's archive must be byte-identical to a fresh bank's under the same "
+		"table and rows (same capacity/count/append-order/retention, Forge W1)");
+}
+
+// T-V3.1-PersistDemoteLegacy (dim 9c) -- a demote-to-single-space relabeled bank writes the
+// legacy v1/v2 shape and loads on the current reader.
+static void TestRelabelDemoteWritesLegacyFormat()
+{
+	Rng rng(0x10001cull);
+	const int32_t dims = 48;
+	const ChannelInfo table[2] = {{0, 32}, {32, 16}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(16, dims, Metric::Cosine, Quantization::Int8, table, 2) == Status::Ok);
+	std::vector<float> row(static_cast<size_t>(dims));
+	for (int32_t r = 0; r < 8; ++r)
+	{
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	CHECK(bank.Relabel(nullptr, 0) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 0, "demote-format fixture: table did not clear");
+
+	MemArchive archive;
+	CHECK(bank.Save(archive.Writer()) == Status::Ok);
+	uint32_t version = 0;
+	CHECK(archive.bytes.size() >= 8);
+	std::memcpy(&version, archive.bytes.data() + 4, sizeof(version));
+	CHECK_MSG(version == 1u || version == 2u,
+		"a demoted bank must Save the legacy v1/v2 shape, got version %u", version);
+	CHECK_MSG(archive.bytes.size() >= kScratchHeaderFlagsByteOffset + 1 &&
+			archive.bytes[kScratchHeaderFlagsByteOffset] == 0u,
+		"a demoted bank's flags byte must be 0 (no channels bit)");
+
+	ScratchBank loaded;
+	CHECK_MSG(loaded.Load(archive.Reader()) == Status::Ok,
+		"a demoted (legacy-format) archive must load on the current reader");
+	CHECK(loaded.GetChannelCount() == 0);
+}
+
+// T-V3.1-PersistPromoteV3 (dim 9d) -- a promote-to-channels relabeled bank writes v3, and a
+// version newer than this reader supports still hard-rejects (the old-reader-hard-reject law
+// is not silently defeated by relabel-produced content).
+static void TestRelabelPromoteWritesV3Format()
+{
+	Rng rng(0x10001dull);
+	const int32_t dims = 48;
+	const ChannelInfo table[2] = {{0, 32}, {32, 16}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(16, dims, Metric::Cosine, Quantization::Int8) == Status::Ok);
+	std::vector<float> row(static_cast<size_t>(dims));
+	for (int32_t r = 0; r < 8; ++r)
+	{
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	CHECK(bank.Relabel(table, 2) == Status::Ok);
+	CHECK_MSG(bank.GetChannelCount() == 2, "promote-format fixture: table did not update");
+
+	MemArchive archive;
+	CHECK(bank.Save(archive.Writer()) == Status::Ok);
+	uint32_t version = 0;
+	CHECK(archive.bytes.size() >= 8);
+	std::memcpy(&version, archive.bytes.data() + 4, sizeof(version));
+	CHECK_MSG(version == 3u, "a promoted bank must Save the v3 presence-flags shape, got version %u",
+		version);
+	CHECK_MSG(archive.bytes.size() >= kScratchHeaderFlagsByteOffset + 1 &&
+			(archive.bytes[kScratchHeaderFlagsByteOffset] & 0x02) != 0,
+		"a promoted bank's flags byte must carry the channels bit (0x02)");
+
+	MemArchive tooNew;
+	tooNew.bytes = archive.bytes;
+	const uint32_t bumped = version + 1;
+	std::memcpy(tooNew.bytes.data() + 4, &bumped, sizeof(bumped));
+	ScratchBank rejected;
+	CHECK_MSG(rejected.Load(tooNew.Reader()) == Status::BadFormat,
+		"a version newer than this reader supports must hard-reject as BadFormat");
+}
+
+// T-V3.1-VersionInherited (dim 9, N-3) -- V3.1 introduces no new archive version and no new
+// reserved-flag semantics: the V3.0 reserved flag-bit forward tolerance is inherited
+// unchanged on a relabeled bank's archive.
+static void TestRelabelVersionEvolutionInherited()
+{
+	Rng rng(0x10001eull);
+	const int32_t dims = 64;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+	const ChannelInfo newTable[2] = {{0, 16}, {16, 48}};
+
+	ScratchBank bank;
+	CHECK(bank.Create(24, dims, Metric::Cosine, Quantization::Int8, oldTable, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	std::vector<float> row(static_cast<size_t>(dims));
+	for (int32_t r = 0; r < 20; ++r)
+	{
+		for (auto& v : row) { v = rng.NextFloat(); }
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	CHECK(bank.Relabel(newTable, 2) == Status::Ok);
+
+	MemArchive archive;
+	CHECK(bank.Save(archive.Writer()) == Status::Ok);
+
+	MemArchive poked;
+	poked.bytes = archive.bytes;
+	CHECK(poked.bytes.size() > kScratchHeaderFlagsByteOffset);
+	poked.bytes[kScratchHeaderFlagsByteOffset] |= 0x04;
+
+	ScratchBank loaded;
+	const Status s = loaded.Load(poked.Reader());
+	CHECK_MSG(s == Status::Ok,
+		"V3.1 inherits V3.0's reserved flag-bit forward tolerance unchanged, got status=%d",
+		static_cast<int>(s));
+	if (s != Status::Ok)
+	{
+		return;
+	}
+	BankView loadedSnap;
+	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(loaded.Count()), 0u);
+	CHECK(loaded.Snapshot(&loadedSnap, tombs.data()) == Status::Ok);
+	CHECK_MSG(loadedSnap.channelCount == 2 && loadedSnap.channels[0].length == 16,
+		"reserved-bit tolerance on a relabeled bank: the channel table must survive, "
+		"channelCount=%d", loadedSnap.channelCount);
+}
+
+// T-V3.1-Feat (dim 10, the crux) -- the general FEAT: post-relabel per-channel query returns
+// the independent double brute-force top-k over the new sub-range, on the SCRATCH bank,
+// across metric x quant x {boundary move, count up, count down}.
+static void TestRelabelFeatOracle()
+{
+	Rng rng(0x10001full);
+	const int32_t dims = 64;
+	const int32_t count = 96;
+	const int32_t k = 10;
+	const ChannelInfo oldTable[2] = {{0, 32}, {32, 32}};
+
+	struct Scenario { const char* name; std::vector<ChannelInfo> target; };
+	std::vector<Scenario> scenarios = {
+		{"boundary move", {{0, 16}, {16, 48}}},
+		{"count up", {{0, 16}, {16, 16}, {32, 32}}},
+		{"count down", {{0, 64}}},
+	};
+
+	for (const Scenario& sc : scenarios)
+	{
+		for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+		{
+			for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+			{
+				ScratchBank bank;
+				CHECK(bank.Create(count, dims, metric, quant, oldTable, 2) == Status::Ok);
+				std::vector<float> source(static_cast<size_t>(count) * dims);
+				for (auto& v : source) { v = rng.NextFloat(); }
+				for (int32_t r = 0; r < count; ++r)
+				{
+					CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims,
+							  nullptr) == Status::Ok);
+				}
+				CHECK_MSG(
+					bank.Relabel(sc.target.data(), static_cast<int32_t>(sc.target.size())) ==
+						Status::Ok,
+					"%s (metric=%d quant=%d): Relabel failed", sc.name, static_cast<int>(metric),
+					static_cast<int>(quant));
+
+				BankView snap;
+				std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+				CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+				CHECK_MSG(snap.channelCount == static_cast<int32_t>(sc.target.size()),
+					"%s (metric=%d quant=%d): snapshot channel count did not update", sc.name,
+					static_cast<int>(metric), static_cast<int>(quant));
+				if (snap.channelCount == 0)
+				{
+					continue;
+				}
+
+				std::vector<float> queryRaw(dims);
+				for (auto& v : queryRaw) { v = rng.NextFloat(); }
+				AlignedBuf qbuf(static_cast<size_t>(snap.paddedDims) * sizeof(float));
+				PadQuery(queryRaw, snap.paddedDims, qbuf.F32());
+				const ChannelInfo& ch = sc.target[0];
+				const QuerySegment seg[1] = {{ch.offset, ch.length, 1.0f}};
+				QueryParams p;
+				p.k = k;
+				p.segments = seg;
+				p.segmentCount = 1;
+				p.excludeBits = tombs.data();
+				Workspace ws;
+				Hit hits[10];
+				int32_t n = 0;
+				CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+				const std::vector<FeatRefHit> ref =
+					ChannelBruteForce(snap, qbuf.F32(), ch, tombs.data(), metric);
+				CheckFeatTopK(ref, hits, n, k, count, metric, quant, sc.name);
+			}
+		}
+	}
+}
+
+// T-V3.1-Promote (dim 10, G-1, AC-4) -- the headline promote capability: a single-space
+// bank's per-channel query is impossible before Relabel (GetChannelCount()==0; for Cosine,
+// MeasureScratchRecallPerChannel is a defined InvalidArgument) and correct -- the
+// independent brute-force top-k -- after Relabel-to-channels, per metric.
+static void TestRelabelPromoteFeat()
+{
+	Rng rng(0x100020ull);
+	const int32_t dims = 64;
+	const int32_t count = 96;
+	const int32_t k = 10;
+	const ChannelInfo target[2] = {{0, 32}, {32, 32}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			ScratchBank bank;
+			CHECK(bank.Create(count, dims, metric, quant, /*retainFloats=*/true) == Status::Ok);
+			std::vector<float> source(static_cast<size_t>(count) * dims);
+			for (auto& v : source) { v = rng.NextFloat(); }
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+					Status::Ok);
+			}
+			CHECK_MSG(bank.GetChannelCount() == 0,
+				"promote fixture must start single-space, got channelCount=%d",
+				bank.GetChannelCount());
+			if (metric == Metric::Cosine)
+			{
+				Workspace wsPre;
+				ScratchRecallReport reports[2];
+				CHECK_MSG(bank.MeasureScratchRecallPerChannel(wsPre, reports, 2) ==
+						Status::InvalidArgument,
+					"pre-promote: per-channel recall must reject (no channel table yet)");
+			}
+
+			CHECK_MSG(bank.Relabel(target, 2) == Status::Ok,
+				"promote Relabel failed: metric=%d quant=%d", static_cast<int>(metric),
+				static_cast<int>(quant));
+			CHECK_MSG(bank.GetChannelCount() == 2,
+				"promote: GetChannelCount() should be 2 after Relabel-to-channels, got %d "
+				"(metric=%d quant=%d)", bank.GetChannelCount(), static_cast<int>(metric),
+				static_cast<int>(quant));
+
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			CHECK_MSG(snap.channelCount == 2,
+				"promote: the snapshot must carry the new table (metric=%d quant=%d)",
+				static_cast<int>(metric), static_cast<int>(quant));
+
+			std::vector<float> queryRaw(dims);
+			for (auto& v : queryRaw) { v = rng.NextFloat(); }
+			const int32_t pd = snap.paddedDims;
+			AlignedBuf qbuf(static_cast<size_t>(pd) * sizeof(float));
+			PadQuery(queryRaw, pd, qbuf.F32());
+			const QuerySegment seg[1] = {{target[0].offset, target[0].length, 1.0f}};
+			QueryParams p;
+			p.k = k;
+			p.segments = seg;
+			p.segmentCount = 1;
+			p.excludeBits = tombs.data();
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+			const std::vector<FeatRefHit> ref =
+				ChannelBruteForce(snap, qbuf.F32(), target[0], tombs.data(), metric);
+			CheckFeatTopK(ref, hits, n, k, count, metric, quant, "promote FEAT");
+		}
+	}
+}
+
+// T-V3.1-Demote (dim 10, G-1, AC-5) -- a channel bank, after Relabel(nullptr, 0), rejects
+// per-channel recall and correctly serves the whole-vector brute-force top-k -- including
+// the reloaded-archive form.
+static void TestRelabelDemoteFeat()
+{
+	Rng rng(0x100021ull);
+	const int32_t dims = 64;
+	const int32_t count = 96;
+	const int32_t k = 10;
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			ScratchBank bank;
+			CHECK(bank.Create(count, dims, metric, quant, channels, 2, /*retainFloats=*/true) ==
+				Status::Ok);
+			std::vector<float> source(static_cast<size_t>(count) * dims);
+			for (auto& v : source) { v = rng.NextFloat(); }
+			for (int32_t r = 0; r < count; ++r)
+			{
+				CHECK(bank.Append(source.data() + static_cast<size_t>(r) * dims, dims, nullptr) ==
+					Status::Ok);
+			}
+			CHECK(bank.GetChannelCount() == 2);
+
+			CHECK_MSG(bank.Relabel(nullptr, 0) == Status::Ok,
+				"demote Relabel failed: metric=%d quant=%d", static_cast<int>(metric),
+				static_cast<int>(quant));
+			CHECK_MSG(bank.GetChannelCount() == 0,
+				"demote: GetChannelCount() should be 0 after Relabel-to-single-space, got %d "
+				"(metric=%d quant=%d)", bank.GetChannelCount(), static_cast<int>(metric),
+				static_cast<int>(quant));
+			if (metric == Metric::Cosine)
+			{
+				Workspace wsPost;
+				ScratchRecallReport reports[2];
+				CHECK_MSG(bank.MeasureScratchRecallPerChannel(wsPost, reports, 2) ==
+						Status::InvalidArgument,
+					"post-demote: per-channel recall must reject (no channel table left)");
+			}
+
+			BankView snap;
+			std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(count), 0u);
+			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+			CHECK_MSG(snap.channelCount == 0,
+				"demote: the snapshot must carry no channel table (metric=%d quant=%d)",
+				static_cast<int>(metric), static_cast<int>(quant));
+
+			std::vector<float> queryRaw(dims);
+			for (auto& v : queryRaw) { v = rng.NextFloat(); }
+			const int32_t pd = snap.paddedDims;
+			AlignedBuf qbuf(static_cast<size_t>(pd) * sizeof(float));
+			PadQuery(queryRaw, pd, qbuf.F32());
+			QueryParams p;
+			p.k = k;
+			p.excludeBits = tombs.data();
+			Workspace ws;
+			Hit hits[10];
+			int32_t n = 0;
+			CHECK(Query(snap, qbuf.F32(), p, ws, hits, &n) == Status::Ok);
+			const std::vector<FeatRefHit> ref =
+				WholeVectorBruteForce(snap, qbuf.F32(), tombs.data(), metric);
+			CheckFeatTopK(ref, hits, n, k, count, metric, quant, "demote whole-vector FEAT");
+
+			MemArchive archive;
+			CHECK(bank.Save(archive.Writer()) == Status::Ok);
+			ScratchBank loaded;
+			CHECK(loaded.Load(archive.Reader()) == Status::Ok);
+			CHECK_MSG(loaded.GetChannelCount() == 0,
+				"demoted archive must reload single-space (metric=%d quant=%d)",
+				static_cast<int>(metric), static_cast<int>(quant));
+			BankView loadedSnap;
+			std::vector<uint32_t> loadedTombs(ScratchBank::TombstoneWords(loaded.Count()), 0u);
+			CHECK(loaded.Snapshot(&loadedSnap, loadedTombs.data()) == Status::Ok);
+			Hit loadedHits[10];
+			int32_t nl = 0;
+			CHECK(Query(loadedSnap, qbuf.F32(), p, ws, loadedHits, &nl) == Status::Ok);
+			const std::vector<FeatRefHit> loadedRef =
+				WholeVectorBruteForce(loadedSnap, qbuf.F32(), loadedTombs.data(), metric);
+			CheckFeatTopK(loadedRef, loadedHits, nl, k, count, metric, quant,
+				"demote reloaded-archive whole-vector FEAT");
+		}
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -11618,6 +13984,43 @@ int main()
 	TestChannelAnalyticsCrossDeviceGolden();
 	TestPerChannelRecallOracle();
 	TestVersionHeaderCoherence();
+
+	// V3.1 red suite (Curie): the Relabel operation (plan section 24), realizing the
+	// section 24.8 Coverage Model. Test design: Claude/Curie/superfaiss-v3.1-test-design-
+	// 2026-07-13.md.
+	TestRelabelValidationSymmetry();
+	TestRelabelRejectionsStillQueryableUnderOldTable();
+	TestRelabelOomLeavesBankIntact();
+	TestRelabelWarmLifetimeSequence();
+	TestRelabelWarmPromoteDemoteToggle();
+	TestRelabelHeldViewAliasing();
+	TestRelabelExclusiveDrainStorm();
+	TestRelabelExtremesMatrix();
+	TestRelabelAllZeroNormChannel();
+	TestRelabelParityVsFreshCreate();
+	TestRelabelParityEqualsComputeChannelInverseNorms();
+	TestRelabelPostAppendDerivation();
+	TestRelabelSubNormFloorAndClamp();
+	TestRelabelCrossRunnerGolden();
+	TestRelabelNeverTouchesRows();
+	TestRelabelWholeVectorPathUnchanged();
+	TestRelabelMetricMatrixContractClaim();
+	TestRelabelCompositionRetention();
+	TestRelabelCompositionGrowOrderIndependence();
+	TestRelabelCompositionTombstones();
+	TestRelabelCompositionFreeze();
+	TestRelabelCompositionCrossDevice();
+	TestRelabelCompositionBatchIntersectionMetricOverride();
+	TestRelabelCompositionAnalytics();
+	TestRelabelPromoteDemoteRetention();
+	TestRelabelPersistenceValueRoundTrip();
+	TestRelabelArchiveByteIdenticalToFresh();
+	TestRelabelDemoteWritesLegacyFormat();
+	TestRelabelPromoteWritesV3Format();
+	TestRelabelVersionEvolutionInherited();
+	TestRelabelFeatOracle();
+	TestRelabelPromoteFeat();
+	TestRelabelDemoteFeat();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
