@@ -148,6 +148,31 @@ public:
 	// exceed the current capacity.
 	Status Grow(int32_t newCapacity);
 
+	// Mutable channel vocabulary (V3.1, plan section 24.4): atomically replaces the
+	// channel table on a live bank, relaxing V3.0's fixed-at-Create vocabulary (D-V3-2).
+	// The stored rows are never touched — channels are sub-ranges over the same
+	// dims (section 24.3), so a relabel is a vocabulary change, not a row change.
+	//
+	// The new table is validated with the SAME rules Create/Load apply (in-bounds
+	// against PaddedDims_, ascending, non-overlapping, on the 16-byte element grid,
+	// length > 0, channelCount in [1, kMaxChannels]); newChannelCount == 0 with a null
+	// table is the demote-to-single-space case; a nonzero valid table on any bank is the
+	// general case (promote / boundary move / count change). EXCLUSIVE, the same class as
+	// Grow/Load: the host drains readers before calling, so no in-flight BankView observes
+	// a torn table — a view taken before a relabel joins the Grow/Load/Destroy invalidation
+	// set. Reject-over-degrade: a malformed table returns InvalidArgument and an arena
+	// realloc failure returns OutOfMemory, and in both cases the table, arena, sub-norms,
+	// and generation are exactly as before the call (the Load idiom).
+	//
+	// Dot/L2 channel banks carry no sub-norm arena, so their relabel is a validate-and-swap
+	// of the by-value members with no arena touch (cannot OOM). A Cosine relabel that
+	// changes the channel count (or promotes/demotes) reallocates the arena via the Grow
+	// template and RE-DERIVES the per-channel inverse sub-norms under the new table (the
+	// same ComputeChannelInverseNorms Load already runs), so a relabeled bank is
+	// bit-identical to a fresh Create(newTable)+Append of the same rows. Advances
+	// Generation() (a mutation) so a pre-relabel recall report reads stale.
+	Status Relabel(const ChannelInfo* newChannels, int32_t newChannelCount);
+
 	// --- Reader-pin / exclusive-drain protocol (Poirot F4) ---
 	//
 	// The dispatch gate hosts put in front of Grow/Load (T-044 N4): readers pin

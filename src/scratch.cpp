@@ -650,6 +650,155 @@ Status ScratchBank::Grow(int32_t newCapacity)
 	return Status::Ok;
 }
 
+// Mutable channel vocabulary (V3.1, plan section 24.4): atomically replace the channel
+// table on a live bank. The stored rows are never touched — channels are sub-ranges over
+// the same dims (section 24.3) — so a relabel swaps the table and, for a Cosine bank,
+// re-derives the per-channel inverse sub-norms under the new table. EXCLUSIVE, the same
+// class as Grow/Load (the host drains readers before calling). Reject-over-degrade: the
+// new table is validated and the (Cosine) arena is allocated BEFORE any state changes, so
+// a malformed table (InvalidArgument) or a realloc failure (OutOfMemory) leaves the bank
+// exactly as before, still queryable under the old table.
+Status ScratchBank::Relabel(const ChannelInfo* newChannels, int32_t newChannelCount)
+{
+	if (!IsCreated())
+	{
+		return Status::InvalidArgument;
+	}
+	WriterGuard guard(WriterBusy_);
+
+	// Validate the new table with the SAME rules Create/Load apply (validation symmetry,
+	// dim 2) — before a byte of state changes. A null table with nonzero count, a nonzero
+	// table with zero/negative count, out-of-bounds, overlap, non-ascending, off-grid, or
+	// length <= 0 each return InvalidArgument and leave the bank untouched. newChannelCount
+	// == 0 with a null table is the demote-to-single-space case.
+	if (newChannels != nullptr || newChannelCount != 0)
+	{
+		if (newChannels == nullptr || newChannelCount <= 0 || newChannelCount > kMaxChannels)
+		{
+			return Status::InvalidArgument;
+		}
+		const int32_t grid = kAlignment / ElementSize(Quant_);
+		int32_t prevEnd = 0;
+		for (int32_t c = 0; c < newChannelCount; ++c)
+		{
+			const ChannelInfo& channel = newChannels[c];
+			if (channel.offset < 0 || channel.length <= 0 ||
+				channel.offset % grid != 0 || channel.length % grid != 0 ||
+				channel.offset < prevEnd ||
+				static_cast<int64_t>(channel.offset) + channel.length > PaddedDims_)
+			{
+				return Status::InvalidArgument;
+			}
+			prevEnd = channel.offset + channel.length;
+		}
+	}
+
+	const int32_t newSubNormPerRow = (Metric_ == Metric::Cosine && newChannelCount > 0)
+		? newChannelCount
+		: 0;
+	const int32_t oldSubNormPerRow = (Metric_ == Metric::Cosine && ChannelCount_ > 0)
+		? ChannelCount_
+		: 0;
+
+	// Dot/L2 banks carry no sub-norm arena (V3-G2/V31-G2), so a relabel is a validate-and-
+	// swap of the by-value members with no arena touch — it cannot OOM. This runs under the
+	// same exclusive drain as the Cosine path (Forge W2: Snapshot aliases Channels_/
+	// ChannelCount_ into every live BankView, so even the member write is observable through
+	// a held view — the host drain, not a lock-free poke, is what makes it safe). A Cosine
+	// bank with no channels on either side (single-space -> single-space) has no sub-norm
+	// region either way and takes the same cheap path.
+	if (oldSubNormPerRow == 0 && newSubNormPerRow == 0)
+	{
+		ChannelCount_ = newChannelCount;
+		for (int32_t c = 0; c < newChannelCount; ++c)
+		{
+			Channels_[c] = newChannels[c];
+		}
+		Generation_.fetch_add(1, std::memory_order_release);
+		return Status::Ok;
+	}
+
+	// Cosine relabel with channels on either side: the sub-norm region changes size (count
+	// change / promote / demote) or its values change (boundary move), so the only atomic
+	// path that preserves reject-over-degrade is to build a fresh arena and adopt it on
+	// success — the Grow index-preserving realloc template (V31-G7), differing only in that
+	// the sub-norm region is RE-DERIVED under the new table (V31-G5), never copied.
+	const int64_t bytes = ArenaBytes(Capacity_, Dims_, PaddedDims_, Quant_, Retain_,
+		newSubNormPerRow);
+	uint8_t* arena = static_cast<uint8_t*>(
+		detail::SeamAlloc(Allocator_, static_cast<size_t>(bytes), kAlignment));
+	if (arena == nullptr)
+	{
+		// Reject-over-degrade: the bank is unchanged and still queryable under the old table.
+		return Status::OutOfMemory;
+	}
+
+	const int32_t count = PublishedCount_.load(std::memory_order_relaxed);
+	const void* oldRows = Rows_;
+	const float* oldScales = Scales_;
+	const std::atomic<uint32_t>* oldTombstones = Tombstones_;
+	const float* oldRetained = Retained_;
+	uint8_t* oldArena = Arena_;
+
+	// The allocation succeeded — the last fallible step is behind us. Commit the new table
+	// so BindArena sizes the sub-norm region for the new count, then copy the immutable
+	// state across index-preserving (nothing renumbers) and re-derive the sub-norms.
+	ChannelCount_ = newChannelCount;
+	for (int32_t c = 0; c < newChannelCount; ++c)
+	{
+		Channels_[c] = newChannels[c];
+	}
+	BindArena(arena, Capacity_);
+
+	std::memcpy(Rows_, oldRows,
+		static_cast<size_t>(count) * PaddedDims_ * ElementSize(Quant_));
+	if (Quant_ == Quantization::Int8)
+	{
+		std::memcpy(Scales_, oldScales, static_cast<size_t>(count) * sizeof(float));
+	}
+	for (int32_t w = 0; w < TombstoneWords(count); ++w)
+	{
+		Tombstones_[w].store(
+			oldTombstones[w].load(std::memory_order_relaxed), std::memory_order_relaxed);
+	}
+	if (Retain_)
+	{
+		std::memcpy(Retained_, oldRetained,
+			static_cast<size_t>(count) * Dims_ * sizeof(float));
+	}
+
+	// Re-derive the per-channel inverse sub-norms under the NEW table (only when the new
+	// table has channels — a demote leaves ChannelInvNorms_ null). The rows are byte-
+	// identical to the old arena (just copied, never re-quantized), so this is the same
+	// ComputeChannelInverseNorms a fresh Create+Append and a Load run — the parity oracle
+	// (dim 6). It is total over these validated inputs (non-null rows, a valid table).
+	if (newSubNormPerRow > 0)
+	{
+		BankView cview;
+		cview.rows = Rows_;
+		cview.scales = Scales_;
+		cview.count = count;
+		cview.dims = Dims_;
+		cview.paddedDims = PaddedDims_;
+		cview.quant = Quant_;
+		cview.metric = Metric_;
+		cview.channels = Channels_;
+		cview.channelCount = ChannelCount_;
+		const Status subNorm = ComputeChannelInverseNorms(cview, ChannelInvNorms_);
+		if (subNorm != Status::Ok)
+		{
+			return subNorm;
+		}
+	}
+
+	detail::SeamFree(Allocator_, oldArena);
+
+	// A relabel is a mutation: advance the generation (only forward) so any pre-relabel
+	// recall report reads stale (V31-G11).
+	Generation_.fetch_add(1, std::memory_order_release);
+	return Status::Ok;
+}
+
 Status ScratchBank::Freeze(void* outRows, float* outScales, int32_t* outIndexMap,
 	ScratchRecallReport* outReport, Workspace* recallWs, uint64_t recallSeed) const
 {
