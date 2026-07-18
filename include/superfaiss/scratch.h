@@ -104,7 +104,8 @@ public:
 		const Allocator& allocator = DefaultAllocator());
 
 	// Channel-capable overload (V3.0, plan section 23.4): the channel table
-	// becomes a scratch-bank property, fixed for the bank's lifetime (D-V3-2).
+	// becomes a scratch-bank property, set at Create (D-V3-2) and replaceable
+	// thereafter only by the exclusive Relabel operation (V3.1).
 	// Validated at construction with the same rules ValidateBank applies to a
 	// baked channel table (in-bounds, ascending, non-overlapping, on the
 	// 16-byte element grid, channelCount in [1, kMaxChannels]) -- validation
@@ -395,7 +396,8 @@ private:
 	Metric Metric_ = Metric::Dot;
 	Quantization Quant_ = Quantization::Float32;
 	bool Retain_ = false;
-	// Channel table (V3.0, D-V3-2): fixed at Create for the bank's lifetime. Empty
+	// Channel table (V3.0, D-V3-2; mutable since V3.1): set at Create, replaced
+	// atomically only by Relabel. Empty
 	// (ChannelCount_ == 0) for a single-space bank. Held by value — small (<= kMaxChannels)
 	// and survives Grow/Load without an arena region of its own; the per-channel inverse
 	// sub-norms (ChannelInvNorms_) live in the arena.

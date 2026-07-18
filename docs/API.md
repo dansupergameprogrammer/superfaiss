@@ -415,8 +415,12 @@ class ScratchBank {              // single writer, lock-free readers
     Status Create(int32_t capacity, int32_t dims, Metric, Quantization,
                   bool retainFloats, const Allocator& = ...); // v2.3 retention overload
     Status Create(int32_t capacity, int32_t dims, Metric, Quantization,   // v3.0 channel overload
-                  const ChannelInfo* channels, int32_t channelCount,       //   table fixed at Create
+                  const ChannelInfo* channels, int32_t channelCount,       //   table set at Create
                   bool retainFloats = false, const Allocator& = ...);
+    Status Relabel(const ChannelInfo* newChannels, int32_t newChannelCount); // v3.1: atomically
+                  // replace the channel table on a LIVE bank (exclusive drain; stored rows
+                  // untouched; Cosine sub-norms re-derived; reject-over-degrade; count change,
+                  // boundary move, promote, and demote all supported)
     Status Append(const float* row, int32_t dims, int32_t* outIndex);
     Status Remove(int32_t index);                 // atomic tombstone; idempotent
     Status Snapshot(BankView* outView, uint32_t* outTombstones) const;

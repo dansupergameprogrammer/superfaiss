@@ -270,7 +270,8 @@ Status ScratchBank::Create(
 }
 
 // Channel-capable Create (V3.0, plan section 23.4): the channel table becomes a
-// scratch-bank property, fixed for the bank's lifetime (D-V3-2). The table is validated
+// scratch-bank property, set at Create (D-V3-2) and replaced thereafter only by the
+// exclusive Relabel operation (V3.1). The table is validated
 // at construction with the same rules ValidateBank applies to a baked channel table
 // (validation moves from import-time to construction-time); on a Cosine bank the arena
 // additionally carries a capacity x channelCount per-channel inverse-sub-norm array,

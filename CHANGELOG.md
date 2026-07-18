@@ -9,6 +9,18 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.1.2] — 2026-07-18
+
+### Fixed
+- **Stale public contracts scrubbed (docs/comments only; no code change).** `scratch.h`,
+  `scratch.cpp`, `docs/API.md`, and `docs/INTEGRATION.md` still described the channel table as
+  "fixed for the bank's lifetime" — the v3.0 contract that v3.1's `Relabel` repealed. All four now
+  state the current contract, and `Relabel` is documented in `API.md`/`INTEGRATION.md` (it had
+  landed in the README and this changelog only).
+- **`version.h` corrected to the released version.** The header (and its coherence check in the
+  test suite) still carried 3.0.1 through both 3.1 releases; both now read 3.1.2. Found while
+  closing an external review's release-identity finding.
+
 ## [3.1.0] — 2026-07-17
 
 ### Added
