@@ -9,6 +9,29 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.1.0] — 2026-07-17
+
+### Added
+- **Runtime-mutable channel vocabulary (`Relabel`)** — the channel table set at `Create`, fixed
+  for the bank's lifetime in v3.0, becomes mutable at runtime through one exclusive
+  `Relabel(newChannels, newChannelCount)` on a live scratch bank. A single atomic table swap
+  covers every vocabulary change: move boundaries at a fixed count, change the count, add or
+  remove channels, promote a single-space bank into channels (`channelCount 0 → N`), or demote a
+  channel bank back to single-space (`→ 0`). It never touches the stored rows — channels are
+  sub-ranges over the same dims, so no row is re-quantized or re-normalized; on a Cosine bank it
+  re-derives the `capacity × channelCount` per-channel sub-norm arena over the unchanged rows
+  (the same derivation `Load` performs), while Dot/L2 banks relabel by a by-value member swap
+  with no arena work. `Relabel` is atomic reject-over-degrade: the new table is validated with
+  the `Create`/`Load` rules and the arena is allocated before any state changes, so a malformed
+  table (`InvalidArgument`) or an allocation failure (`OutOfMemory`) leaves the bank byte-for-byte
+  intact and still queryable under the old table. It runs under the same exclusive reader-drain as
+  `Grow`/`Load`, joins their `BankView` invalidation set, and advances the generation. A relabeled
+  bank is bit-identical to a fresh `Create(newTable)+Append` of the same rows, and its archive is
+  unchanged in shape — no new on-disk format version. Measured: a count-change relabel of a
+  100k × 256 Cosine bank costs ~30 ms against ~166 ms to rebuild from the rows on int8
+  (~5.5× cheaper), ~2.1× on float32; promote/demote adds/frees a `capacity × channelCount × 4`
+  sub-norm arena (~3.0 MB at 100k rows / 8 channels).
+
 ## [3.0.0] — 2026-07-12
 
 ### Added
