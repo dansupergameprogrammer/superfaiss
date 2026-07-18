@@ -33,7 +33,13 @@ jobs:
           set +e
           ./build/superfaiss_tests | tee test_output.txt
           status=${PIPESTATUS[0]}
-          grep -E "simd path: (sse|avx2)" test_output.txt > /dev/null || exit 1
+          # Require the AVX2 path specifically (GitHub ubuntu-latest runners are
+          # AVX2-capable). The float32 sub-8 bit-equality determinism check
+          # (TestAvx2Sub8RemainderF32 Part C) is guarded on ActiveSimdPath()==AVX2 and
+          # can only run on AVX2 hardware, so a runner that fell back to SSE would
+          # silently skip it. Failing here surfaces lost AVX2 coverage loudly; the
+          # windows-x64 job keeps the looser sse|avx2 check as the general x86 path.
+          grep "simd path: avx2" test_output.txt > /dev/null || exit 1
           grep "cross-device hash:" test_output.txt > /dev/null || exit 1
           exit $status
 
