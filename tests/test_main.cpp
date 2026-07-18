@@ -906,6 +906,11 @@ static void TestAvx2Sub8RemainderF32()
 	// tail-dropped value (exactly 0 at len 4); the controls pass in both states. Only
 	// meaningful when AVX2 is the active path — the mirror is the AVX2-shaped scalar;
 	// on other devices skip with a note rather than assert a path this build never runs.
+	// Compile-time x86 guard (not only the runtime check): DotF32ScalarAvx2/L2F32ScalarAvx2
+	// are defined solely in the x86-guarded kernels_avx2.cpp, so a bare reference to them on
+	// arm64 is an undefined-symbol link error -- the runtime ActiveSimdPath() check does not
+	// remove the call the compiler emits.
+#if defined(SUPERFAISS_TEST_X86_INTRINSICS)
 	if (ActiveSimdPath() == SimdPath::AVX2)
 	{
 		Rng rng(0x5178A11);
@@ -943,6 +948,7 @@ static void TestAvx2Sub8RemainderF32()
 			}
 		}
 	}
+#endif // SUPERFAISS_TEST_X86_INTRINSICS (Part A)
 
 	// --- Part C (Poirot C-1): the AVX2 intrinsic equals its scalar mirror BIT-EXACTLY at
 	// the sub-8 tail. This is the path's determinism contract (DotF32Avx2 == its scalar
