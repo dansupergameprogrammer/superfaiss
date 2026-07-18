@@ -614,6 +614,105 @@ namespace
 	};
 }
 
+namespace
+{
+	// V3.1 calibration (mutable channel vocabulary; plan section 24.2 V31-V1/V31-V2).
+	// V31-V1: the cost of an exclusive Relabel (Cosine count-change: arena realloc +
+	// full per-channel sub-norm re-derive over the unchanged rows) priced honestly
+	// against the full Create+Append rebuild it replaces. V31-V2: the promote/demote
+	// memory delta is the sub-norm arena region, capacity x channelCount x 4 bytes
+	// (V31-G2) -- a deterministic accounting number, not a sampled timing.
+	struct RelabelBench
+	{
+		Allocator alloc = DefaultAllocator();
+
+		static double Best(double a, double b) { return a < b ? a : b; }
+
+		// V31-V1 -- relabel (8<->4 channels, count change) vs the rebuild it replaces.
+		void RunCost(int32_t count, int32_t dims, Quantization quant)
+		{
+			Rng rng;
+			std::vector<float> src(static_cast<size_t>(count) * dims);
+			for (auto& v : src) { v = rng.NextFloat(); }
+
+			const int32_t w8 = dims / 8, w4 = dims / 4;
+			std::vector<ChannelInfo> t8(8), t4(4);
+			for (int32_t i = 0; i < 8; ++i) { t8[static_cast<size_t>(i)] = {i * w8, w8}; }
+			for (int32_t i = 0; i < 4; ++i) { t4[static_cast<size_t>(i)] = {i * w4, w4}; }
+
+			// Warm bank: 8-channel Cosine, count rows appended once.
+			ScratchBank bank;
+			if (bank.Create(count, dims, Metric::Cosine, quant, t8.data(), 8) != Status::Ok)
+			{
+				std::printf("relabel %d x %d: Create failed\n", count, dims);
+				return;
+			}
+			for (int32_t r = 0; r < count; ++r)
+			{
+				bank.Append(src.data() + static_cast<size_t>(r) * dims, dims, nullptr);
+			}
+
+			// Warm-up + time: each rep relabels to the other count (always a count change,
+			// full re-derive). Best-of-5 of `reps` alternating relabels.
+			bank.Relabel(t4.data(), 4);
+			bank.Relabel(t8.data(), 8);
+			const int32_t reps = count >= 100000 ? 20 : 100;
+			double bestRelabel = 1e300;
+			for (int32_t run = 0; run < 5; ++run)
+			{
+				const double t0 = Now();
+				for (int32_t r = 0; r < reps; ++r)
+				{
+					bank.Relabel((r & 1) ? t8.data() : t4.data(), (r & 1) ? 8 : 4);
+				}
+				bestRelabel = Best(bestRelabel, (Now() - t0) / reps);
+			}
+
+			// The rebuild it replaces: Create(T4) + Append every row. Best-of-3.
+			double bestRebuild = 1e300;
+			for (int32_t run = 0; run < 3; ++run)
+			{
+				const double t0 = Now();
+				ScratchBank fresh;
+				fresh.Create(count, dims, Metric::Cosine, quant, t4.data(), 4);
+				for (int32_t r = 0; r < count; ++r)
+				{
+					fresh.Append(src.data() + static_cast<size_t>(r) * dims, dims, nullptr);
+				}
+				bestRebuild = Best(bestRebuild, Now() - t0);
+			}
+
+			std::printf(
+				"relabel %7d x %3d %-7s cosine 8<->4ch | relabel %8.3f ms | rebuild %9.3f ms | "
+				"relabel is %6.1fx cheaper (%.3f%% of rebuild)\n",
+				count, dims, quant == Quantization::Float32 ? "float32" : "int8",
+				bestRelabel * 1e3, bestRebuild * 1e3, bestRebuild / bestRelabel,
+				bestRelabel / bestRebuild * 100.0);
+		}
+
+		// V31-V2 -- the promote/demote sub-norm arena delta (deterministic: cap x ch x 4).
+		void RunMemory(int32_t capacity, int32_t dims, Quantization quant)
+		{
+			const int32_t rowBytes =
+				PaddedDims(dims, quant) * static_cast<int32_t>(ElementSize(quant));
+			for (int32_t ch : {1, 4, 8})
+			{
+				const int64_t bytes =
+					static_cast<int64_t>(capacity) * ch * static_cast<int64_t>(sizeof(float));
+				std::printf(
+					"promote/demote delta %7d x %3d %-7s | %dch sub-norm arena %8.2f MB "
+					"(%2d B/row, %5.1f%% of the %d B row payload)\n",
+					capacity, dims, quant == Quantization::Float32 ? "float32" : "int8", ch,
+					static_cast<double>(bytes) / (1024.0 * 1024.0),
+					ch * static_cast<int32_t>(sizeof(float)),
+					static_cast<double>(ch * static_cast<int32_t>(sizeof(float))) / rowBytes *
+						100.0,
+					rowBytes);
+			}
+		}
+	};
+}
+
 int main()
 {
 	std::printf("superfaiss bench (single thread, simd path: %s)\n",
@@ -645,5 +744,12 @@ int main()
 	XdBench xdBench;
 	xdBench.Run(10000, 128, 64);
 	xdBench.Run(100000, 256, 64);
+
+	// V3.1 calibration (mutable channel vocabulary; plan section 24.2 V31-V1/V31-V2).
+	RelabelBench relabelBench;
+	relabelBench.RunCost(10000, 128, Quantization::Int8);
+	relabelBench.RunCost(100000, 256, Quantization::Int8);
+	relabelBench.RunCost(100000, 256, Quantization::Float32);
+	relabelBench.RunMemory(100000, 256, Quantization::Int8);
 	return 0;
 }

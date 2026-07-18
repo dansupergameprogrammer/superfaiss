@@ -175,6 +175,20 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   arena is `channelCount × 4` bytes/row (16 B/row at 4 channels — mandatory on a Cosine
   channel bank, ~6% of the int8 row beside it; Dot/L2 channel banks carry none).
   [API.md](docs/API.md), [DETERMINISM.md §2e](docs/DETERMINISM.md).
+- **Runtime-mutable channel vocabulary (v3.1).** The channel partition is no longer fixed for the
+  bank's lifetime: one exclusive `Relabel(newTable)` re-channels a **live** scratch bank — move
+  boundaries, change the channel count, add or remove channels, promote a single-space bank into
+  channels or demote it back to single-space — without discarding the rows or rebuilding. It never
+  touches the stored rows (channels are sub-ranges over the same dims); for Cosine it re-derives the
+  per-channel sub-norms over the unchanged rows, and it is atomic reject-over-degrade — a malformed
+  table or an allocation failure leaves the bank byte-for-byte intact and still queryable under the
+  old table. The saving over the rebuild it replaces is real and largest on int8: a count-change
+  relabel of a 100k × 256 Cosine bank costs ~30 ms against ~166 ms to rebuild from the rows
+  (~5.5× cheaper), and ~60 ms against ~130 ms (~2.1×) on float32, where the rebuild's append is
+  cheaper and the re-derive reads wider rows. Promote/demote toggles the sub-norm arena —
+  `capacity × channelCount × 4` bytes, ~3.0 MB at 100k rows / 8 channels (12.5% of the int8 row
+  payload beside it), added on promote and freed on demote; Dot/L2 banks relabel by a table swap
+  alone, no arena work. [API.md](docs/API.md).
 
 ## What it deliberately is not
 
