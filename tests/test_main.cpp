@@ -845,6 +845,254 @@ static void TestSimdEqualsScalar()
 }
 
 // ---------------------------------------------------------------------------
+// T11b — AVX2 sub-8 float32 remainder (regression, T-099 slot-5 spinoff). A float32
+// segment/channel stride lies on the 4-float (16-byte) grid, so a range whose length
+// ≡ 4 (mod 8) leaves a trailing 4-element tail after the 8-lane groups. The AVX2
+// float32 kernels DotF32Avx2/L2F32Avx2 AND their scalar mirrors DotF32ScalarAvx2/
+// L2F32ScalarAvx2 processed only whole 8-lane groups with NO 4-element remainder, so
+// that tail was dropped. The fix (src/kernels_avx2.cpp) adds the 4-remainder to both,
+// bit-identically.
+//
+// Where the defect actually bites (established while authoring this test — the coord's
+// original "length-4 scores 0 on the whole-row path" framing was imprecise):
+//   * The WHOLE-ROW dispatch DotF32()/L2F32() (src/kernels.cpp) selects the AVX2
+//     intrinsic ONLY when paddedDims % 8 == 0 (else DotF32Sse, which handles the tail).
+//     PaddedDims is always a multiple of 8 for f32 banks big enough to matter, so a
+//     length ≡ 4 mod 8 never reaches the intrinsic through that dispatch — the whole-
+//     row path was NOT wrong in production. That is why the correctness check in Part A
+//     runs against the scalar MIRROR directly, not through DotF32().
+//   * The defect bites the SEGMENTED / per-channel-cosine scan: ResolveRowKernels()
+//     (src/kernels.cpp) wires k.dotF32 = DotF32Avx2 RAW (no % 8 guard), and the non-
+//     foldable per-channel-cosine path (ScoreChunkSegmented) calls it over each
+//     channel's own sub-range. A length-4 channel therefore hits DotF32Avx2(.., 4),
+//     drops the whole channel, and scores a per-channel cosine of exactly 0. Part B
+//     drives that real production surface through the public Query() API.
+//
+// Parts A and B are RED pre-fix, GREEN post-fix. Part A is a unit check on the mirror
+// against a double reference (tolerance); Part B is the production feature oracle over
+// the public Query() API (tolerance) and the core twin of the plugin slot-5 Cell-1
+// named-channel query. Part C (Poirot C-1) adds the missing BIT-EXACT determinism
+// guard: intrinsic DotF32Avx2/L2F32Avx2 == their scalar mirrors, exact float bits, at
+// the sub-8 tail lengths. The intrinsics are not in the public header (only the scalar
+// mirrors are), so — like src/kernels.cpp does — this TU forward-declares them; they
+// have external linkage in namespace superfaiss::detail and are defined in
+// kernels_avx2.cpp under the same x86 guard used below. Part C is GREEN in BOTH stash
+// states by design: pre-fix both paths drop the tail identically (they agree at the
+// tail-dropped value), post-fix both add the 4-remainder bit-identically (std::fma
+// rounds like the hardware FMA). It does not catch the ORIGINAL bug (Parts A/B do); it
+// guards against a FUTURE edit that changes one path's tail and not the other — the
+// exact cross-path determinism contract C-1 flagged as unguarded.
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+	#define SUPERFAISS_TEST_X86_INTRINSICS 1
+namespace superfaiss
+{
+namespace detail
+{
+	// Defined in src/kernels_avx2.cpp (external linkage; not exported in kernels.h).
+	float DotF32Avx2(const float* row, const float* query, int32_t paddedDims);
+	float L2F32Avx2(const float* row, const float* query, int32_t paddedDims);
+}
+}
+#endif
+
+static void TestAvx2Sub8RemainderF32()
+{
+	using namespace superfaiss;
+
+	// --- Part A: the AVX2 scalar mirror computes the sub-8 tail (reachable unit check).
+	// Compares DotF32ScalarAvx2/L2F32ScalarAvx2 against an INDEPENDENT double reference
+	// (plain for-loop, not a recode of the kernel's lane structure) at lengths ≡ 4 mod 8
+	// {4,12,20} plus multiple-of-8 controls {8,16}. Pre-fix the mirror returns the
+	// tail-dropped value (exactly 0 at len 4); the controls pass in both states. Only
+	// meaningful when AVX2 is the active path — the mirror is the AVX2-shaped scalar;
+	// on other devices skip with a note rather than assert a path this build never runs.
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		Rng rng(0x5178A11);
+		const int32_t lens[] = {4, 8, 12, 16, 20};
+		const int32_t maxLen = 20;
+		AlignedBuf row(static_cast<size_t>(maxLen) * sizeof(float));
+		AlignedBuf query(static_cast<size_t>(maxLen) * sizeof(float));
+
+		for (int32_t len : lens)
+		{
+			for (int32_t rep = 0; rep < 32; ++rep)
+			{
+				for (int32_t i = 0; i < len; ++i)
+				{
+					row.F32()[i] = rng.NextFloat();
+					query.F32()[i] = rng.NextFloat();
+				}
+				double refDot = 0.0, refL2 = 0.0;
+				for (int32_t i = 0; i < len; ++i)
+				{
+					const double a = static_cast<double>(row.F32()[i]);
+					const double b = static_cast<double>(query.F32()[i]);
+					refDot += a * b;
+					const double d = b - a;
+					refL2 += d * d;
+				}
+				const float dot = detail::DotF32ScalarAvx2(row.F32(), query.F32(), len);
+				const float l2 = detail::L2F32ScalarAvx2(row.F32(), query.F32(), len);
+				const double dotTol = 1e-5 * (1.0 + std::fabs(refDot));
+				const double l2Tol = 1e-5 * (1.0 + std::fabs(refL2));
+				CHECK_MSG(std::fabs(static_cast<double>(dot) - refDot) <= dotTol,
+					"DotF32ScalarAvx2 len=%d: kernel %.9g ref %.9g", len, dot, refDot);
+				CHECK_MSG(std::fabs(static_cast<double>(l2) - refL2) <= l2Tol,
+					"L2F32ScalarAvx2 len=%d: kernel %.9g ref %.9g", len, l2, refL2);
+			}
+		}
+	}
+
+	// --- Part C (Poirot C-1): the AVX2 intrinsic equals its scalar mirror BIT-EXACTLY at
+	// the sub-8 tail. This is the path's determinism contract (DotF32Avx2 == its scalar
+	// mirror, and L2 likewise) and was unguarded here: TestSimdEqualsScalar reaches the
+	// intrinsic only via the DotF32/DotF32Mirror dispatchers, which route non-multiple-
+	// of-8 strides to SSE/scalar, so the sub-8-tail intrinsic-vs-mirror bits were never
+	// compared. Exact ==, never a tolerance — the contract is bit equality. Several
+	// random fixtures per length so it is not one lucky value. AVX2-only (the intrinsic
+	// forward-declared above exists on this x86 build; the runtime guard confirms the
+	// device actually runs it).
+#if defined(SUPERFAISS_TEST_X86_INTRINSICS)
+	if (ActiveSimdPath() == SimdPath::AVX2)
+	{
+		Rng rng(0xB17EC0DEull);
+		const int32_t lens[] = {4, 8, 12, 16, 20}; // {4,12,20} tail; {8,16} controls
+		const int32_t maxLen = 20;
+		AlignedBuf row(static_cast<size_t>(maxLen) * sizeof(float));
+		AlignedBuf query(static_cast<size_t>(maxLen) * sizeof(float));
+		for (int32_t len : lens)
+		{
+			for (int32_t rep = 0; rep < 16; ++rep)
+			{
+				for (int32_t i = 0; i < len; ++i)
+				{
+					row.F32()[i] = rng.NextFloat();
+					query.F32()[i] = rng.NextFloat();
+				}
+				const float dotIntrin = detail::DotF32Avx2(row.F32(), query.F32(), len);
+				const float dotMirror = detail::DotF32ScalarAvx2(row.F32(), query.F32(), len);
+				const float l2Intrin = detail::L2F32Avx2(row.F32(), query.F32(), len);
+				const float l2Mirror = detail::L2F32ScalarAvx2(row.F32(), query.F32(), len);
+				// Bit-exact: identical float bit patterns, not IsNearlyEqual.
+				CHECK_MSG(dotIntrin == dotMirror,
+					"DotF32Avx2 vs mirror len=%d rep=%d: intrinsic %.9g mirror %.9g",
+					len, rep, dotIntrin, dotMirror);
+				CHECK_MSG(l2Intrin == l2Mirror,
+					"L2F32Avx2 vs mirror len=%d rep=%d: intrinsic %.9g mirror %.9g",
+					len, rep, l2Intrin, l2Mirror);
+			}
+		}
+	}
+#endif
+
+	// --- Part B: the production per-channel-cosine scan over a LENGTH-4 channel (public
+	// Query() API — the real surface, exercising the raw DotF32Avx2 intrinsic through
+	// ResolveRowKernels). A Float32 Cosine bank with a length-4 first channel; query
+	// that one channel and compare the full ranking to an INDEPENDENT double per-channel
+	// cosine brute-force over the same sub-range. Pre-fix every row scores exactly 0
+	// (the channel is dropped), so the ranking and scores diverge from the reference and
+	// this fails decisively; post-fix they match. Runs on every device (the whole-row
+	// bank ops use paddedDims % 8 == 0, so a non-AVX2 device simply exercises the SSE
+	// path, which was always correct — the oracle holds there too).
+	{
+		Rng rng(0xC4A22E1ull);
+		const int32_t dims = 8;                  // paddedDims 8 (% 8 == 0) for the bank ops
+		const int32_t count = 64;
+		const int32_t chanOffset = 0;
+		const int32_t chanLen = 4;               // ≡ 4 mod 8 — the dropped-tail case
+		TestBank bank(rng, count, dims, Quantization::Float32, Metric::Cosine);
+		const int32_t pd = bank.view.paddedDims;
+
+		const ChannelInfo channels[2] = {{chanOffset, chanLen}, {chanLen, pd - chanLen}};
+		std::vector<float> invNorms(static_cast<size_t>(count) * 2);
+		BankView view = bank.view;
+		view.channels = channels;
+		view.channelCount = 2;
+		CHECK(ComputeChannelInverseNorms(view, invNorms.data()) == Status::Ok);
+		view.channelInvNorms = invNorms.data();
+		CHECK(ValidateBank(view) == Status::Ok);
+
+		// Query, with the first channel's sub-vector renormalized to unit norm (the
+		// D-V2-1 per-channel build rule the fixture in TestPerChannelCosine also uses).
+		AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+		std::vector<float> qv(static_cast<size_t>(dims));
+		for (auto& x : qv)
+		{
+			x = rng.NextFloat();
+		}
+		PadQuery(qv, pd, q.F32());
+		{
+			double norm = 0.0;
+			for (int32_t j = chanOffset; j < chanOffset + chanLen; ++j)
+			{
+				norm += static_cast<double>(q.F32()[j]) * q.F32()[j];
+			}
+			const double inv = norm > 0.0 ? 1.0 / std::sqrt(norm) : 0.0;
+			for (int32_t j = chanOffset; j < chanOffset + chanLen; ++j)
+			{
+				q.F32()[j] = static_cast<float>(q.F32()[j] * inv);
+			}
+		}
+
+		const QuerySegment one[1] = {{chanOffset, chanLen, 1.0f}};
+		QueryParams sp;
+		sp.k = count;
+		sp.segments = one;
+		sp.segmentCount = 1;
+		Workspace ws;
+		std::vector<Hit> got(static_cast<size_t>(count));
+		int32_t gotCount = 0;
+		CHECK(Query(view, q.F32(), sp, ws, got.data(), &gotCount) == Status::Ok);
+		CHECK_MSG(gotCount == count, "length-4 channel query hit count %d != %d",
+			gotCount, count);
+
+		// Independent oracle: per-channel cosine of the length-4 sub-range, in double,
+		// straight from the definition — dot(q_sub, row_sub) / (||q_sub|| ||row_sub||).
+		// (q_sub is already unit-norm from the renormalization above.)
+		struct RefScore { int32_t index; double score; };
+		std::vector<RefScore> ref(static_cast<size_t>(count));
+		double bestAbs = 0.0;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			const double* rr = bank.refRows.data() + static_cast<size_t>(r) * dims;
+			double dot = 0.0, rowNorm = 0.0, qNorm = 0.0;
+			for (int32_t j = chanOffset; j < chanOffset + chanLen; ++j)
+			{
+				dot += static_cast<double>(q.F32()[j]) * rr[j];
+				rowNorm += rr[j] * rr[j];
+				qNorm += static_cast<double>(q.F32()[j]) * q.F32()[j];
+			}
+			const double denom = std::sqrt(rowNorm) * std::sqrt(qNorm);
+			ref[r].index = r;
+			ref[r].score = denom > 0.0 ? dot / denom : 0.0;
+			bestAbs = std::max(bestAbs, std::fabs(ref[r].score));
+		}
+		std::sort(ref.begin(), ref.end(), [](const RefScore& a, const RefScore& b) {
+			return a.score > b.score;
+		});
+
+		// The channel carries real signal (guards against a vacuous all-zero oracle that
+		// would let the pre-fix all-zero scan look "correct").
+		CHECK_MSG(bestAbs > 0.1, "length-4 channel oracle has no signal (max |cos| %.4g)",
+			bestAbs);
+
+		// FEAT: the scan's per-channel cosines match the independent brute force in both
+		// score and order. Pre-fix all got[].score are 0 → the top score mismatches the
+		// reference's ~bestAbs and this fails; post-fix they agree within float slack.
+		for (int32_t i = 0; i < gotCount && i < count; ++i)
+		{
+			CHECK_MSG(got[i].index == ref[i].index,
+				"length-4 channel rank %d: scan row %d, oracle row %d",
+				i, got[i].index, ref[i].index);
+			CHECK_MSG(std::fabs(static_cast<double>(got[i].score) - ref[i].score) <= 1e-4,
+				"length-4 channel rank %d: scan %.6g oracle %.6g",
+				i, got[i].score, ref[i].score);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // T12 — MergeTopK: per-chunk scans merged externally are bit-identical to a single
 // Query over the same bank (the parallel-driver contract; Poirot M1).
 
@@ -13968,6 +14216,7 @@ static void TestRelabelDemoteFeat()
 int main()
 {
 	TestSimdEqualsScalar();
+	TestAvx2Sub8RemainderF32();
 	TestMergeTopK();
 	TestValidateBankData();
 	TestKnownGeometry();

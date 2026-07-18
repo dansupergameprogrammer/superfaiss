@@ -63,6 +63,27 @@ namespace
 			}
 		}
 
+		// Four-lane remainder mirrors: a float32 segment stride lies on the 4-float
+		// (16-byte) grid, so after the 8-lane groups a final 4-element tail can remain.
+		// It feeds lanes 0..3 only (lanes 4..7 untouched), which is exactly what the
+		// intrinsic does when it FMAs a zero-extended 4-vector (0*0 leaves those lanes).
+		void FmaMul4(const float* a, const float* b)
+		{
+			for (int l = 0; l < 4; ++l)
+			{
+				Lane[l] = std::fma(a[l], b[l], Lane[l]);
+			}
+		}
+
+		void FmaDiffSq4(const float* q, const float* r)
+		{
+			for (int l = 0; l < 4; ++l)
+			{
+				const float d = q[l] - r[l];
+				Lane[l] = std::fma(d, d, Lane[l]);
+			}
+		}
+
 		void FmaMulI8(const int8_t* r, const float* q)
 		{
 			for (int l = 0; l < 8; ++l)
@@ -119,6 +140,18 @@ float DotF32Avx2(const float* row, const float* query, int32_t paddedDims)
 	if (i + 8 <= paddedDims)
 	{
 		acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(query + i), acc2);
+		i += 8;
+	}
+	// Float32 segment strides lie on the 4-float grid, so a final 4-element tail can
+	// remain after the 8-lane groups. Zero-extend the 4 floats into a 256-bit vector
+	// (upper lanes zero) and FMA into acc3: lanes 0..3 take the products, lanes 4..7
+	// see 0*0 and are unchanged. Without this, a length-4 segment scored 0 on AVX2
+	// while the SSE/scalar paths scored it correctly (dropped tail; determinism gap).
+	if (i + 4 <= paddedDims)
+	{
+		const __m256 r4 = _mm256_zextps128_ps256(_mm_loadu_ps(row + i));
+		const __m256 q4 = _mm256_zextps128_ps256(_mm_loadu_ps(query + i));
+		acc3 = _mm256_fmadd_ps(r4, q4, acc3);
 	}
 	return (SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3));
 }
@@ -158,6 +191,16 @@ float L2F32Avx2(const float* row, const float* query, int32_t paddedDims)
 	{
 		const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(query + i), _mm256_loadu_ps(row + i));
 		acc2 = _mm256_fmadd_ps(d, d, acc2);
+		i += 8;
+	}
+	// Final 4-element tail (see DotF32Avx2): the zero-extended lanes 4..7 give d=0-0=0,
+	// so 0*0 leaves acc3's upper lanes unchanged and only lanes 0..3 accumulate.
+	if (i + 4 <= paddedDims)
+	{
+		const __m256 d = _mm256_sub_ps(
+			_mm256_zextps128_ps256(_mm_loadu_ps(query + i)),
+			_mm256_zextps128_ps256(_mm_loadu_ps(row + i)));
+		acc3 = _mm256_fmadd_ps(d, d, acc3);
 	}
 	return (SumLanes8(acc0) + SumLanes8(acc1)) + (SumLanes8(acc2) + SumLanes8(acc3));
 }
@@ -433,6 +476,10 @@ float DotF32ScalarAvx2(const float* row, const float* query, int32_t paddedDims)
 	{
 		acc[g].FmaMul(row + i, query + i);
 	}
+	if (i + 4 <= paddedDims)
+	{
+		acc[3].FmaMul4(row + i, query + i);
+	}
 	return (acc[0].Sum() + acc[1].Sum()) + (acc[2].Sum() + acc[3].Sum());
 }
 
@@ -450,6 +497,10 @@ float L2F32ScalarAvx2(const float* row, const float* query, int32_t paddedDims)
 	for (int32_t g = 0; i + 8 <= paddedDims; i += 8, ++g)
 	{
 		acc[g].FmaDiffSq(query + i, row + i);
+	}
+	if (i + 4 <= paddedDims)
+	{
+		acc[3].FmaDiffSq4(query + i, row + i);
 	}
 	return (acc[0].Sum() + acc[1].Sum()) + (acc[2].Sum() + acc[3].Sum());
 }
