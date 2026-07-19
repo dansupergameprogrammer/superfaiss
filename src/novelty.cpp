@@ -13,9 +13,10 @@
 
 #include "superfaiss/novelty.h"
 
-#include "superfaiss/analytics.h" // ScoreXdPair
-#include "superfaiss/kernels.h"   // XdQuery, QuantizeQueryXd, detail::DotI8I8/FloatBitsToDouble
-#include "superfaiss/query.h"     // Query
+#include "superfaiss/analytics.h"        // ScoreXdPair
+#include "superfaiss/inspector_common.h" // DequantizeRowAsQuery
+#include "superfaiss/kernels.h"          // XdQuery, QuantizeQueryXd, detail::DotI8I8/FloatBitsToDouble
+#include "superfaiss/query.h"            // Query, QueryBatch
 
 #include <algorithm>
 #include <cmath>
@@ -48,31 +49,6 @@ inline double XdCosineDistanceLocal(double cross, double aSq, double bSq)
 {
 	const double denom = std::sqrt(aSq * bSq);
 	return 1.0 - cross / denom;
-}
-
-// Row r decoded to a paddedDims float query, exactly as the kernels decode it (the
-// graph.h/pca.cpp convention): int8 is (int8 byte) * that row's own scale; float32 is
-// the bytes as-is.
-void DequantizeRow(const BankView& bank, int32_t r, float* out)
-{
-	const int32_t pd = bank.paddedDims;
-	if (bank.quant == Quantization::Int8)
-	{
-		const int8_t* row = static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(r) * pd;
-		const float scale = bank.scales[r];
-		for (int32_t d = 0; d < pd; ++d)
-		{
-			out[d] = static_cast<float>(row[d]) * scale;
-		}
-	}
-	else
-	{
-		const float* row = static_cast<const float*>(bank.rows) + static_cast<int64_t>(r) * pd;
-		for (int32_t d = 0; d < pd; ++d)
-		{
-			out[d] = row[d];
-		}
-	}
 }
 
 // L2 -> the score itself (already a squared distance); Cosine -> 1 - score (a
@@ -249,42 +225,55 @@ Status CalibrateNoveltyBaseline(
 	// Self-excluded k-th-NN: widen retrieval by one (mirroring BuildKnnNeighbors), since
 	// each row is its own nearest and must be dropped from its own baseline entry.
 	const int32_t internalK = k + 1;
-	if (!workspace.Reserve(internalK, 1))
+	const int32_t count = bank.count;
+
+	// The batch query path (matching graph.h's BuildKnnNeighbors — Poirot casebook
+	// afabc08-graph-h-m1-review.md, S1/S2/S3): the chunk loop runs OUTERMOST across all
+	// `count` queries in one bank pass. Tracked, warm-reusable query scratch; QueryBatch
+	// manages its own internal top-k scratch via `workspace` (never given segments here,
+	// so it never touches this region).
+	if (!workspace.ReserveQueryScratch(bank.paddedDims, count))
 	{
 		return Status::OutOfMemory;
 	}
-	if (!workspace.ReserveQueryScratch(bank.paddedDims, 1))
+	// Pack from the base at OUR OWN stride (bank.paddedDims) — never via
+	// workspace.QueryScratch(r) for r > 0, whose internal stride can be wider than
+	// bank.paddedDims on a warm workspace (query.cpp's own segmented-fold precedent).
+	float* queryBase = workspace.QueryScratch(0);
+	for (int32_t r = 0; r < count; ++r)
 	{
-		return Status::OutOfMemory;
+		DequantizeRowAsQuery(bank, r, queryBase + static_cast<int64_t>(r) * bank.paddedDims);
 	}
 
-	float* query = workspace.QueryScratch(0);
-	std::vector<Hit> hits(static_cast<size_t>(internalK));
+	// Caller-owned outHits, matching every QueryBatch call site in this codebase:
+	// workspace's HeapStorage slots are QueryBatch's own per-sub-batch scratch, reused and
+	// overwritten across sub-batches, never a stable place for a caller's persistent output.
+	std::vector<Hit> allHits(static_cast<size_t>(count) * static_cast<size_t>(internalK));
+	std::vector<int32_t> hitCounts(static_cast<size_t>(count));
 	QueryParams params;
 	params.k = internalK;
-
-	for (int32_t r = 0; r < bank.count; ++r)
+	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits.data(), hitCounts.data());
+	if (s != Status::Ok)
 	{
-		DequantizeRow(bank, r, query);
-		int32_t hitCount = 0;
-		const Status s = Query(bank, query, params, workspace, hits.data(), &hitCount);
-		if (s != Status::Ok)
-		{
-			return s;
-		}
+		return s;
+	}
 
+	for (int32_t r = 0; r < count; ++r)
+	{
+		const Hit* rowHits = allHits.data() + static_cast<int64_t>(r) * internalK;
+		const int32_t hitCount = hitCounts[static_cast<size_t>(r)];
 		int32_t seen = 0;
 		bool found = false;
 		float rawScore = 0.0f;
 		for (int32_t j = 0; j < hitCount; ++j)
 		{
-			if (hits[static_cast<size_t>(j)].index == r)
+			if (rowHits[j].index == r)
 			{
 				continue; // self-exclude
 			}
 			if (++seen == k)
 			{
-				rawScore = hits[static_cast<size_t>(j)].score;
+				rawScore = rowHits[j].score;
 				found = true;
 				break;
 			}
@@ -296,8 +285,8 @@ Status CalibrateNoveltyBaseline(
 		outSortedDistances[r] = RankDistanceLocal(bank.metric, rawScore);
 	}
 
-	std::sort(outSortedDistances, outSortedDistances + bank.count);
-	*outCount = bank.count;
+	std::sort(outSortedDistances, outSortedDistances + count);
+	*outCount = count;
 	return Status::Ok;
 }
 

@@ -9,6 +9,7 @@
 
 #include "superfaiss/graph.h"
 
+#include "superfaiss/inspector_common.h" // DequantizeRowAsQuery
 #include "superfaiss/query.h"
 
 #include <algorithm>
@@ -19,32 +20,6 @@ namespace superfaiss
 {
 namespace
 {
-
-// Row r decoded to a paddedDims float query, exactly as the kernels decode it (pca.cpp:16
-// and the plugin's MakeCentroidQuery({row})): int8 is (int8 byte) * that row's own scale;
-// float32 is the bytes as-is. Pad lanes are zero in storage and copy through as zero. A
-// plain multiply — the DAZ-safe decode the whole-vector paths already use.
-void DequantizeRow(const BankView& bank, int32_t r, float* out)
-{
-	const int32_t pd = bank.paddedDims;
-	if (bank.quant == Quantization::Int8)
-	{
-		const int8_t* row = static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(r) * pd;
-		const float scale = bank.scales[r];
-		for (int32_t d = 0; d < pd; ++d)
-		{
-			out[d] = static_cast<float>(row[d]) * scale;
-		}
-	}
-	else
-	{
-		const float* row = static_cast<const float*>(bank.rows) + static_cast<int64_t>(r) * pd;
-		for (int32_t d = 0; d < pd; ++d)
-		{
-			out[d] = row[d];
-		}
-	}
-}
 
 // FNV-1a over a row's stored bytes plus (for int8) its scale — the grouping hash. Only a
 // pre-filter: full byte equality is always confirmed before two rows share a group.
@@ -102,40 +77,59 @@ Status BuildKnnNeighbors(
 	// 0 / self-dot), so k+1 hits guarantee k survivors after the self drop. k < count, so
 	// internalK <= count is always a valid query k.
 	const int32_t internalK = excludeSelf ? k + 1 : k;
-	if (!workspace.Reserve(internalK, 1))
+
+	// The batch query path (V32-G5/§25.4): the chunk loop runs OUTERMOST across all `count`
+	// queries in one bank pass, amortizing the memory traffic a per-row Query() loop would
+	// re-pay `count` times. Tracked, warm-reusable scratch for the packed query buffer
+	// (Workspace's own "zero allocation on warm reuse" contract); QueryBatch manages its own
+	// internal top-k scratch via `workspace` and is never given segments here, so it never
+	// touches this region itself.
+	if (!workspace.ReserveQueryScratch(bank.paddedDims, count))
 	{
 		return Status::OutOfMemory;
 	}
-	if (!workspace.ReserveQueryScratch(bank.paddedDims, 1))
+	// Index from the base at OUR OWN chosen stride (bank.paddedDims), never via
+	// workspace.QueryScratch(r) for r > 0: a warm workspace's internal stride can be WIDER
+	// than bank.paddedDims (grown by an earlier, larger-dims caller), so QueryScratch(r)
+	// would not land at r*bank.paddedDims — the exact hazard query.cpp's own segmented-fold
+	// packing works around (external bug report 2026-07-04, T25). ReserveQueryScratch's
+	// total allocation is always >= count*bank.paddedDims regardless of the internal
+	// stride, so packing from the base at our own stride is always safe.
+	float* queryBase = workspace.QueryScratch(0);
+	for (int32_t r = 0; r < count; ++r)
 	{
-		return Status::OutOfMemory;
+		DequantizeRowAsQuery(bank, r, queryBase + static_cast<int64_t>(r) * bank.paddedDims);
 	}
 
-	float* query = workspace.QueryScratch(0);
-	std::vector<Hit> hits(static_cast<size_t>(internalK));
+	// QueryBatch's own outHits is a caller-owned buffer, matching every other QueryBatch
+	// call site in this codebase (analytics.cpp, the existing test suite): `workspace`'s
+	// HeapStorage slots are QueryBatch's OWN internal per-sub-batch scratch, reused and
+	// overwritten across sub-batches — not a place a caller can safely park its persistent
+	// output.
+	std::vector<Hit> allHits(static_cast<size_t>(count) * static_cast<size_t>(internalK));
+	std::vector<int32_t> hitCounts(static_cast<size_t>(count));
 
 	QueryParams params;
 	params.k = internalK;
+	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits.data(), hitCounts.data());
+	if (s != Status::Ok)
+	{
+		return s;
+	}
 
 	for (int32_t r = 0; r < count; ++r)
 	{
-		DequantizeRow(bank, r, query);
-		int32_t hitCount = 0;
-		const Status s = Query(bank, query, params, workspace, hits.data(), &hitCount);
-		if (s != Status::Ok)
-		{
-			return s;
-		}
-
+		const Hit* rowHits = allHits.data() + static_cast<int64_t>(r) * internalK;
+		const int32_t hitCount = hitCounts[static_cast<size_t>(r)];
 		int32_t* outRow = outNeighbors + static_cast<int64_t>(r) * k;
 		int32_t written = 0;
 		for (int32_t j = 0; j < hitCount && written < k; ++j)
 		{
-			if (excludeSelf && hits[static_cast<size_t>(j)].index == r)
+			if (excludeSelf && rowHits[j].index == r)
 			{
 				continue;
 			}
-			outRow[written++] = hits[static_cast<size_t>(j)].index;
+			outRow[written++] = rowHits[j].index;
 		}
 		for (; written < k; ++written)
 		{
