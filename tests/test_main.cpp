@@ -14562,52 +14562,87 @@ static void TestM1DuplicateGroupingByteConfirm()
 	}
 }
 
-// M1 / dim 7 (edges exact) + G-3 (per-metric generality) — the built neighbor list,
-// mutual flags, and component ids equal the double-precision brute force on a well-
-// separated fixture, for Dot, Cosine, and L2, int8 and float32.
+// M1 / dim 6 (edges exact) + dim 7 (per-metric generality, G-3) — the built neighbor
+// list, mutual flags, and component ids equal the double-precision brute force, for Dot,
+// Cosine, and L2, int8 and float32. Two mechanism-true, TIE-FREE fixtures (F-M1-3, the
+// D-V32-25 corollary: a degenerate/near-duplicate oracle value must be TRACED from the
+// mechanism, never intuited):
+//   Leg 1 (distinct-distance arc) proves neighbor RANKING on distinct, gap-separated
+//     distances — points on a circular arc with strictly-INCREASING angular gaps, so
+//     every pairwise distance is distinct in all three metrics and no float-vs-double
+//     near-tie exists.
+//   Leg 2 (exact-duplicate orthogonal blocks) is the per-metric FEAT: D=4 byte-identical
+//     blocks on orthogonal axes -> the construction-union guarantees exactly D components
+//     BY CONSTRUCTION (mechanism-true, independent of k), and within-block ties are at
+//     EXACT distance 0 (integer index tie-break, identical in float and double).
+// A NEAR-duplicate dense blob is deliberately NOT used here: bounded-k mutual-kNN over it
+// fragments (R-V32-3 / the seventh fracture), so "one component per blob" is intuited, not
+// mechanism-traced — and normalized near-identical unit vectors are a genuine float-vs-
+// double near-tie on Cosine. That geometry is the Structure FEAT's job (exact-duplicate
+// blocks + isolates), where the union makes the count mechanism-true.
 static void TestM1EdgesExactAcrossMetrics()
 {
-	Rng rng(0x7E5);
-	const int32_t dims = 32, blobs = 4, per = 12, k = 5;
-	const int32_t count = blobs * per;
+	const int32_t dims = 16, k = 4;
+	auto checkEqual = [&](const GBank& b, int32_t kk, const char* leg, Metric metric, Quantization q,
+		int32_t expectComponents /* -1 = don't assert count */)
+	{
+		const int32_t count = b.view.count;
+		Workspace ws; ws.Reserve(kk + 1, 1);
+		std::vector<int32_t> nb(static_cast<size_t>(count) * kk, -999);
+		CHECK(BuildKnnNeighbors(b.view, kk, true, nb.data(), ws) == Status::Ok);
+		const std::vector<int32_t> refNb = BruteKnn(b, kk, true);
+		int32_t nbMismatch = 0;
+		for (size_t i = 0; i < nb.size(); ++i) if (nb[i] != refNb[i]) ++nbMismatch;
+		CHECK_MSG(nbMismatch == 0, "%s: neighbor list must equal brute force (metric=%d quant=%d): %d mismatches",
+			leg, (int)metric, (int)q, nbMismatch);
+
+		std::vector<uint8_t> flags(static_cast<size_t>(count) * kk, 0xEE);
+		CHECK(MutualFilter(count, kk, nb.data(), flags.data()) == Status::Ok);
+		const std::vector<uint8_t> refFlags = BruteMutual(refNb, count, kk);
+		int32_t flagMismatch = 0;
+		for (size_t i = 0; i < flags.size(); ++i) if (flags[i] != refFlags[i]) ++flagMismatch;
+		CHECK_MSG(flagMismatch == 0, "%s: mutual flags must equal brute force (metric=%d quant=%d)", leg, (int)metric, (int)q);
+
+		std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+		CHECK(RunM1Pipeline(b, kk, ids) == Status::Ok);
+		const std::vector<int32_t> refIds = BruteComponents(b, kk);
+		int32_t idMismatch = 0;
+		for (int32_t r = 0; r < count; ++r) if (ids[r] != refIds[r]) ++idMismatch;
+		CHECK_MSG(idMismatch == 0, "%s: component ids must equal brute force (metric=%d quant=%d)", leg, (int)metric, (int)q);
+		if (expectComponents >= 0)
+			CHECK_MSG(ComponentCount(ids) == expectComponents,
+				"%s: constructed %d components (metric=%d quant=%d), got %d",
+				leg, expectComponents, (int)metric, (int)q, ComponentCount(ids));
+	};
+
 	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
 	{
 		for (Quantization q : {Quantization::Float32, Quantization::Int8})
 		{
-			// Well-separated blobs so top-k membership is unambiguous (no float/double ties).
-			std::vector<float> src;
-			for (int32_t bl = 0; bl < blobs; ++bl)
+			// Leg 1 — distinct-distance arc: 10 points, strictly-increasing angular gaps.
 			{
-				std::vector<float> centre(static_cast<size_t>(dims), 0.0f);
-				centre[static_cast<size_t>(bl)] = 20.0f * (bl + 1);
-				PushBlob(src, dims, centre, per, rng, 0.05f);
+				const int32_t n = 10;
+				std::vector<float> src(static_cast<size_t>(n) * dims, 0.0f);
+				double theta = 0.0;
+				for (int32_t i = 0; i < n; ++i)
+				{
+					src[static_cast<size_t>(i) * dims + 0] = static_cast<float>(std::cos(theta));
+					src[static_cast<size_t>(i) * dims + 1] = static_cast<float>(std::sin(theta));
+					theta += 0.25 + 0.11 * i; // growing gaps -> all pairwise distances distinct
+				}
+				GBank b(src, n, dims, q, metric);
+				checkEqual(b, k, "arc", metric, q, -1);
 			}
-			GBank b(src, count, dims, q, metric);
-			Workspace ws; ws.Reserve(k + 1, 1);
-			std::vector<int32_t> nb(static_cast<size_t>(count) * k, -999);
-			CHECK(BuildKnnNeighbors(b.view, k, true, nb.data(), ws) == Status::Ok);
-			const std::vector<int32_t> refNb = BruteKnn(b, k, true);
-			int32_t nbMismatch = 0;
-			for (size_t i = 0; i < nb.size(); ++i) if (nb[i] != refNb[i]) ++nbMismatch;
-			CHECK_MSG(nbMismatch == 0, "neighbor list must equal brute force (metric=%d quant=%d): %d mismatches",
-				(int)metric, (int)q, nbMismatch);
-
-			std::vector<uint8_t> flags(static_cast<size_t>(count) * k, 0xEE);
-			CHECK(MutualFilter(count, k, nb.data(), flags.data()) == Status::Ok);
-			const std::vector<uint8_t> refFlags = BruteMutual(refNb, count, k);
-			int32_t flagMismatch = 0;
-			for (size_t i = 0; i < flags.size(); ++i) if (flags[i] != refFlags[i]) ++flagMismatch;
-			CHECK_MSG(flagMismatch == 0, "mutual flags must equal brute force (metric=%d quant=%d)", (int)metric, (int)q);
-
-			std::vector<int32_t> ids(static_cast<size_t>(count), -999);
-			CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
-			const std::vector<int32_t> refIds = BruteComponents(b, k);
-			// Each blob is one component; ids equal the brute-force partition exactly.
-			int32_t idMismatch = 0;
-			for (int32_t r = 0; r < count; ++r) if (ids[r] != refIds[r]) ++idMismatch;
-			CHECK_MSG(idMismatch == 0, "component ids must equal brute force (metric=%d quant=%d)", (int)metric, (int)q);
-			CHECK_MSG(ComponentCount(ids) == blobs, "well-separated blobs -> %d components (metric=%d quant=%d), got %d",
-				blobs, (int)metric, (int)q, ComponentCount(ids));
+			// Leg 2 — exact-duplicate orthogonal blocks (per-metric FEAT, mechanism-true count).
+			{
+				const int32_t D = 4, blk = 6, n = D * blk;
+				std::vector<float> src(static_cast<size_t>(n) * dims, 0.0f);
+				for (int32_t d = 0; d < D; ++d)
+					for (int32_t i = 0; i < blk; ++i)
+						src[(static_cast<size_t>(d) * blk + i) * dims + d] = 10.0f * (d + 1); // block d on axis d
+				GBank b(src, n, dims, q, metric);
+				checkEqual(b, k, "exact-dup-blocks", metric, q, D);
+			}
 		}
 	}
 }
