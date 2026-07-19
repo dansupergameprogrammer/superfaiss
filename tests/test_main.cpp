@@ -16532,10 +16532,16 @@ static void TestM3CslsDirectionPerMetric()
 			"perturbed=%.6g (matched0=%d matched1=%d)", static_cast<int>(metric), ref0.margin,
 			ref1.margin, ref0.matched, ref1.matched);
 
+		// The sample view carries exactly the sampled rows: sampleSourceIndices and
+		// outPairs are sized by contract to sampleViewA.count, so passing the full
+		// 6-row view here with 2-entry arrays overruns both (the M3 heap-corruption
+		// root cause — Poirot, Claude/Poirot/b4e139e-m3-heap-corruption-root-cause.md).
+		std::vector<float> sampleSrc(aSrc.begin(), aSrc.begin() + 2 * dims);
+		GBank sampleA(sampleSrc, 2, dims, Quantization::Float32, metric);
 		Workspace ws; ws.Reserve(matchK, 1);
 		std::vector<MatchPair> pairs(2);
 		int32_t pairCount = -999;
-		CHECK(MutualNearestMatches(fullA.view, sampleSourceIndices.data(), fullB.view, nullptr,
+		CHECK(MutualNearestMatches(sampleA.view, sampleSourceIndices.data(), fullB.view, nullptr,
 			fullA.view, nullptr, matchK, pairs.data(), &pairCount, ws) == Status::Ok);
 
 		CHECK_MSG(pairs[0].sourceIndexB == 0 && pairs[1].sourceIndexB == 1,
