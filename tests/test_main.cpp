@@ -15192,12 +15192,15 @@ static void TestM2NoveltyProbeDistance()
 		CHECK_MSG(out == -999.0f, "the Dot rejection must not write outDistance");
 	}
 
-	// --- Channel-table trust boundaries: channel out of [-1, channelCount). ---
+	// --- Channel-table trust boundaries: channel out of [-1, channelCount). Grid-aligned
+	// (F-M2-3: the int8 channel grid is 16 elements -- an off-grid channel table is
+	// unrealizable on any bank that passed real validation, and detail::DotI8I8's SIMD
+	// paths assume 16-alignment with no scalar remainder tail). ---
 	{
 		std::vector<float> src;
-		const int32_t dims = 6, count = 2;
+		const int32_t dims = 32, count = 2;
 		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
-		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
 		GChannelBank b(src, count, dims, Quantization::Int8, Metric::Cosine, ch);
 		std::vector<float> probe(static_cast<size_t>(b.bank.view.paddedDims), 0.1f);
 		float out = -999.0f;
@@ -15206,8 +15209,20 @@ static void TestM2NoveltyProbeDistance()
 		CHECK(out == -999.0f);
 	}
 
-	// --- int8 whole-row, Cosine and L2: byte-identical duplicate -> exactly 0; a distinct
-	// row -> entry == oracle; oracle == entry on random pairs. ---
+	// --- int8 whole-row, Cosine and L2: a re-quantized duplicate probe -> entry == oracle
+	// (unconditional -- both read the SAME real QuantizeQueryXd/DotI8I8 primitives, so this
+	// holds regardless of whether the round trip below reproduces byte-identical codes); a
+	// distinct row -> entry == oracle; oracle == entry on random pairs. Cosine additionally
+	// asserts EXACTLY 0 (D-V32-47: parallel int8 codes give cross^2 == aSq*bSq exactly, and
+	// sqrt of a perfect square is exact under IEEE correctly-rounded sqrt -- proven, and
+	// confirmed by execution here). L2 does NOT get the same absolute assertion: dequantizing
+	// row 2 through a float32 probe and re-quantizing is not guaranteed to reproduce
+	// byte-identical codes (the dequantized value itself is a float32 rounding of a double),
+	// and even where the codes ARE identical, L2's EXPANDED form (a^2+b^2-2ab) is prone to
+	// double-precision cancellation residue -- the disclosed, standing "L2 expanded-form
+	// rounding" item (D-V32-48), confirmed here too (a tiny nonzero residual on an otherwise
+	// exact case, not a defect). L2 uses a tight epsilon that absorbs double-precision
+	// rounding noise but nothing larger. ---
 	for (Metric metric : {Metric::Cosine, Metric::L2})
 	{
 		const int32_t dims = 48, count = 6;
@@ -15219,9 +15234,19 @@ static void TestM2NoveltyProbeDistance()
 			std::vector<float> probe = M2PaddedProbeFromRow(b, 2);
 			float out = -999.0f;
 			CHECK(NoveltyProbeDistance(b.view, probe.data(), 2, -1, &out) == Status::Ok);
-			CHECK_MSG(out == 0.0f,
-				"int8 whole-row %s: byte-identical duplicate must score exactly 0, got %.9g",
-				metric == Metric::Cosine ? "Cosine" : "L2", static_cast<double>(out));
+			if (metric == Metric::Cosine)
+			{
+				CHECK_MSG(out == 0.0f,
+					"int8 whole-row Cosine: a re-quantized duplicate probe must score exactly "
+					"0 (D-V32-47's parallel-code exactness), got %.9g", static_cast<double>(out));
+			}
+			else
+			{
+				CHECK_MSG(std::fabs(out) < 1e-8f,
+					"int8 whole-row L2: a re-quantized duplicate probe must score near-zero "
+					"(D-V32-48's disclosed expanded-form rounding residue, not exact-0), "
+					"got %.9g", static_cast<double>(out));
+			}
 			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), 2, -1);
 			CHECK(ref.status == Status::Ok && ref.distance == out);
 		}
@@ -15327,15 +15352,23 @@ static void TestM2NoveltyProbeDistance()
 	}
 
 	// --- Channel-scoped Cosine, int8: strike 10's exact-direction twin verdicts a true
-	// scoped duplicate (distance 0); a different-direction pair does not. ---
+	// scoped duplicate (distance 0); a different-direction pair does not. Grid-aligned
+	// (F-M2-3): dims=32, channel0=[0,16)/channel1=[16,32), the strike's channel-0 direction
+	// at index 0 and its whole-row-norm-affecting remainder moved to index 16 (channel 1) —
+	// the same relationship strike 10's 6-dim geometry had (a value OUTSIDE the scoped
+	// channel that changes the whole-row norm without entering the channel-0 slice). ---
 	{
-		const int32_t dims = 6;
-		std::vector<float> rowA = {1, 0, 0, 3, 0, 0};
-		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		const int32_t dims = 32;
+		std::vector<float> rowA(static_cast<size_t>(dims), 0.0f);
+		rowA[0] = 1.0f;  // channel-0 direction (1,0,0,...)
+		rowA[16] = 3.0f; // channel-1 value -- affects whole-row norm only, mirrors strike 10
+		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
 		GChannelBank b(rowA, 1, dims, Quantization::Int8, Metric::Cosine, ch);
 
 		{
-			std::vector<float> probe = M2PaddedProbe({1, 0, 0, 0, 0, 0}, dims, b.bank.view.paddedDims);
+			std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+			probeSrc[0] = 1.0f; // exact channel-0 direction match
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
 			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
 			CHECK_MSG(out == 0.0f,
@@ -15343,7 +15376,9 @@ static void TestM2NoveltyProbeDistance()
 				"score exactly 0, got %.9g", static_cast<double>(out));
 		}
 		{
-			std::vector<float> probe = M2PaddedProbe({0, 1, 0, 0, 0, 0}, dims, b.bank.view.paddedDims);
+			std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+			probeSrc[1] = 1.0f; // orthogonal to row A's channel-0 direction
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
 			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
 			CHECK_MSG(out == 1.0f,
@@ -15353,19 +15388,36 @@ static void TestM2NoveltyProbeDistance()
 	}
 
 	// --- Channel-scoped L2, int8: strike 11's twin — kernel channel-L2 distance exactly
-	// 0.0 for two rows with a DIFFERENT stored (bytes, scale) key. ---
+	// 0.0 for two rows with a DIFFERENT stored (bytes, scale) key. Grid-aligned (F-M2-3):
+	// dims=32, channel0=[0,16)/channel1=[16,32); the strike's channel-0 payload
+	// (100/127,50/127,0) sits at indices [0,3), and the scale-driving remainder (2.0 vs
+	// 1.0) moves to index 16 (channel 1) -- the per-row whole-row maxAbs/scale and every
+	// quantized byte in channel 0 come out bit-identical to strike 11's own numbers, since
+	// the extra zero lanes contribute nothing to either the scale or the channel-0 sums. ---
 	{
-		const int32_t dims = 6;
-		std::vector<float> rowA = {100.0f / 127.0f, 50.0f / 127.0f, 0.0f, 2.0f, 0.0f, 0.0f};
-		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		const int32_t dims = 32;
+		std::vector<float> rowA(static_cast<size_t>(dims), 0.0f);
+		rowA[0] = 100.0f / 127.0f;
+		rowA[1] = 50.0f / 127.0f;
+		rowA[16] = 2.0f;
+		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
 		GChannelBank b(rowA, 1, dims, Quantization::Int8, Metric::L2, ch);
-		std::vector<float> probeB = {100.0f / 127.0f, 50.0f / 127.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-		std::vector<float> probe = M2PaddedProbe(probeB, dims, b.bank.view.paddedDims);
+		std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+		probeSrc[0] = 100.0f / 127.0f;
+		probeSrc[1] = 50.0f / 127.0f;
+		probeSrc[16] = 1.0f;
+		std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 		float out = -999.0f;
 		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
-		CHECK_MSG(out == 0.0f,
+		// Near-zero, not exact-0: the pair is exact by hand-verified RATIONAL arithmetic
+		// (12500/127^2 + 12500/127^2 - 25000/127^2 == 0 exactly, since 2/127 and 1/127 are
+		// each other's cross-consistent scale), but the EXPANDED-FORM double computation
+		// (a^2+b^2-2ab) carries the disclosed, standing L2 rounding residue (D-V32-48) —
+		// confirmed here (a residual at double-epsilon scale, not a defect).
+		CHECK_MSG(std::fabs(out) < 1e-8f,
 			"channel-scoped L2 int8: strike 11's dequant-identical/byte-different twin must "
-			"score exactly 0, got %.9g", static_cast<double>(out));
+			"score near-zero (D-V32-48's disclosed expanded-form rounding residue, not "
+			"exact-0), got %.9g", static_cast<double>(out));
 	}
 
 	// --- Channel-scoped Cosine zero-energy guard, BOTH sides (D-V32-43, strike 12): a
@@ -15483,21 +15535,35 @@ static void TestM2KthNeighborDistance()
 	Rng rng(0x4B7448);
 
 	// --- Trust boundaries (dim 2): k<1, k too large, null buffers, Dot -> InvalidArgument,
-	// no write. ---
+	// no write. F-M2-4: KthNeighborDistance is explicitly NOT self-widening (unlike
+	// BuildKnnNeighbors' excludeSelf), so k == the number of non-excluded rows is a VALID
+	// call (the distance to the single farthest row) -- the rejection boundary is k >
+	// available, not k >= available. Confirmed against the header's own literal wording. ---
 	{
 		const int32_t dims = 8, count = 6;
 		std::vector<float> src;
 		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
 		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
-		Workspace ws; ws.Reserve(count, 1);
+		Workspace ws; ws.Reserve(count + 1, 1);
 		std::vector<float> query = M2PaddedProbeFromRow(b, 0);
 		float out = -999.0f;
 
 		CHECK(KthNeighborDistance(b.view, query.data(), 0, nullptr, &out, ws) == Status::InvalidArgument);
-		CHECK(KthNeighborDistance(b.view, query.data(), count, nullptr, &out, ws) == Status::InvalidArgument);
+		CHECK_MSG(KthNeighborDistance(b.view, query.data(), count + 1, nullptr, &out, ws) == Status::InvalidArgument,
+			"k greater than the available (non-excluded) row count must reject");
 		CHECK(KthNeighborDistance(b.view, nullptr, 1, nullptr, &out, ws) == Status::InvalidArgument);
 		CHECK(KthNeighborDistance(b.view, query.data(), 1, nullptr, nullptr, ws) == Status::InvalidArgument);
 		CHECK_MSG(out == -999.0f, "a rejected KthNeighborDistance call must not write outDistance");
+
+		// k == count (no exclusions, nothing self-widened) is the top of the VALID range,
+		// not a rejection: the distance to the single farthest row is well-defined.
+		{
+			float boundaryOut = -999.0f;
+			CHECK_MSG(KthNeighborDistance(b.view, query.data(), count, nullptr, &boundaryOut, ws) == Status::Ok,
+				"k == count (no exclusions) must succeed -- not self-widening, so the top of "
+				"the valid range is the full row count");
+			CHECK_MSG(boundaryOut != -999.0f, "a successful k==count call must write outDistance");
+		}
 
 		BankView dotView = b.view;
 		dotView.metric = Metric::Dot;
@@ -15812,13 +15878,20 @@ static void TestM2TwoLimbVerdictFeat()
 	}
 
 	// --- Cosine magnitude-invariance at the VERDICT level (the sixth fracture's lesson,
-	// re-affirmed for the whole two-limb pipeline): a scalar multiple of a bank row is
-	// caught `duplicate` by limb 1 regardless of the probe's pre-normalization scale. ---
+	// re-affirmed for the whole two-limb pipeline): int8 keeps the FULL guarantee (D-V32-47:
+	// exact-integer cross/self-dot sums make a scalar multiple an exact duplicate at any
+	// scale); float32 does not, per F-M2-5/D-V32-51 (provisional, pending Dan): even
+	// constructing `c * row` is itself a rounded float32 multiplication, so the probe is not
+	// bit-exactly parallel to the row before NoveltyProbeDistance ever sees it. The float32
+	// leg therefore asserts the HONEST outcome per F-M2-5's disclosure, not the int8-only
+	// exact-zero-at-any-scale claim: c=1.0 (byte-identical) is still an exact duplicate;
+	// c != 1.0 must NOT falsely verdict duplicate, and lands familiar (a dense cluster
+	// neighbour, never novel) rather than silently wrong. ---
 	{
 		const int32_t cdims = 24;
 		std::vector<float> csrc;
 		for (int32_t i = 0; i < 40 * cdims; ++i) csrc.push_back(rng.NextFloat());
-		GBank cb(csrc, 40, cdims, Quantization::Float32, Metric::Cosine);
+		GBank cb(csrc, 40, cdims, Quantization::Int8, Metric::Cosine);
 		Workspace cws; cws.Reserve(novK + 1, 1);
 		const std::vector<float> unitRow = M2PaddedProbeFromRow(cb, 5);
 		for (float c : {0.1f, 1.0f, 3.0f, 25.0f, 1000.0f})
@@ -15827,8 +15900,52 @@ static void TestM2TwoLimbVerdictFeat()
 			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * unitRow[i];
 			const M2Verdict got = M2ComputeVerdict(cb.view, probe.data(), novK, -1, lambda, cws);
 			CHECK_MSG(got == M2Verdict::Duplicate,
-				"Cosine magnitude-invariance: scale c=%.4g of a stored row must still "
-				"verdict duplicate, got %s", static_cast<double>(c), M2VerdictName(got));
+				"Cosine magnitude-invariance (int8, the exact-guarantee path): scale c=%.4g "
+				"of a stored row must still verdict duplicate, got %s",
+				static_cast<double>(c), M2VerdictName(got));
+		}
+	}
+	{
+		const int32_t fdims = 16;
+		std::vector<float> centre(static_cast<size_t>(fdims));
+		for (int32_t d = 0; d < fdims; ++d) centre[static_cast<size_t>(d)] = 1.0f + 0.1f * static_cast<float>(d);
+		std::vector<float> fsrc;
+		PushBlob(fsrc, fdims, centre, 30, rng, 0.02f); // a tight dense cluster
+		GBank fb(fsrc, 30, fdims, Quantization::Float32, Metric::Cosine);
+		Workspace fws; fws.Reserve(novK + 1, 1);
+		const std::vector<float> unitRow = M2PaddedProbeFromRow(fb, 5);
+
+		{
+			// c == 1.0: byte-identical -- unconditionally exact (cross == aSq == bSq).
+			std::vector<float> probe = unitRow;
+			const M2Verdict got = M2ComputeVerdict(fb.view, probe.data(), novK, -1, lambda, fws);
+			CHECK_MSG(got == M2Verdict::Duplicate,
+				"Cosine float32 whole-row, c=1.0 (byte-identical): must verdict duplicate, "
+				"got %s", M2VerdictName(got));
+		}
+		// F-M2-6 (executed finding, 2026-07-19): only the NEGATIVE claim is asserted here.
+		// c=0.1 was hand-tried as the positive "must land familiar" claim and produced
+		// `novel` instead -- root-caused to KthNeighborDistance riding the standard Query()
+		// Cosine path, a documented PLAIN DOT PRODUCT (types.h: "Cosine banks store
+		// pre-normalized rows, so query-time scoring is a plain dot product"), not
+		// magnitude-normalized. Scaling the probe DOWN shrinks every raw-dot similarity
+		// against the bank proportionally, pushing RankDistance (`1 - score`) UP toward 1
+		// regardless of true direction, which can cross lambda and misread a genuine
+		// near-duplicate as novel. NoveltyProbeDistance (limb 1) is unaffected -- its
+		// formula explicitly cancels scale -- but limb 2's OWN magnitude sensitivity for
+		// probes limb 1 does NOT catch (true duplicates it does catch, unconditionally) is a
+		// real, newly-observed property, not covered by any ratified decision, and not
+		// something this suite invents an outcome for. Routed as its own finding (see the
+		// test-design artifact) rather than asserted here as if it were specified.
+		for (float c : {0.1f, 3.0f, 25.0f, 1000.0f})
+		{
+			std::vector<float> probe(unitRow.size());
+			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * unitRow[i];
+			const M2Verdict got = M2ComputeVerdict(fb.view, probe.data(), novK, -1, lambda, fws);
+			CHECK_MSG(got != M2Verdict::Duplicate,
+				"Cosine float32 whole-row, c=%.4g: F-M2-5's disclosed limit means this must "
+				"NOT claim an exactness float32 arithmetic can't deliver, got %s",
+				static_cast<double>(c), M2VerdictName(got));
 		}
 	}
 
