@@ -8,7 +8,8 @@
 // epsilon boundary check rather than exact rank equality.
 
 #include "superfaiss/superfaiss.h"
-#include "superfaiss/graph.h" // V3.2 M1 (Bank Inspector I)
+#include "superfaiss/graph.h"   // V3.2 M1 (Bank Inspector I)
+#include "superfaiss/novelty.h" // V3.2 M2
 
 #include "xd_fixtures.h"
 
@@ -14892,6 +14893,61 @@ static void TestM1StructureFeat()
 	}
 }
 
+// ===========================================================================
+// V3.2 red suite (Curie) — module M2 novelty.h. NoveltyScore only (its contract
+// is fully pinned by §25.4 and is independent of F-M2-1); the probe, baseline,
+// and two-limb verdict land after the F-M2-1 exact-distance-entry decision.
+// RED SCAFFOLD: src/novelty.cpp returns Ok and writes nothing.
+// ===========================================================================
+
+// M2 / dim 2 + dim 6 + dim 10 — NoveltyScore is the empirical-CDF rank: the fraction of
+// the sorted baseline STRICTLY LESS THAN the probe distance (ties resolve to the lowest
+// rank), normalized to [0,1]. Oracle is hand-computed from the definition (strike-9's
+// executed NoveltyScore); rejection on count<1 / null buffers.
+static void TestM2NoveltyScore()
+{
+	// Rejection (dim 2): count < 1 and null buffers -> InvalidArgument, no write.
+	{
+		const float base[] = {1.0f, 2.0f, 3.0f};
+		float out = -999.0f;
+		CHECK_MSG(NoveltyScore(base, 0, 1.5f, &out) == Status::InvalidArgument, "NoveltyScore count=0 must reject");
+		CHECK_MSG(NoveltyScore(nullptr, 3, 1.5f, &out) == Status::InvalidArgument, "NoveltyScore null baseline must reject");
+		CHECK_MSG(NoveltyScore(base, 3, 1.5f, nullptr) == Status::InvalidArgument, "NoveltyScore null out must reject");
+		CHECK_MSG(out == -999.0f, "rejected NoveltyScore must not write output");
+	}
+	// Correctness + ties-low + normalization. baseline sorted ascending; rank = (# strictly
+	// less) / count. Ties (distance == a baseline entry) count only the strictly-less side.
+	{
+		const float base[] = {1.0f, 2.0f, 2.0f, 3.0f, 5.0f, 8.0f}; // count 6
+		struct Case { float distance; float expect; const char* why; };
+		const Case cases[] = {
+			{0.0f, 0.0f, "below all -> 0"},
+			{2.0f, 1.0f / 6.0f, "tie with the 2.0 pair -> lowest rank (only 1.0 is strictly less)"},
+			{2.5f, 3.0f / 6.0f, "strictly above 1,2,2 -> 3/6"},
+			{4.0f, 4.0f / 6.0f, "strictly above 1,2,2,3 -> 4/6"},
+			{8.0f, 5.0f / 6.0f, "tie with max -> lowest rank (5 strictly less)"},
+			{10.0f, 1.0f, "above all -> 1"},
+		};
+		for (const Case& c : cases)
+		{
+			float out = -999.0f;
+			CHECK_MSG(NoveltyScore(base, 6, c.distance, &out) == Status::Ok, "NoveltyScore must succeed");
+			CHECK_MSG(std::fabs(out - c.expect) < 1e-6f,
+				"NoveltyScore(d=%.2f)=%.6f expected %.6f (%s)", c.distance, out, c.expect, c.why);
+			CHECK_MSG(out >= 0.0f && out <= 1.0f, "NoveltyScore must lie in [0,1]");
+		}
+	}
+	// Single-entry baseline (degenerate): probe below -> 0, tie/above -> handled per definition.
+	{
+		const float base[] = {5.0f};
+		float out = -999.0f;
+		CHECK(NoveltyScore(base, 1, 4.0f, &out) == Status::Ok);
+		CHECK_MSG(std::fabs(out - 0.0f) < 1e-6f, "single-entry baseline, probe below -> 0, got %.6f", out);
+		CHECK(NoveltyScore(base, 1, 6.0f, &out) == Status::Ok);
+		CHECK_MSG(std::fabs(out - 1.0f) < 1e-6f, "single-entry baseline, probe above -> 1, got %.6f", out);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -15012,6 +15068,7 @@ int main()
 	TestM1RepeatAndCanonicalId();
 	TestM1WarmWorkspaceGrowShrink();
 	TestM1StructureFeat();
+	TestM2NoveltyScore();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
