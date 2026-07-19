@@ -15,3 +15,8 @@
 #include "analytics.h"
 #include "pca.h"
 #include "scratch.h"
+
+// V3.2 Bank Inspector I, Tier 1 (plan section 25.4).
+#include "graph.h"
+#include "novelty.h"
+#include "matching.h"
