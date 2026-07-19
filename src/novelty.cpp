@@ -188,17 +188,21 @@ Status KthNeighborDistance(
 		return Status::InvalidArgument;
 	}
 
-	if (!workspace.Reserve(k, 1))
+	// Query's own outHits is a caller-owned buffer, not workspace.HeapStorage() (Query's
+	// internal Reserve()/HeapStorage() calls are its own scan scratch, sized by its own
+	// scanK and resized mid-call — a caller cannot safely alias them). ReserveBatchOutput
+	// is workspace's dedicated, growth-tracked block for exactly this (S1 close).
+	if (!workspace.ReserveBatchOutput(k, 1))
 	{
 		return Status::OutOfMemory;
 	}
-	std::vector<Hit> hits(static_cast<size_t>(k));
+	Hit* hits = workspace.BatchOutputHits();
 	QueryParams params;
 	params.k = k;
 	params.excludeBits = excludeBits;
 
 	int32_t hitCount = 0;
-	const Status s = Query(bank, query, params, workspace, hits.data(), &hitCount);
+	const Status s = Query(bank, query, params, workspace, hits, &hitCount);
 	if (s != Status::Ok)
 	{
 		return s;
@@ -248,11 +252,16 @@ Status CalibrateNoveltyBaseline(
 	// Caller-owned outHits, matching every QueryBatch call site in this codebase:
 	// workspace's HeapStorage slots are QueryBatch's own per-sub-batch scratch, reused and
 	// overwritten across sub-batches, never a stable place for a caller's persistent output.
-	std::vector<Hit> allHits(static_cast<size_t>(count) * static_cast<size_t>(internalK));
-	std::vector<int32_t> hitCounts(static_cast<size_t>(count));
+	// ReserveBatchOutput is workspace's own dedicated, growth-tracked block (S1 close).
+	if (!workspace.ReserveBatchOutput(internalK, count))
+	{
+		return Status::OutOfMemory;
+	}
+	Hit* allHits = workspace.BatchOutputHits();
+	int32_t* hitCounts = workspace.BatchOutputCounts();
 	QueryParams params;
 	params.k = internalK;
-	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits.data(), hitCounts.data());
+	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits, hitCounts);
 	if (s != Status::Ok)
 	{
 		return s;
@@ -260,7 +269,7 @@ Status CalibrateNoveltyBaseline(
 
 	for (int32_t r = 0; r < count; ++r)
 	{
-		const Hit* rowHits = allHits.data() + static_cast<int64_t>(r) * internalK;
+		const Hit* rowHits = allHits + static_cast<int64_t>(r) * internalK;
 		const int32_t hitCount = hitCounts[static_cast<size_t>(r)];
 		int32_t seen = 0;
 		bool found = false;

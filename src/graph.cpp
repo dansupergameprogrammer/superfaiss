@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <vector>
 
 namespace superfaiss
 {
@@ -105,13 +104,18 @@ Status BuildKnnNeighbors(
 	// call site in this codebase (analytics.cpp, the existing test suite): `workspace`'s
 	// HeapStorage slots are QueryBatch's OWN internal per-sub-batch scratch, reused and
 	// overwritten across sub-batches — not a place a caller can safely park its persistent
-	// output.
-	std::vector<Hit> allHits(static_cast<size_t>(count) * static_cast<size_t>(internalK));
-	std::vector<int32_t> hitCounts(static_cast<size_t>(count));
+	// output. `ReserveBatchOutput` is workspace's OWN dedicated, growth-tracked block for
+	// exactly this (S1 close — no per-call std::vector, no un-seamed heap traffic).
+	if (!workspace.ReserveBatchOutput(internalK, count))
+	{
+		return Status::OutOfMemory;
+	}
+	Hit* allHits = workspace.BatchOutputHits();
+	int32_t* hitCounts = workspace.BatchOutputCounts();
 
 	QueryParams params;
 	params.k = internalK;
-	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits.data(), hitCounts.data());
+	const Status s = QueryBatch(bank, queryBase, count, params, workspace, allHits, hitCounts);
 	if (s != Status::Ok)
 	{
 		return s;
@@ -119,7 +123,7 @@ Status BuildKnnNeighbors(
 
 	for (int32_t r = 0; r < count; ++r)
 	{
-		const Hit* rowHits = allHits.data() + static_cast<int64_t>(r) * internalK;
+		const Hit* rowHits = allHits + static_cast<int64_t>(r) * internalK;
 		const int32_t hitCount = hitCounts[static_cast<size_t>(r)];
 		int32_t* outRow = outNeighbors + static_cast<int64_t>(r) * k;
 		int32_t written = 0;

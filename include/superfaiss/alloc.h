@@ -81,6 +81,29 @@ public:
 	// Number of times Reserve() actually grew the buffer. Flat across warm queries.
 	uint64_t GrowthCount() const { return GrowthCount_; }
 
+	// Caller-owned batch QUERY-OUTPUT scratch (V3.2 S1 close: Claude/Poirot/afabc08-graph-h-
+	// m1-review.md, 15a0668-s1s2s3-fix-verify.md, 524b373-matching-m3-review.md). DISTINCT
+	// from HeapStorage() above: Query/QueryBatch use HeapStorage() as THEIR OWN internal
+	// per-sub-batch scan scratch via their own Reserve() calls, resized and overwritten
+	// mid-call — a caller cannot safely park its own persistent QueryBatch outHits/outCounts
+	// there. A caller that wants that result to live in workspace-tracked memory instead of a
+	// per-call std::vector reserves its own block here, sized to its own queryCount*k /
+	// queryCount. Two independent SLOTS (0/1, default 0): graph.h/novelty.h use one call's
+	// worth of output at a time (slot 0), but matching.h's two-pass mutual match needs
+	// pass 1's and pass 2's results alive SIMULTANEOUSLY (the assembly loop reads both) —
+	// slot 0 for pass 1, slot 1 for pass 2, so the second reservation cannot alias/clobber
+	// the first. Same growth accounting as Reserve().
+	bool ReserveBatchOutput(int32_t k, int32_t queryCount, int32_t slot = 0);
+	Hit* BatchOutputHits(int32_t slot = 0);
+	int32_t* BatchOutputCounts(int32_t slot = 0);
+
+	// General int32 index scratch (V3.2 S1 close): matching.h's candidate-dedup working
+	// arrays (candidateOfSample and its sorted/uniqued copy distinctCandidates) need two
+	// independent, simultaneously-alive int32 buffers of caller-chosen size, the same shape
+	// as BatchOutput's two slots. Same growth accounting as Reserve().
+	bool ReserveIndexScratch(int32_t count, int32_t slot = 0);
+	int32_t* IndexScratch(int32_t slot = 0);
+
 private:
 	Allocator Allocator_ = DefaultAllocator();
 	Hit* Storage_ = nullptr;
@@ -94,6 +117,12 @@ private:
 	int8_t* XdQ8_ = nullptr;      // count x paddedDims int8, then count doubles, then count int64s
 	int32_t XdDims_ = 0;
 	int32_t XdCount_ = 0;
+	Hit* OutputHits_[2] = {nullptr, nullptr};
+	int32_t* OutputCounts_[2] = {nullptr, nullptr};
+	int32_t OutputK_[2] = {0, 0};
+	int32_t OutputCount_[2] = {0, 0};
+	int32_t* IndexScratch_[2] = {nullptr, nullptr};
+	int32_t IndexScratchCount_[2] = {0, 0};
 	uint64_t GrowthCount_ = 0;
 };
 

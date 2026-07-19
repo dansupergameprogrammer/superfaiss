@@ -70,6 +70,12 @@ Workspace::~Workspace()
 	detail::SeamFree(Allocator_, QueryScratch_);
 	detail::SeamFree(Allocator_, BiasBits_);
 	detail::SeamFree(Allocator_, XdQ8_);
+	detail::SeamFree(Allocator_, OutputHits_[0]);
+	detail::SeamFree(Allocator_, OutputCounts_[0]);
+	detail::SeamFree(Allocator_, OutputHits_[1]);
+	detail::SeamFree(Allocator_, OutputCounts_[1]);
+	detail::SeamFree(Allocator_, IndexScratch_[0]);
+	detail::SeamFree(Allocator_, IndexScratch_[1]);
 }
 
 bool Workspace::ReserveXdQuery(int32_t paddedDims, int32_t count)
@@ -224,6 +230,82 @@ bool Workspace::Reserve(int32_t k, int32_t batchWidth)
 Hit* Workspace::HeapStorage(int32_t queryIndex)
 {
 	return Storage_ + static_cast<size_t>(queryIndex) * ReservedK_;
+}
+
+bool Workspace::ReserveBatchOutput(int32_t k, int32_t queryCount, int32_t slot)
+{
+	if (k < 1 || queryCount < 1 || slot < 0 || slot > 1)
+	{
+		return false;
+	}
+	if (k <= OutputK_[slot] && queryCount <= OutputCount_[slot])
+	{
+		return true;
+	}
+	const int32_t newK = k > OutputK_[slot] ? k : OutputK_[slot];
+	const int32_t newCount = queryCount > OutputCount_[slot] ? queryCount : OutputCount_[slot];
+
+	const size_t hitBytes = static_cast<size_t>(newK) * newCount * sizeof(Hit);
+	Hit* grownHits = static_cast<Hit*>(detail::SeamAlloc(
+		Allocator_, hitBytes ? hitBytes : sizeof(Hit), alignof(Hit) > 16 ? alignof(Hit) : 16));
+	if (grownHits == nullptr)
+	{
+		return false;
+	}
+	int32_t* grownCounts = static_cast<int32_t*>(
+		detail::SeamAlloc(Allocator_, static_cast<size_t>(newCount) * sizeof(int32_t), 16));
+	if (grownCounts == nullptr)
+	{
+		detail::SeamFree(Allocator_, grownHits);
+		return false;
+	}
+
+	detail::SeamFree(Allocator_, OutputHits_[slot]);
+	detail::SeamFree(Allocator_, OutputCounts_[slot]);
+	OutputHits_[slot] = grownHits;
+	OutputCounts_[slot] = grownCounts;
+	OutputK_[slot] = newK;
+	OutputCount_[slot] = newCount;
+	++GrowthCount_;
+	return true;
+}
+
+Hit* Workspace::BatchOutputHits(int32_t slot)
+{
+	return OutputHits_[slot];
+}
+
+int32_t* Workspace::BatchOutputCounts(int32_t slot)
+{
+	return OutputCounts_[slot];
+}
+
+bool Workspace::ReserveIndexScratch(int32_t count, int32_t slot)
+{
+	if (count < 1 || slot < 0 || slot > 1)
+	{
+		return false;
+	}
+	if (count <= IndexScratchCount_[slot])
+	{
+		return true;
+	}
+	int32_t* grown = static_cast<int32_t*>(
+		detail::SeamAlloc(Allocator_, static_cast<size_t>(count) * sizeof(int32_t), 16));
+	if (grown == nullptr)
+	{
+		return false;
+	}
+	detail::SeamFree(Allocator_, IndexScratch_[slot]);
+	IndexScratch_[slot] = grown;
+	IndexScratchCount_[slot] = count;
+	++GrowthCount_;
+	return true;
+}
+
+int32_t* Workspace::IndexScratch(int32_t slot)
+{
+	return IndexScratch_[slot];
 }
 
 } // namespace superfaiss

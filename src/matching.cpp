@@ -9,60 +9,29 @@
 // fullViewA (no third pass — both r-terms and the margin compute entirely from these two
 // retrievals, T4-S2). sampleViewA/fullViewB/fullViewA may differ in quantization (E-D1-3),
 // so their paddedDims can differ at equal logical dims — every cross-bank query decode
-// below zero-pads to the TARGET bank's own paddedDims, never assumes the source's.
+// below calls the shared DequantizeRowAsQuery with an explicit targetPaddedDims, never
+// assumes the source's own paddedDims (S4 close, Claude/Poirot/524b373-matching-m3-
+// review.md — this module no longer carries a private decode duplicate).
 //
-// KNOWN, ACCEPTED (Poirot S1, casebooks afabc08-graph-h-m1-review.md /
-// 15a0668-s1s2s3-fix-verify.md): QueryBatch's outHits is an ordinary call-scoped
-// std::vector here, not workspace-tracked — the same S1-class untracked allocation
-// already standing against graph.h/novelty.h's identical pattern, kept for
-// consistency until S1 is resolved for all three modules together. (The 2026-07-19
-// heap-corruption crash that stalled this module was root-caused to a caller-array
-// overrun in one test cell, not to this file — casebook
-// b4e139e-m3-heap-corruption-root-cause.md.)
+// S1 CLOSED (2026-07-19, Claude/Poirot/524b373-matching-m3-review.md O1 — "ripe for the
+// all-three close"): both passes' outHits/outCounts route through Workspace's
+// ReserveBatchOutput (slot 0 / slot 1, since pass 1's and pass 2's results must stay alive
+// simultaneously for the assembly loop below), not a per-call std::vector — the same fix
+// applied to graph.h/novelty.h in this same change. (The 2026-07-19 heap-corruption crash
+// that separately stalled this module was root-caused to a caller-array overrun in one
+// test cell, not to this file — casebook b4e139e-m3-heap-corruption-root-cause.md.)
 
 #include "superfaiss/matching.h"
 
+#include "superfaiss/inspector_common.h" // DequantizeRowAsQuery
 #include "superfaiss/query.h"
 
 #include <algorithm>
-#include <vector>
 
 namespace superfaiss
 {
 namespace
 {
-
-// Decodes `source` row `row` into a query sized for `targetPaddedDims` — a possibly
-// DIFFERENT bank's own paddedDims (matching.h crosses views that may differ in
-// quantization). Zeros the whole buffer first, then fills the real [0, dims) elements;
-// correct regardless of which paddedDims is wider (the shared DequantizeRowAsQuery in
-// graph.h/novelty.h assumes source and target share one bank's paddedDims, which never
-// holds across a mutual-match's two distinct banks).
-void DequantizeRowForTarget(const BankView& source, int32_t row, int32_t targetPaddedDims, float* out)
-{
-	for (int32_t d = 0; d < targetPaddedDims; ++d)
-	{
-		out[d] = 0.0f;
-	}
-	const int32_t dims = source.dims;
-	if (source.quant == Quantization::Int8)
-	{
-		const int8_t* r = static_cast<const int8_t*>(source.rows) + static_cast<int64_t>(row) * source.paddedDims;
-		const float scale = source.scales[row];
-		for (int32_t d = 0; d < dims; ++d)
-		{
-			out[d] = static_cast<float>(r[d]) * scale;
-		}
-	}
-	else
-	{
-		const float* r = static_cast<const float*>(source.rows) + static_cast<int64_t>(row) * source.paddedDims;
-		for (int32_t d = 0; d < dims; ++d)
-		{
-			out[d] = r[d];
-		}
-	}
-}
 
 int32_t CountNonExcluded(const BankView& bank, const uint32_t* excludeBits)
 {
@@ -130,15 +99,22 @@ Status MutualNearestMatches(
 	float* pass1Base = workspace.QueryScratch(0);
 	for (int32_t i = 0; i < sampleCount; ++i)
 	{
-		DequantizeRowForTarget(sampleViewA, i, fullViewB.paddedDims, pass1Base + static_cast<int64_t>(i) * fullViewB.paddedDims);
+		DequantizeRowAsQuery(sampleViewA, i, pass1Base + static_cast<int64_t>(i) * fullViewB.paddedDims, fullViewB.paddedDims);
 	}
 
-	std::vector<Hit> pass1Hits(static_cast<size_t>(sampleCount) * static_cast<size_t>(matchK));
-	std::vector<int32_t> pass1Counts(static_cast<size_t>(sampleCount));
+	// Caller-owned outHits (not workspace.HeapStorage() — QueryBatch's own internal scan
+	// scratch, resized mid-call). Slot 0: pass 1's result must stay alive alongside pass 2's
+	// (the assembly loop below reads both), so each pass gets its own ReserveBatchOutput slot.
+	if (!workspace.ReserveBatchOutput(matchK, sampleCount, 0))
+	{
+		return Status::OutOfMemory;
+	}
+	Hit* pass1Hits = workspace.BatchOutputHits(0);
+	int32_t* pass1Counts = workspace.BatchOutputCounts(0);
 	QueryParams paramsB;
 	paramsB.k = matchK;
 	paramsB.excludeBits = excludeBitsB;
-	Status s = QueryBatch(fullViewB, pass1Base, sampleCount, paramsB, workspace, pass1Hits.data(), pass1Counts.data());
+	Status s = QueryBatch(fullViewB, pass1Base, sampleCount, paramsB, workspace, pass1Hits, pass1Counts);
 	if (s != Status::Ok)
 	{
 		return s;
@@ -147,26 +123,37 @@ Status MutualNearestMatches(
 	// Collect the DISTINCT candidate B rows pass 1 surfaced (top-1 of each sample row's
 	// retrieval) — the dedup the contract's own "no third pass" text implies: multiple
 	// sample rows can share the same forward candidate, and it is back-verified once.
-	std::vector<int32_t> candidateOfSample(static_cast<size_t>(sampleCount), -1);
-	std::vector<int32_t> distinctCandidates;
+	// Two workspace-tracked index-scratch slots (S1 close): slot 0 holds candidateOfSample
+	// (one entry per sample row, read throughout the assembly loop below); slot 1 holds a
+	// working copy that gets sorted/uniqued down to the distinct set in place, tracked by
+	// distinctCount rather than a container resize.
+	if (!workspace.ReserveIndexScratch(sampleCount, 0) || !workspace.ReserveIndexScratch(sampleCount, 1))
+	{
+		return Status::OutOfMemory;
+	}
+	int32_t* candidateOfSample = workspace.IndexScratch(0);
 	for (int32_t i = 0; i < sampleCount; ++i)
 	{
-		if (pass1Counts[static_cast<size_t>(i)] > 0)
-		{
-			candidateOfSample[static_cast<size_t>(i)] = pass1Hits[static_cast<size_t>(i) * matchK].index;
-		}
+		candidateOfSample[i] = (pass1Counts[static_cast<size_t>(i)] > 0)
+			? pass1Hits[static_cast<size_t>(i) * matchK].index
+			: -1;
 	}
-	distinctCandidates = candidateOfSample;
-	std::sort(distinctCandidates.begin(), distinctCandidates.end());
-	distinctCandidates.erase(std::remove(distinctCandidates.begin(), distinctCandidates.end(), -1), distinctCandidates.end());
-	distinctCandidates.erase(std::unique(distinctCandidates.begin(), distinctCandidates.end()), distinctCandidates.end());
+	int32_t* distinctCandidates = workspace.IndexScratch(1);
+	std::copy(candidateOfSample, candidateOfSample + sampleCount, distinctCandidates);
+	std::sort(distinctCandidates, distinctCandidates + sampleCount);
+	int32_t* distinctEnd = std::remove(distinctCandidates, distinctCandidates + sampleCount, -1);
+	distinctEnd = std::unique(distinctCandidates, distinctEnd);
 
 	// Pass 2: batch the distinct candidates (decoded from fullViewB, sized for fullViewA's
 	// own paddedDims) against fullViewA. Re-purposes the SAME tracked query scratch — pass
 	// 1's buffer is no longer needed once its QueryBatch call has returned.
-	const int32_t distinctCount = static_cast<int32_t>(distinctCandidates.size());
-	std::vector<Hit> pass2Hits;
-	std::vector<int32_t> pass2Counts;
+	const int32_t distinctCount = static_cast<int32_t>(distinctEnd - distinctCandidates);
+	// Slot 1: pass 2's own output, distinct from pass 1's slot 0 above — both must stay
+	// alive together for the assembly loop below. Left null when distinctCount == 0
+	// (candidateOfSample is then all -1, so the assembly loop's candidateB < 0 guard
+	// always continues before either pointer would be dereferenced).
+	Hit* pass2Hits = nullptr;
+	int32_t* pass2Counts = nullptr;
 	if (distinctCount > 0)
 	{
 		if (!workspace.ReserveQueryScratch(fullViewA.paddedDims, distinctCount))
@@ -176,15 +163,19 @@ Status MutualNearestMatches(
 		float* pass2Base = workspace.QueryScratch(0);
 		for (int32_t c = 0; c < distinctCount; ++c)
 		{
-			DequantizeRowForTarget(fullViewB, distinctCandidates[static_cast<size_t>(c)], fullViewA.paddedDims,
-				pass2Base + static_cast<int64_t>(c) * fullViewA.paddedDims);
+			DequantizeRowAsQuery(fullViewB, distinctCandidates[static_cast<size_t>(c)],
+				pass2Base + static_cast<int64_t>(c) * fullViewA.paddedDims, fullViewA.paddedDims);
 		}
-		pass2Hits.resize(static_cast<size_t>(distinctCount) * static_cast<size_t>(matchK));
-		pass2Counts.resize(static_cast<size_t>(distinctCount));
+		if (!workspace.ReserveBatchOutput(matchK, distinctCount, 1))
+		{
+			return Status::OutOfMemory;
+		}
+		pass2Hits = workspace.BatchOutputHits(1);
+		pass2Counts = workspace.BatchOutputCounts(1);
 		QueryParams paramsA;
 		paramsA.k = matchK;
 		paramsA.excludeBits = excludeBitsA;
-		s = QueryBatch(fullViewA, pass2Base, distinctCount, paramsA, workspace, pass2Hits.data(), pass2Counts.data());
+		s = QueryBatch(fullViewA, pass2Base, distinctCount, paramsA, workspace, pass2Hits, pass2Counts);
 		if (s != Status::Ok)
 		{
 			return s;
@@ -204,8 +195,8 @@ Status MutualNearestMatches(
 		{
 			continue; // pass 1 found no scorable neighbor at all
 		}
-		const auto it = std::lower_bound(distinctCandidates.begin(), distinctCandidates.end(), candidateB);
-		const int32_t c = static_cast<int32_t>(it - distinctCandidates.begin());
+		const int32_t* it = std::lower_bound(distinctCandidates, distinctCandidates + distinctCount, candidateB);
+		const int32_t c = static_cast<int32_t>(it - distinctCandidates);
 		const int32_t pass2Count = pass2Counts[static_cast<size_t>(c)];
 		if (pass2Count == 0)
 		{
@@ -220,7 +211,7 @@ Status MutualNearestMatches(
 		// r_B: mean Sim of pass 1's top-matchK for this sample row.
 		double rB = 0.0;
 		const int32_t pass1Count = pass1Counts[static_cast<size_t>(i)];
-		const Hit* pass1Row = pass1Hits.data() + static_cast<int64_t>(i) * matchK;
+		const Hit* pass1Row = pass1Hits + static_cast<int64_t>(i) * matchK;
 		for (int32_t j = 0; j < pass1Count; ++j)
 		{
 			rB += Sim(metric, pass1Row[j].score);
@@ -229,7 +220,7 @@ Status MutualNearestMatches(
 
 		// r_A: mean Sim of pass 2's top-matchK for this candidate.
 		double rA = 0.0;
-		const Hit* pass2Row = pass2Hits.data() + static_cast<int64_t>(c) * matchK;
+		const Hit* pass2Row = pass2Hits + static_cast<int64_t>(c) * matchK;
 		for (int32_t j = 0; j < pass2Count; ++j)
 		{
 			rA += Sim(metric, pass2Row[j].score);
