@@ -14948,6 +14948,948 @@ static void TestM2NoveltyScore()
 	}
 }
 
+// ===========================================================================
+// V3.2 red suite (Curie) continued — M2 novelty.h: NoveltyProbeDistance (F-M2-1 /
+// D-V32-50, Dan's call, option A), KthNeighborDistance, CalibrateNoveltyBaseline, and the
+// two-limb tri-state verdict FEAT (D-V32-31/47, the crux). RED SCAFFOLD: the three new
+// novelty.cpp bodies return Ok and write nothing.
+// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+//
+// Oracle discipline (the D-V32 strike loop, "build don't reason"), applied per F-M2-1's
+// mandate: NoveltyProbeDistance's oracle (M2OracleProbeDistance) reproduces the SAME
+// per-(metric,scope,quant) dispatch the entry's contract pins, built from REAL shipped
+// kernel primitives (QuantizeQueryXd, detail::DotI8I8, detail::FloatBitsToDouble) that are
+// proven elsewhere and are never the entry under test — oracle == entry by execution, one
+// verified number rather than two hopefully-agreeing ones (the strike-14 discipline). The
+// strike 10/11/12/13/14 constructed geometries are ported verbatim as fixtures.
+// ===========================================================================
+
+namespace
+{
+	// The cross-device subnormal floor, own recode of analytics.cpp's XdFloor:
+	// |x| < FLT_MIN -> exactly 0.0f, on every machine.
+	float M2XdFloor(double score)
+	{
+		const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly
+		if (score < lim && score > -lim)
+		{
+			return 0.0f;
+		}
+		return static_cast<float>(score);
+	}
+
+	struct M2ProbeResult
+	{
+		Status status;
+		float distance;
+	};
+
+	// Independent oracle for NoveltyProbeDistance (F-M2-1/D-V32-47/48/50): the SAME
+	// per-(metric,scope,quant) dispatch novelty.h's contract pins, built from real shipped
+	// kernel primitives — never calls NoveltyProbeDistance itself. `channel == -1` is
+	// whole-row.
+	M2ProbeResult M2OracleProbeDistance(const BankView& bank, const float* probe,
+		int32_t storedRow, int32_t channel)
+	{
+		if (bank.count < 1 || storedRow < 0 || storedRow >= bank.count || probe == nullptr)
+		{
+			return {Status::InvalidArgument, -999.0f};
+		}
+		if (channel != -1 &&
+			(bank.channels == nullptr || channel < 0 || channel >= bank.channelCount))
+		{
+			return {Status::InvalidArgument, -999.0f};
+		}
+		if (bank.metric == Metric::Dot)
+		{
+			return {Status::InvalidArgument, -999.0f};
+		}
+
+		const int32_t pd = bank.paddedDims;
+		const int32_t offset = channel == -1 ? 0 : bank.channels[channel].offset;
+		const int32_t length = channel == -1 ? pd : bank.channels[channel].length;
+		const bool isCosine = bank.metric == Metric::Cosine;
+
+		if (bank.quant == Quantization::Int8)
+		{
+			std::vector<int8_t> q8Probe(static_cast<size_t>(pd));
+			double probeScale = 0.0;
+			int64_t probeFullSq = 0;
+			QuantizeQueryXd(probe, pd, q8Probe.data(), &probeScale, &probeFullSq);
+			const int8_t* rowFull = static_cast<const int8_t*>(bank.rows) +
+				static_cast<int64_t>(storedRow) * pd;
+			const double rowScale = detail::FloatBitsToDouble(bank.scales[storedRow]);
+			const int8_t* probeSlice = q8Probe.data() + offset;
+			const int8_t* rowSlice = rowFull + offset;
+			const int64_t probeSq = detail::DotI8I8(probeSlice, probeSlice, length);
+			const int64_t rowSq = detail::DotI8I8(rowSlice, rowSlice, length);
+			const int64_t cross = detail::DotI8I8(probeSlice, rowSlice, length);
+			if (isCosine && (probeSq == 0 || rowSq == 0))
+			{
+				return {Status::ZeroNormQuery, -999.0f};
+			}
+			if (isCosine)
+			{
+				const double denom =
+					std::sqrt(static_cast<double>(probeSq) * static_cast<double>(rowSq));
+				return {Status::Ok, M2XdFloor(1.0 - static_cast<double>(cross) / denom)};
+			}
+			const double a = (probeScale * probeScale) * static_cast<double>(probeSq);
+			const double bb = (rowScale * rowScale) * static_cast<double>(rowSq);
+			const double cc = ((probeScale * rowScale) * static_cast<double>(cross)) * 2.0;
+			return {Status::Ok, M2XdFloor((a + bb) - cc)};
+		}
+
+		const float* rowFull =
+			static_cast<const float*>(bank.rows) + static_cast<int64_t>(storedRow) * pd;
+		double probeSq = 0.0, rowSq = 0.0, cross = 0.0, l2 = 0.0;
+		for (int32_t i = 0; i < length; ++i)
+		{
+			const double p = static_cast<double>(probe[offset + i]);
+			const double r = static_cast<double>(rowFull[offset + i]);
+			probeSq += p * p;
+			rowSq += r * r;
+			cross += p * r;
+			const double d = p - r;
+			l2 += d * d;
+		}
+		if (isCosine && (probeSq == 0.0 || rowSq == 0.0))
+		{
+			return {Status::ZeroNormQuery, -999.0f};
+		}
+		if (isCosine)
+		{
+			return {Status::Ok, M2XdFloor(1.0 - cross / std::sqrt(probeSq * rowSq))};
+		}
+		return {Status::Ok, M2XdFloor(l2)};
+	}
+
+	// A GBank plus an attached channel table (metadata only — the row bytes/scales are
+	// GBank's own whole-row bake, exactly matching production: whole-row normalize/quantize
+	// happens at bake time; the channel table is separate metadata over the same bytes).
+	struct GChannelBank
+	{
+		GBank bank;
+		std::vector<ChannelInfo> channels;
+		GChannelBank(const std::vector<float>& src, int32_t count, int32_t dims,
+			Quantization quant, Metric metric, std::vector<ChannelInfo> ch)
+			: bank(src, count, dims, quant, metric), channels(std::move(ch))
+		{
+			bank.view.channels = channels.data();
+			bank.view.channelCount = static_cast<int32_t>(channels.size());
+		}
+	};
+
+	// paddedDims-length, zero-padded float probe reproducing GBank row `row`'s DEQUANTIZED
+	// (or bake-normalized) value exactly — a byte-identical duplicate probe by construction.
+	std::vector<float> M2PaddedProbeFromRow(const GBank& b, int32_t row)
+	{
+		std::vector<float> out(static_cast<size_t>(b.view.paddedDims), 0.0f);
+		const int32_t dims = b.view.dims;
+		for (int32_t i = 0; i < dims; ++i)
+		{
+			out[static_cast<size_t>(i)] =
+				static_cast<float>(b.refRows[static_cast<size_t>(row) * dims + i]);
+		}
+		return out;
+	}
+
+	// paddedDims-length float probe from an explicit dims-length source vector, zero-padded.
+	std::vector<float> M2PaddedProbe(const std::vector<float>& src, int32_t dims, int32_t paddedDims)
+	{
+		std::vector<float> out(static_cast<size_t>(paddedDims), 0.0f);
+		for (int32_t i = 0; i < dims; ++i)
+		{
+			out[static_cast<size_t>(i)] = src[static_cast<size_t>(i)];
+		}
+		return out;
+	}
+
+	// Double-precision score of `query` (a dims-or-more-length float array, read [0,dims))
+	// against row r of `b`, in the bank's own metric's SIMILARITY sense (RefBetter's
+	// convention: for L2 lower is nearer; for Dot/Cosine higher is nearer) — the same
+	// "score" a real Query() call would report pre-RankDistance-conversion.
+	double M2RefScore(const GBank& b, const float* query, int32_t r)
+	{
+		const int32_t dims = b.view.dims;
+		const double* row = &b.refRows[static_cast<size_t>(r) * dims];
+		double score = 0.0;
+		if (b.view.metric == Metric::L2)
+		{
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				const double d = static_cast<double>(query[i]) - row[i];
+				score += d * d;
+			}
+		}
+		else
+		{
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				score += static_cast<double>(query[i]) * row[i];
+			}
+		}
+		return score;
+	}
+
+	// Brute-force k-th-NN RankDistance of `query` against `b`, excluding the rows listed in
+	// `excludeRows`. L2 -> the k-th smallest squared distance (already a RankDistance);
+	// Cosine -> 1 - the k-th LARGEST cosine similarity (RankDistance applied AFTER ranking
+	// by similarity — D-V32-19's pinned order). Never called on a Dot bank (verdict-domain
+	// only).
+	float M2BruteKthRankDistance(const GBank& b, const float* query, int32_t k,
+		const std::vector<int32_t>& excludeRows)
+	{
+		std::vector<double> scores;
+		for (int32_t r = 0; r < b.view.count; ++r)
+		{
+			if (std::find(excludeRows.begin(), excludeRows.end(), r) != excludeRows.end())
+			{
+				continue;
+			}
+			scores.push_back(M2RefScore(b, query, r));
+		}
+		std::sort(scores.begin(), scores.end(), [&](double x, double y) {
+			return b.view.metric == Metric::L2 ? x < y : x > y;
+		});
+		const double kth = scores[static_cast<size_t>(k - 1)];
+		return b.view.metric == Metric::Cosine ? static_cast<float>(1.0 - kth) : static_cast<float>(kth);
+	}
+}
+
+// M2 / dim 2 + dim 4 + dim 6 + dim 7 (F-M2-1, D-V32-47/48/50) — NoveltyProbeDistance is
+// limb 1's exact-distance entry: the metric's OWN distance function between a probe and
+// one stored row, dispatched per (metric, scope, quant). Oracle: M2OracleProbeDistance.
+static void TestM2NoveltyProbeDistance()
+{
+	Rng rng(0x4E5031);
+
+	// --- Trust boundaries (dim 2): storedRow/channel/null rejections, no write. ---
+	{
+		std::vector<float> src;
+		const int32_t dims = 8, count = 4;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		std::vector<float> probe(static_cast<size_t>(b.view.paddedDims), 0.1f);
+		float out = -999.0f;
+
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), -1, -1, &out) == Status::InvalidArgument,
+			"storedRow -1 must reject");
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), count, -1, &out) == Status::InvalidArgument,
+			"storedRow == count must reject");
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, 0, &out) == Status::InvalidArgument,
+			"channel 0 on a bank with no channel table must reject");
+		CHECK_MSG(NoveltyProbeDistance(b.view, nullptr, 0, -1, &out) == Status::InvalidArgument,
+			"null paddedProbeQuery must reject");
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, -1, nullptr) == Status::InvalidArgument,
+			"null outDistance must reject");
+		CHECK_MSG(out == -999.0f, "a rejected call must not write outDistance");
+
+		BankView dotView = b.view;
+		dotView.metric = Metric::Dot;
+		CHECK_MSG(NoveltyProbeDistance(dotView, probe.data(), 0, -1, &out) == Status::InvalidArgument,
+			"a Dot bank must reject -- never dispatched (verdict-unavailable is upstream)");
+		CHECK_MSG(out == -999.0f, "the Dot rejection must not write outDistance");
+	}
+
+	// --- Channel-table trust boundaries: channel out of [-1, channelCount). ---
+	{
+		std::vector<float> src;
+		const int32_t dims = 6, count = 2;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		GChannelBank b(src, count, dims, Quantization::Int8, Metric::Cosine, ch);
+		std::vector<float> probe(static_cast<size_t>(b.bank.view.paddedDims), 0.1f);
+		float out = -999.0f;
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, -2, &out) == Status::InvalidArgument);
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 2, &out) == Status::InvalidArgument);
+		CHECK(out == -999.0f);
+	}
+
+	// --- int8 whole-row, Cosine and L2: byte-identical duplicate -> exactly 0; a distinct
+	// row -> entry == oracle; oracle == entry on random pairs. ---
+	for (Metric metric : {Metric::Cosine, Metric::L2})
+	{
+		const int32_t dims = 48, count = 6;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Int8, metric);
+
+		{
+			std::vector<float> probe = M2PaddedProbeFromRow(b, 2);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 2, -1, &out) == Status::Ok);
+			CHECK_MSG(out == 0.0f,
+				"int8 whole-row %s: byte-identical duplicate must score exactly 0, got %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2", static_cast<double>(out));
+			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), 2, -1);
+			CHECK(ref.status == Status::Ok && ref.distance == out);
+		}
+		for (int32_t r = 0; r < count; ++r)
+		{
+			std::vector<float> probe = M2PaddedProbeFromRow(b, (r + 3) % count);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), r, -1, &out) == Status::Ok);
+			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), r, -1);
+			CHECK_MSG(ref.status == Status::Ok && ref.distance == out,
+				"int8 whole-row %s row %d: entry %.9g oracle %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2", r,
+				static_cast<double>(out), static_cast<double>(ref.distance));
+		}
+		for (int32_t t = 0; t < 40; ++t)
+		{
+			std::vector<float> probeSrc(static_cast<size_t>(dims));
+			for (float& v : probeSrc) v = rng.NextFloat();
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.view.paddedDims);
+			const int32_t row = rng.NextIndex(count);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), row, -1, &out) == Status::Ok);
+			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), row, -1);
+			CHECK_MSG(ref.status == Status::Ok && ref.distance == out,
+				"int8 whole-row %s random pair: entry %.9g oracle %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2",
+				static_cast<double>(out), static_cast<double>(ref.distance));
+		}
+	}
+
+	// --- Whole-row Cosine, int8: a SCALAR MULTIPLE of a stored row is a true cosine
+	// duplicate (distance exactly 0) even though it stores byte-DIFFERENT — the strike-14
+	// completeness leg (D-V32-46/47): kills any regression to a byte-identity limb 1. ---
+	{
+		const int32_t dims = 32, count = 1;
+		std::vector<float> rowSrc(static_cast<size_t>(dims));
+		for (float& v : rowSrc) v = rng.NextFloat();
+		GBank b(rowSrc, count, dims, Quantization::Int8, Metric::Cosine);
+		const std::vector<float> normalizedRow = M2PaddedProbeFromRow(b, 0);
+		const float scalars[] = {2.0f, 3.0f, 5.0f, 7.0f, 1.5f, 0.5f, 0.333333f, 10.0f, 1.0001f, 100.0f};
+		for (float c : scalars)
+		{
+			std::vector<float> probe(normalizedRow.size());
+			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * normalizedRow[i];
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out) == Status::Ok);
+			CHECK_MSG(out == 0.0f,
+				"whole-row Cosine int8: scalar multiple c=%.6g of the stored row must score "
+				"exactly 0 (true cosine duplicate; byte-identity would miss most of these), "
+				"got %.9g", static_cast<double>(c), static_cast<double>(out));
+		}
+	}
+
+	// --- Whole-row float32, Cosine and L2: exactly-representable fixtures (axis-aligned
+	// unit vectors), robust to any accumulation order. Plus a duplicate case and a random
+	// oracle cross-check (double-accumulated, per the header's pinned convention). ---
+	for (Metric metric : {Metric::Cosine, Metric::L2})
+	{
+		const int32_t dims = 8;
+		std::vector<float> src = {
+			1, 0, 0, 0, 0, 0, 0, 0,
+			0, 1, 0, 0, 0, 0, 0, 0,
+		};
+		GBank b(src, 2, dims, Quantization::Float32, metric);
+
+		{
+			std::vector<float> probe = M2PaddedProbe({0, 1, 0, 0, 0, 0, 0, 0}, dims, b.view.paddedDims);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out) == Status::Ok);
+			const float expect = metric == Metric::Cosine ? 1.0f : 2.0f;
+			CHECK_MSG(out == expect, "whole-row float32 %s orthogonal pair: expected %.6g got %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2",
+				static_cast<double>(expect), static_cast<double>(out));
+		}
+		{
+			std::vector<float> probe = M2PaddedProbeFromRow(b, 1);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 1, -1, &out) == Status::Ok);
+			CHECK_MSG(out == 0.0f, "whole-row float32 %s duplicate must score exactly 0, got %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2", static_cast<double>(out));
+		}
+		{
+			const int32_t rdims = 16, rcount = 5;
+			std::vector<float> rsrc;
+			for (int32_t i = 0; i < rcount * rdims; ++i) rsrc.push_back(rng.NextFloat());
+			GBank rb(rsrc, rcount, rdims, Quantization::Float32, metric);
+			for (int32_t t = 0; t < 20; ++t)
+			{
+				std::vector<float> probeSrc(static_cast<size_t>(rdims));
+				for (float& v : probeSrc) v = rng.NextFloat();
+				std::vector<float> probe = M2PaddedProbe(probeSrc, rdims, rb.view.paddedDims);
+				const int32_t row = rng.NextIndex(rcount);
+				float out = -999.0f;
+				CHECK(NoveltyProbeDistance(rb.view, probe.data(), row, -1, &out) == Status::Ok);
+				const M2ProbeResult ref = M2OracleProbeDistance(rb.view, probe.data(), row, -1);
+				CHECK_MSG(ref.status == Status::Ok &&
+						std::fabs(ref.distance - out) <= 1e-5f * std::max(1.0f, std::fabs(ref.distance)),
+					"whole-row float32 %s random pair: entry %.9g oracle %.9g",
+					metric == Metric::Cosine ? "Cosine" : "L2",
+					static_cast<double>(out), static_cast<double>(ref.distance));
+			}
+		}
+	}
+
+	// --- Channel-scoped Cosine, int8: strike 10's exact-direction twin verdicts a true
+	// scoped duplicate (distance 0); a different-direction pair does not. ---
+	{
+		const int32_t dims = 6;
+		std::vector<float> rowA = {1, 0, 0, 3, 0, 0};
+		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		GChannelBank b(rowA, 1, dims, Quantization::Int8, Metric::Cosine, ch);
+
+		{
+			std::vector<float> probe = M2PaddedProbe({1, 0, 0, 0, 0, 0}, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+			CHECK_MSG(out == 0.0f,
+				"channel-scoped Cosine int8: exact-direction slice twin (strike 10) must "
+				"score exactly 0, got %.9g", static_cast<double>(out));
+		}
+		{
+			std::vector<float> probe = M2PaddedProbe({0, 1, 0, 0, 0, 0}, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+			CHECK_MSG(out == 1.0f,
+				"channel-scoped Cosine int8: a different-direction slice must NOT score 0 "
+				"(orthogonal -> 1), got %.9g", static_cast<double>(out));
+		}
+	}
+
+	// --- Channel-scoped L2, int8: strike 11's twin — kernel channel-L2 distance exactly
+	// 0.0 for two rows with a DIFFERENT stored (bytes, scale) key. ---
+	{
+		const int32_t dims = 6;
+		std::vector<float> rowA = {100.0f / 127.0f, 50.0f / 127.0f, 0.0f, 2.0f, 0.0f, 0.0f};
+		std::vector<ChannelInfo> ch = {{0, 3}, {3, 3}};
+		GChannelBank b(rowA, 1, dims, Quantization::Int8, Metric::L2, ch);
+		std::vector<float> probeB = {100.0f / 127.0f, 50.0f / 127.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+		std::vector<float> probe = M2PaddedProbe(probeB, dims, b.bank.view.paddedDims);
+		float out = -999.0f;
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+		CHECK_MSG(out == 0.0f,
+			"channel-scoped L2 int8: strike 11's dequant-identical/byte-different twin must "
+			"score exactly 0, got %.9g", static_cast<double>(out));
+	}
+
+	// --- Channel-scoped Cosine zero-energy guard, BOTH sides (D-V32-43, strike 12): a
+	// zero-energy slice on the STORED row, or on the PROBE, must reject with ZeroNormQuery
+	// — never silently floor to a false distance-0 duplicate. ---
+	{
+		const int32_t dims = 32;
+		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
+		std::vector<float> row0(static_cast<size_t>(dims), 0.0f);
+		row0[0] = 1.0f; // channel-1 slice all zero
+		std::vector<float> row1(static_cast<size_t>(dims), 0.0f);
+		row1[16] = 1.0f; // channel-1 direction, axis 0
+		std::vector<float> src;
+		src.insert(src.end(), row0.begin(), row0.end());
+		src.insert(src.end(), row1.begin(), row1.end());
+		GChannelBank b(src, 2, dims, Quantization::Int8, Metric::Cosine, ch);
+
+		{
+			std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+			probeSrc[17] = 1.0f; // channel-1 direction, axis 1 (orthogonal to row1)
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out);
+			CHECK_MSG(s == Status::ZeroNormQuery,
+				"channel Cosine zero-energy STORED row (strike 12) must reject ZeroNormQuery, "
+				"got status=%d distance=%.9g", static_cast<int>(s), static_cast<double>(out));
+			CHECK(out == -999.0f);
+		}
+		{
+			std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+			probeSrc[17] = 1.0f;
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out) == Status::Ok);
+			CHECK_MSG(out == 1.0f,
+				"channel Cosine control (orthogonal, non-zero stored slice) must score 1, "
+				"got %.9g", static_cast<double>(out));
+		}
+		{
+			std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+			probeSrc[0] = 1.0f; // nonzero elsewhere, but channel-1 [16,32) is all zero
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out);
+			CHECK_MSG(s == Status::ZeroNormQuery,
+				"channel Cosine zero-energy PROBE slice must also reject ZeroNormQuery, "
+				"got status=%d distance=%.9g", static_cast<int>(s), static_cast<double>(out));
+			CHECK(out == -999.0f);
+		}
+	}
+
+	// --- Channel-scoped L2 needs no zero-energy guard. ---
+	{
+		const int32_t dims = 32;
+		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
+		std::vector<float> row0(static_cast<size_t>(dims), 0.0f);
+		row0[0] = 1.0f;
+		GChannelBank b(row0, 1, dims, Quantization::Int8, Metric::L2, ch);
+		std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+		probeSrc[16] = 3.0f;
+		std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+		float out = -999.0f;
+		const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out);
+		CHECK_MSG(s == Status::Ok,
+			"channel L2 zero-energy slice must NOT reject (no Cosine-only guard), got status=%d",
+			static_cast<int>(s));
+		CHECK_MSG(out > 0.0f,
+			"channel L2 zero-vs-nonzero slice must score a real positive distance, got %.9g",
+			static_cast<double>(out));
+	}
+
+	// --- Channel-scoped float32, Cosine and L2: same shape as int8, exactly-representable
+	// fixture + oracle cross-check. ---
+	for (Metric metric : {Metric::Cosine, Metric::L2})
+	{
+		const int32_t dims = 8;
+		std::vector<ChannelInfo> ch = {{0, 4}, {4, 4}};
+		std::vector<float> src = {1, 0, 0, 0, 2, 0, 0, 0};
+		GChannelBank b(src, 1, dims, Quantization::Float32, metric, ch);
+		{
+			std::vector<float> probeSrc = {0, 0, 0, 0, 5, 0, 0, 0};
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+			float out = -999.0f;
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out) == Status::Ok);
+			const float expect = metric == Metric::Cosine ? 0.0f : (5.0f - 2.0f) * (5.0f - 2.0f);
+			CHECK_MSG(out == expect, "channel float32 %s same-direction leg: expected %.6g got %.9g",
+				metric == Metric::Cosine ? "Cosine" : "L2",
+				static_cast<double>(expect), static_cast<double>(out));
+		}
+		for (int32_t t = 0; t < 20; ++t)
+		{
+			std::vector<float> probeSrc(static_cast<size_t>(dims));
+			for (float& v : probeSrc) v = rng.NextFloat() + 1.5f; // keep every slice nonzero
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+			for (int32_t c = 0; c < 2; ++c)
+			{
+				float out = -999.0f;
+				CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, c, &out) == Status::Ok);
+				const M2ProbeResult ref = M2OracleProbeDistance(b.bank.view, probe.data(), 0, c);
+				CHECK_MSG(ref.status == Status::Ok &&
+						std::fabs(ref.distance - out) <= 1e-5f * std::max(1.0f, std::fabs(ref.distance)),
+					"channel float32 %s random pair ch=%d: entry %.9g oracle %.9g",
+					metric == Metric::Cosine ? "Cosine" : "L2", c,
+					static_cast<double>(out), static_cast<double>(ref.distance));
+			}
+		}
+	}
+}
+
+// M2 / dim 2 + dim 5 + dim 6 (D-V32-19/22) — KthNeighborDistance: the k-th-NN distance
+// against the FULL view, converted to RankDistance before ranking (L2 -> score; Cosine ->
+// 1 - score); Dot excluded from the verdict domain. Oracle: M2BruteKthRankDistance.
+static void TestM2KthNeighborDistance()
+{
+	Rng rng(0x4B7448);
+
+	// --- Trust boundaries (dim 2): k<1, k too large, null buffers, Dot -> InvalidArgument,
+	// no write. ---
+	{
+		const int32_t dims = 8, count = 6;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		Workspace ws; ws.Reserve(count, 1);
+		std::vector<float> query = M2PaddedProbeFromRow(b, 0);
+		float out = -999.0f;
+
+		CHECK(KthNeighborDistance(b.view, query.data(), 0, nullptr, &out, ws) == Status::InvalidArgument);
+		CHECK(KthNeighborDistance(b.view, query.data(), count, nullptr, &out, ws) == Status::InvalidArgument);
+		CHECK(KthNeighborDistance(b.view, nullptr, 1, nullptr, &out, ws) == Status::InvalidArgument);
+		CHECK(KthNeighborDistance(b.view, query.data(), 1, nullptr, nullptr, ws) == Status::InvalidArgument);
+		CHECK_MSG(out == -999.0f, "a rejected KthNeighborDistance call must not write outDistance");
+
+		BankView dotView = b.view;
+		dotView.metric = Metric::Dot;
+		CHECK_MSG(KthNeighborDistance(dotView, query.data(), 1, nullptr, &out, ws) == Status::InvalidArgument,
+			"a Dot bank must reject -- RankDistance is undefined there (D-V32-22)");
+		CHECK(out == -999.0f);
+	}
+
+	// --- RankDistance correctness, L2 and Cosine: a tie-free "arc" fixture (distinct
+	// angular gaps, the M1 precedent) so float-vs-double ranking cannot disagree. ---
+	for (Metric metric : {Metric::L2, Metric::Cosine})
+	{
+		const int32_t dims = 4, count = 9;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count; ++i)
+		{
+			const double theta = 0.31 * i + 0.07 * i * i;
+			src.push_back(static_cast<float>(std::cos(theta) * (1.0 + 0.05 * i)));
+			src.push_back(static_cast<float>(std::sin(theta) * (1.0 + 0.05 * i)));
+			src.push_back(0.02f * static_cast<float>(i));
+			src.push_back(0.01f * static_cast<float>(i * i));
+		}
+		GBank b(src, count, dims, Quantization::Float32, metric);
+		Workspace ws; ws.Reserve(count, 1);
+
+		for (int32_t r = 0; r < count; ++r)
+		{
+			std::vector<float> query = M2PaddedProbeFromRow(b, r);
+			std::vector<uint32_t> excl((static_cast<size_t>(count) + 31) / 32, 0u);
+			excl[static_cast<size_t>(r) >> 5] |= (1u << (r & 31));
+			for (int32_t k = 1; k <= count - 1; ++k)
+			{
+				float out = -999.0f;
+				CHECK(KthNeighborDistance(b.view, query.data(), k, excl.data(), &out, ws) == Status::Ok);
+				const float ref = M2BruteKthRankDistance(b, query.data(), k, {r});
+				CHECK_MSG(std::fabs(out - ref) < 1e-4f,
+					"KthNeighborDistance %s row %d k=%d: got %.6g expected %.6g",
+					metric == Metric::L2 ? "L2" : "Cosine", r, k,
+					static_cast<double>(out), static_cast<double>(ref));
+			}
+		}
+	}
+
+	// --- Exclusion composes: excluding an additional near row changes the k-th-NN
+	// distance to match the reference over the REMAINING rows. ---
+	{
+		const int32_t dims = 4, count = 9;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count; ++i)
+		{
+			const double theta = 0.31 * i + 0.07 * i * i;
+			src.push_back(static_cast<float>(std::cos(theta) * (1.0 + 0.05 * i)));
+			src.push_back(static_cast<float>(std::sin(theta) * (1.0 + 0.05 * i)));
+			src.push_back(0.02f * static_cast<float>(i));
+			src.push_back(0.01f * static_cast<float>(i * i));
+		}
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		Workspace ws; ws.Reserve(count, 1);
+		const int32_t probeRow = 0, extraExcl = 1;
+		std::vector<float> query = M2PaddedProbeFromRow(b, probeRow);
+		std::vector<uint32_t> excl((static_cast<size_t>(count) + 31) / 32, 0u);
+		excl[static_cast<size_t>(probeRow) >> 5] |= (1u << (probeRow & 31));
+		excl[static_cast<size_t>(extraExcl) >> 5] |= (1u << (extraExcl & 31));
+		const int32_t k = 3;
+		float out = -999.0f;
+		CHECK(KthNeighborDistance(b.view, query.data(), k, excl.data(), &out, ws) == Status::Ok);
+		const float ref = M2BruteKthRankDistance(b, query.data(), k, {probeRow, extraExcl});
+		CHECK_MSG(std::fabs(out - ref) < 1e-4f,
+			"KthNeighborDistance with a caller exclusion beyond self: got %.6g expected %.6g",
+			static_cast<double>(out), static_cast<double>(ref));
+	}
+
+	// --- Repeat-call bit-equality (dim 6). ---
+	{
+		const int32_t dims = 16, count = 12;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Int8, Metric::L2);
+		Workspace ws; ws.Reserve(count, 1);
+		std::vector<float> query = M2PaddedProbeFromRow(b, 3);
+		float out1 = -999.0f, out2 = -999.0f;
+		CHECK(KthNeighborDistance(b.view, query.data(), 4, nullptr, &out1, ws) == Status::Ok);
+		CHECK(KthNeighborDistance(b.view, query.data(), 4, nullptr, &out2, ws) == Status::Ok);
+		CHECK_MSG(out1 == out2, "KthNeighborDistance repeat call must be bit-identical: %.9g vs %.9g",
+			static_cast<double>(out1), static_cast<double>(out2));
+	}
+}
+
+// M2 / dim 2 + dim 6 + dim 10 — CalibrateNoveltyBaseline: the bank's own k-th-NN
+// RankDistance distribution over the view it is handed (which the caller already sampled
+// to sampleLimit — this function does not re-stride, per its header contract), each row
+// self-excluded, output sorted ascending. In-cap correctness only (bank.count <=
+// sampleLimit): the over-cap striding algorithm is a separate contract question, routed as
+// F-M2-2 (see the test-design artifact).
+static void TestM2CalibrateNoveltyBaseline()
+{
+	Rng rng(0x2C0FEE);
+
+	// --- Trust boundaries (dim 2). ---
+	{
+		const int32_t dims = 8, count = 6;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		Workspace ws; ws.Reserve(count, 1);
+		std::vector<float> out(static_cast<size_t>(count), -999.0f);
+		int32_t outCount = -999;
+
+		CHECK(CalibrateNoveltyBaseline(b.view, 0, 64, out.data(), &outCount, ws) == Status::InvalidArgument);
+		CHECK(CalibrateNoveltyBaseline(b.view, count, 64, out.data(), &outCount, ws) == Status::InvalidArgument);
+		CHECK(CalibrateNoveltyBaseline(b.view, 1, 0, out.data(), &outCount, ws) == Status::InvalidArgument);
+		CHECK(CalibrateNoveltyBaseline(b.view, 1, 64, nullptr, &outCount, ws) == Status::InvalidArgument);
+		CHECK(CalibrateNoveltyBaseline(b.view, 1, 64, out.data(), nullptr, ws) == Status::InvalidArgument);
+		CHECK_MSG(CalibrateNoveltyBaseline(b.view, 1, count - 1, out.data(), &outCount, ws) == Status::InvalidArgument,
+			"CalibrateNoveltyBaseline must reject a view whose count exceeds its own sampleLimit");
+		CHECK_MSG(out[0] == -999.0f && outCount == -999, "a rejected call must not write outputs");
+
+		BankView dotView = b.view;
+		dotView.metric = Metric::Dot;
+		CHECK_MSG(CalibrateNoveltyBaseline(dotView, 1, 64, out.data(), &outCount, ws) == Status::InvalidArgument,
+			"a Dot bank must reject -- RankDistance is undefined there");
+	}
+
+	// --- In-cap correctness FEAT: bank.count <= sampleLimit (no striding ambiguity). Each
+	// row's self-excluded k-th-NN RankDistance, sorted ascending, matches the independent
+	// brute-force reference exactly (tie-free "arc" fixture). ---
+	for (Metric metric : {Metric::L2, Metric::Cosine})
+	{
+		const int32_t dims = 4, count = 11;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count; ++i)
+		{
+			const double theta = 0.29 * i + 0.05 * i * i;
+			src.push_back(static_cast<float>(std::cos(theta) * (1.0 + 0.04 * i)));
+			src.push_back(static_cast<float>(std::sin(theta) * (1.0 + 0.04 * i)));
+			src.push_back(0.015f * static_cast<float>(i));
+			src.push_back(0.008f * static_cast<float>(i * i));
+		}
+		GBank b(src, count, dims, Quantization::Float32, metric);
+		Workspace ws; ws.Reserve(count, 1);
+		const int32_t k = 3, sampleLimit = 64;
+		std::vector<float> out(static_cast<size_t>(count), -999.0f);
+		int32_t outCount = -999;
+
+		CHECK(CalibrateNoveltyBaseline(b.view, k, sampleLimit, out.data(), &outCount, ws) == Status::Ok);
+		CHECK_MSG(outCount == count,
+			"CalibrateNoveltyBaseline outCount must equal bank.count in-cap, got %d", outCount);
+
+		std::vector<float> refBaseline;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			std::vector<float> query = M2PaddedProbeFromRow(b, r);
+			refBaseline.push_back(M2BruteKthRankDistance(b, query.data(), k, {r}));
+		}
+		std::sort(refBaseline.begin(), refBaseline.end());
+
+		bool sorted = true;
+		for (int32_t i = 1; i < outCount; ++i)
+		{
+			if (out[static_cast<size_t>(i)] < out[static_cast<size_t>(i - 1)]) sorted = false;
+		}
+		CHECK_MSG(sorted, "CalibrateNoveltyBaseline output must be sorted ascending");
+
+		for (int32_t i = 0; i < outCount && i < static_cast<int32_t>(refBaseline.size()); ++i)
+		{
+			CHECK_MSG(std::fabs(out[static_cast<size_t>(i)] - refBaseline[static_cast<size_t>(i)]) < 1e-4f,
+				"CalibrateNoveltyBaseline %s entry %d: got %.6g expected %.6g",
+				metric == Metric::L2 ? "L2" : "Cosine", i,
+				static_cast<double>(out[static_cast<size_t>(i)]),
+				static_cast<double>(refBaseline[static_cast<size_t>(i)]));
+		}
+	}
+
+	// --- Repeat-call bit-equality (dim 6). ---
+	{
+		const int32_t dims = 12, count = 10;
+		std::vector<float> src;
+		for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+		GBank b(src, count, dims, Quantization::Int8, Metric::L2);
+		Workspace ws; ws.Reserve(count, 1);
+		std::vector<float> out1(static_cast<size_t>(count), -999.0f), out2(static_cast<size_t>(count), -999.0f);
+		int32_t n1 = -999, n2 = -999;
+		CHECK(CalibrateNoveltyBaseline(b.view, 3, 64, out1.data(), &n1, ws) == Status::Ok);
+		CHECK(CalibrateNoveltyBaseline(b.view, 3, 64, out2.data(), &n2, ws) == Status::Ok);
+		CHECK(n1 == n2);
+		bool same = true;
+		for (int32_t i = 0; i < n1; ++i)
+		{
+			if (out1[static_cast<size_t>(i)] != out2[static_cast<size_t>(i)]) same = false;
+		}
+		CHECK_MSG(same, "CalibrateNoveltyBaseline repeat call must be bit-identical");
+	}
+}
+
+namespace
+{
+	enum class M2Verdict { Duplicate, Novel, Familiar, Unavailable, Error };
+
+	// The two-limb tri-state verdict driver (D-V32-31/47), composed from the four M2
+	// primitives UNDER TEST — not a hand transcription of the mechanism. Limb 1 fires first
+	// (NoveltyProbeDistance against every live row at exact distance 0 — override, CDF
+	// never consulted); else limb 2 (KthNeighborDistance + CalibrateNoveltyBaseline +
+	// NoveltyScore) splits novel/familiar at lambda. A Dot bank is never special-cased here:
+	// it is routed to Unavailable only when the REAL entries reject it (InvalidArgument),
+	// so this cell genuinely exercises KthNeighborDistance/CalibrateNoveltyBaseline's own
+	// Dot rejection rather than shortcutting around it.
+	M2Verdict M2ComputeVerdict(const BankView& bank, const float* query, int32_t k,
+		int32_t channel, float lambda, Workspace& ws)
+	{
+		for (int32_t r = 0; r < bank.count; ++r)
+		{
+			float d = -999.0f;
+			const Status s = NoveltyProbeDistance(bank, query, r, channel, &d);
+			if (s == Status::Ok && d == 0.0f)
+			{
+				return M2Verdict::Duplicate;
+			}
+		}
+		const int32_t sampleLimit = bank.count;
+		std::vector<float> baseline(static_cast<size_t>(bank.count), -999.0f);
+		int32_t baselineCount = -999;
+		const Status calStatus =
+			CalibrateNoveltyBaseline(bank, k, sampleLimit, baseline.data(), &baselineCount, ws);
+		float kth = -999.0f;
+		const Status kthStatus = KthNeighborDistance(bank, query, k, nullptr, &kth, ws);
+		if (calStatus == Status::InvalidArgument || kthStatus == Status::InvalidArgument)
+		{
+			return bank.metric == Metric::Dot ? M2Verdict::Unavailable : M2Verdict::Error;
+		}
+		if (calStatus != Status::Ok || kthStatus != Status::Ok)
+		{
+			return M2Verdict::Error;
+		}
+		float score = -999.0f;
+		if (NoveltyScore(baseline.data(), baselineCount, kth, &score) != Status::Ok)
+		{
+			return M2Verdict::Error;
+		}
+		return score >= lambda ? M2Verdict::Novel : M2Verdict::Familiar;
+	}
+
+	const char* M2VerdictName(M2Verdict v)
+	{
+		switch (v)
+		{
+			case M2Verdict::Duplicate: return "duplicate";
+			case M2Verdict::Novel: return "novel";
+			case M2Verdict::Familiar: return "familiar";
+			case M2Verdict::Unavailable: return "unavailable";
+			default: return "error";
+		}
+	}
+}
+
+// M2 / dim 10 (the crux) — the two-limb tri-state Novelty FEAT (D-V32-31/47), composed
+// from the four M2 primitives under test via M2ComputeVerdict. The strike-9 discrimination
+// geometry (dup-of-isolate, third-copy, dup-of-dense, fresh-isolate, fresh-familiar), the
+// Cosine magnitude-invariance cell, the Dot verdict-unavailable cell, and a known-CDF FEAT
+// with hand-computed expected scores in RankDistance space.
+static void TestM2TwoLimbVerdictFeat()
+{
+	Rng rng(0x51A1CE);
+	const int32_t dims = 16, novK = 8;
+	const float lambda = 0.95f;
+
+	// --- Strike-9 geometry: a dense cluster (200 rows, every row has >= novK near
+	// neighbours) + one far sparse isolate p + a far already-duplicated pair q1==q2. ---
+	std::vector<float> src;
+	const int32_t nCluster = 200;
+	for (int32_t i = 0; i < nCluster; ++i)
+	{
+		for (int32_t d = 0; d < dims; ++d) src.push_back(0.15f * rng.NextFloat());
+	}
+	const int32_t pIsolate = nCluster;
+	for (int32_t d = 0; d < dims; ++d) src.push_back(10.0f);
+	const int32_t q1 = nCluster + 1, q2 = nCluster + 2;
+	for (int32_t d = 0; d < dims; ++d) src.push_back(-10.0f);
+	for (int32_t d = 0; d < dims; ++d) src.push_back(-10.0f);
+	const int32_t count = nCluster + 3;
+	(void)pIsolate; (void)q1; (void)q2;
+
+	GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+	Workspace ws; ws.Reserve(std::max(novK, count - 1) + 1, 1);
+
+	struct Case { const char* name; std::vector<float> probe; M2Verdict expect; };
+	std::vector<Case> cases;
+	cases.push_back({"dup of isolate p", std::vector<float>(static_cast<size_t>(dims), 10.0f), M2Verdict::Duplicate});
+	cases.push_back({"third copy of q", std::vector<float>(static_cast<size_t>(dims), -10.0f), M2Verdict::Duplicate});
+	{
+		std::vector<float> v = M2PaddedProbeFromRow(b, 0);
+		v.resize(static_cast<size_t>(dims));
+		cases.push_back({"dup of dense row", v, M2Verdict::Duplicate});
+	}
+	{
+		std::vector<float> v(static_cast<size_t>(dims), 10.0f);
+		v[1] += 1500.0f;
+		cases.push_back({"fresh isolate", v, M2Verdict::Novel});
+	}
+	{
+		std::vector<float> v = M2PaddedProbeFromRow(b, 0);
+		v.resize(static_cast<size_t>(dims));
+		v[0] += 0.01f;
+		cases.push_back({"fresh dense (near row 0)", v, M2Verdict::Familiar});
+	}
+
+	for (const Case& c : cases)
+	{
+		std::vector<float> padded = M2PaddedProbe(c.probe, dims, b.view.paddedDims);
+		const M2Verdict got = M2ComputeVerdict(b.view, padded.data(), novK, -1, lambda, ws);
+		CHECK_MSG(got == c.expect, "two-limb verdict FEAT '%s': got %s expected %s",
+			c.name, M2VerdictName(got), M2VerdictName(c.expect));
+	}
+
+	// --- Cosine magnitude-invariance at the VERDICT level (the sixth fracture's lesson,
+	// re-affirmed for the whole two-limb pipeline): a scalar multiple of a bank row is
+	// caught `duplicate` by limb 1 regardless of the probe's pre-normalization scale. ---
+	{
+		const int32_t cdims = 24;
+		std::vector<float> csrc;
+		for (int32_t i = 0; i < 40 * cdims; ++i) csrc.push_back(rng.NextFloat());
+		GBank cb(csrc, 40, cdims, Quantization::Float32, Metric::Cosine);
+		Workspace cws; cws.Reserve(novK + 1, 1);
+		const std::vector<float> unitRow = M2PaddedProbeFromRow(cb, 5);
+		for (float c : {0.1f, 1.0f, 3.0f, 25.0f, 1000.0f})
+		{
+			std::vector<float> probe(unitRow.size());
+			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * unitRow[i];
+			const M2Verdict got = M2ComputeVerdict(cb.view, probe.data(), novK, -1, lambda, cws);
+			CHECK_MSG(got == M2Verdict::Duplicate,
+				"Cosine magnitude-invariance: scale c=%.4g of a stored row must still "
+				"verdict duplicate, got %s", static_cast<double>(c), M2VerdictName(got));
+		}
+	}
+
+	// --- Dot verdict-unavailable: never a number, always the rejection path. ---
+	{
+		const int32_t ddims = 12;
+		std::vector<float> dsrc;
+		for (int32_t i = 0; i < 20 * ddims; ++i) dsrc.push_back(rng.NextFloat());
+		GBank db(dsrc, 20, ddims, Quantization::Float32, Metric::Dot);
+		Workspace dws; dws.Reserve(novK + 1, 1);
+		std::vector<float> probe = M2PaddedProbeFromRow(db, 3);
+		const M2Verdict got = M2ComputeVerdict(db.view, probe.data(), novK, -1, lambda, dws);
+		CHECK_MSG(got == M2Verdict::Unavailable,
+			"a Dot bank must verdict Unavailable, never a number, got %s", M2VerdictName(got));
+	}
+
+	// --- Known-CDF FEAT (audit G-5): a small Cosine fixture sized UNDER sampleLimit so the
+	// sample IS the whole fixture — every within-sample k-th-NN RankDistance and its
+	// empirical-CDF rank is computable by hand from the definition. ---
+	{
+		const int32_t kdims = 4, kcount = 10, kk = 2;
+		std::vector<float> ksrc;
+		for (int32_t i = 0; i < kcount; ++i)
+		{
+			const double theta = 0.27 * i + 0.04 * i * i;
+			ksrc.push_back(static_cast<float>(std::cos(theta) * (1.0 + 0.03 * i)));
+			ksrc.push_back(static_cast<float>(std::sin(theta) * (1.0 + 0.03 * i)));
+			ksrc.push_back(0.01f * static_cast<float>(i));
+			ksrc.push_back(0.006f * static_cast<float>(i * i));
+		}
+		GBank kb(ksrc, kcount, kdims, Quantization::Float32, Metric::Cosine);
+		Workspace kws; kws.Reserve(kcount, 1);
+
+		std::vector<float> baseline(static_cast<size_t>(kcount), -999.0f);
+		int32_t baselineCount = -999;
+		std::vector<float> handBaseline;
+		for (int32_t r = 0; r < kcount; ++r)
+		{
+			std::vector<float> q = M2PaddedProbeFromRow(kb, r);
+			handBaseline.push_back(M2BruteKthRankDistance(kb, q.data(), kk, {r}));
+		}
+		std::sort(handBaseline.begin(), handBaseline.end());
+
+		CHECK(CalibrateNoveltyBaseline(kb.view, kk, 64, baseline.data(), &baselineCount, kws) == Status::Ok);
+		CHECK(baselineCount == kcount);
+
+		std::vector<float> farSrc = {0.0f, 0.0f, 1.0f, 0.0f};
+		std::vector<float> farProbe = M2PaddedProbe(farSrc, kdims, kb.view.paddedDims);
+		float farKth = -999.0f;
+		CHECK(KthNeighborDistance(kb.view, farProbe.data(), kk, nullptr, &farKth, kws) == Status::Ok);
+		float handScore = 0.0f;
+		for (float base : handBaseline) if (base < farKth) handScore += 1.0f;
+		handScore /= static_cast<float>(handBaseline.size());
+		float entryScore = -999.0f;
+		CHECK(NoveltyScore(baseline.data(), baselineCount, farKth, &entryScore) == Status::Ok);
+		CHECK_MSG(std::fabs(entryScore - handScore) < 1e-6f,
+			"known-CDF FEAT: NoveltyScore(entry)=%.6g hand-computed=%.6g",
+			static_cast<double>(entryScore), static_cast<double>(handScore));
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -15069,6 +16011,10 @@ int main()
 	TestM1WarmWorkspaceGrowShrink();
 	TestM1StructureFeat();
 	TestM2NoveltyScore();
+	TestM2NoveltyProbeDistance();
+	TestM2KthNeighborDistance();
+	TestM2CalibrateNoveltyBaseline();
+	TestM2TwoLimbVerdictFeat();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,

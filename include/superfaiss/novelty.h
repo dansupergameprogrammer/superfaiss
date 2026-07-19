@@ -9,13 +9,20 @@
 // query output; touches no kernel, quantization, or format.
 //
 // Determinism tier: PER-DEVICE (fixed sample, fixed order, integer rank over a sorted
-// fixed baseline, ties pinned to the lowest rank). No CrossDevice claim.
+// fixed baseline, ties pinned to the lowest rank). No CrossDevice claim. The float32
+// whole-row/channel legs of NoveltyProbeDistance accumulate in DOUBLE (the epilogue
+// convention every other reduction in this library uses — analytics.cpp's XdPairScore/
+// XdChannelPairScore, HitDistance, the NN reductions), ending in the same subnormal floor
+// as the int8 legs; this is pinned here so both the implementation and the test author's
+// independent oracle build against one arithmetic, not two that might silently diverge.
 //
-// AUTHORING STATE (Curie, 2026-07-18): NoveltyScore is authored — its contract is fully
-// pinned by section 25.4 and is independent of F-M2-1. KthNeighborDistance,
-// CalibrateNoveltyBaseline, and the two-limb verdict entry (limb 1 = the metric's exact
-// distance function == 0.0f) are pending the F-M2-1 contract decision (which public entry
-// computes the exact per-path/per-quant distance), then land here.
+// AUTHORING STATE (Curie, 2026-07-18): NoveltyScore is authored and green. This round adds
+// the contract for NoveltyProbeDistance (F-M2-1 / D-V32-50, Dan's call, option A),
+// KthNeighborDistance, and CalibrateNoveltyBaseline — the two-limb tri-state verdict
+// (D-V32-31/47) is composed by the CALLER from these four functions (no separate "verdict"
+// entry exists; graph.h's precedent — ConnectedComponents composes BuildKnnNeighbors +
+// MutualFilter + BuildDuplicateGroups — is the same shape). RED SCAFFOLD bodies for the
+// three new entries ship in novelty.cpp (return Ok, write nothing) until Brunel implements.
 
 namespace superfaiss
 {
@@ -30,5 +37,99 @@ Status NoveltyScore(
 	int32_t count,
 	float distance,
 	float* outScore);
+
+// The limb-1 exact-distance entry (plan 25.4, D-V32-47/48/50, F-M2-1): the metric's OWN
+// exact distance function between `paddedProbeQuery` and one stored row, dispatched per
+// (metric, scope, quant) — the primitive both the implementation and the test author's
+// independent oracle build against and cross-check by execution (the strike-14 discipline:
+// one verified number, not two hopefully-agreeing ones). `channel == -1` scores the whole
+// row; `channel` in [0, bank.channelCount) scores that channel's sub-range only.
+//
+// Dispatch:
+//   - int8, whole-row: the XdPairScore arithmetic (analytics.cpp) — int8 cross/self-dot
+//     accumulation, one fixed-order double epilogue, the subnormal floor (XdFloor). Cosine:
+//     `1 - cross/sqrt(aSq*bSq)`; L2: the expanded `||aScale*a - bScale*b||^2` form. Requires
+//     a nonzero self-dot on both operands under Cosine — always true here, since a
+//     whole-row-normalized bank rejects a zero-norm row at bake and the probe is a query
+//     (rejected upstream of this call on a Cosine bank).
+//   - float32, whole-row: the SAME two formulas, accumulated in DOUBLE over the plain
+//     floats (see the header note above), ending in the same subnormal floor.
+//   - channel (either quant): the sliced form. The probe is quantized (int8 leg, via the
+//     same arithmetic QuantizeQueryXd uses) or read (float32 leg) over the WHOLE
+//     bank.paddedDims once, then BOTH operands restrict every sum to
+//     `[bank.channels[channel].offset, +length)`; the stored row keeps its own whole-row
+//     int8 scale (channel scoring never renormalizes per channel — analytics.cpp's
+//     XdChannelPairScore convention). **Cosine only, BOTH sides (D-V32-43, strike 12):** a
+//     zero-energy channel slice on EITHER the probe or the stored row returns
+//     `Status::ZeroNormQuery`, no write — a directionless slice is a Cosine duplicate of
+//     nothing, so it is never silently floored to a false distance-0 match the way the
+//     shipped `XdChannelPairScore` reduction floors it for its own (different) purpose.
+//     Channel L2 needs no such guard (a zero-energy slice scores a real positive distance).
+//   - Dot: never dispatched — `bank.metric == Metric::Dot` is `InvalidArgument` (the
+//     verdict-unavailable decision is made upstream of this call; this entry serves only
+//     the verdict domain, L2 and Cosine — D-V32-22/23).
+//
+// Rejections (InvalidArgument, no write): `bank.count < 1`; `storedRow` outside
+// `[0, bank.count)`; `channel` outside `[-1, bank.channelCount)`, or `channel != -1` on a
+// bank with no channel table; a null `paddedProbeQuery`/`outDistance`; `bank.metric ==
+// Metric::Dot`.
+Status NoveltyProbeDistance(
+	const BankView& bank,
+	const float* paddedProbeQuery,
+	int32_t storedRow,
+	int32_t channel, // -1 = whole-row
+	float* outDistance);
+
+// The k-th-nearest-neighbour distance of `query` against the FULL view (plan 25.4), the
+// probe of research 4.4, converted to a RankDistance BEFORE anything ranks it (D-V32-19 —
+// `Hit.score` is a similarity on Cosine/Dot, higher = nearer, and a distance only on L2;
+// ranking the raw score inverts the verdict). The pinned conversion, `RankDistance(metric,
+// score)`: L2 -> `score` (already a squared distance); Cosine -> `1 - score` (bake-
+// normalized rows, so the hit score is a similarity). Dot is EXCLUDED from the verdict
+// domain (D-V32-22: `-score` is monotone but not a dissimilarity on non-normalized Dot
+// rows — a verdict would track magnitude, not isolation) and returns `InvalidArgument`;
+// the reject-over-degrade line the plan draws — this function never silently answers a
+// cosine question a Dot bank never asked.
+//
+// `excludeBits` is the caller's view-space exclusion (tombstones|self for an archive
+// source, self only for a fresh asset — V32-G7); null excludes nothing. This is a raw
+// k-th-hit probe, not self-widening: the caller sizes `k` to what it needs surviving after
+// its own exclusions (mirrors `Query`'s own contract, unlike `BuildKnnNeighbors`'
+// self-widening `excludeSelf` flag). `workspace` warm for `k`.
+//
+// Rejections (InvalidArgument, no write): `k < 1`; `k` greater than the number of
+// non-excluded rows in `bank`; a null `query`/`outDistance`; `bank.metric == Metric::Dot`.
+Status KthNeighborDistance(
+	const BankView& bank,
+	const float* query,
+	int32_t k,
+	const uint32_t* excludeBits,
+	float* outDistance,
+	Workspace& workspace);
+
+// The bank's own k-th-NN RankDistance distribution (plan 25.4): `bank` is the sample view
+// the caller already constructed (the "one shared cap" of section 25.3 — the same
+// compacted, live-rows-only, tombstone-free sample Structure runs on); this function does
+// NOT re-sample or re-stride. For each row of `bank`, its own RankDistance to its k-th
+// nearest OTHER row within `bank` (self excluded, V32-G7), written to
+// `outSortedDistances` in ASCENDING order; `outCount` receives `bank.count`.
+// `sampleLimit` is the caller's declared cap on `bank.count` (defensive: `bank.count >
+// sampleLimit` is `InvalidArgument` — a view exceeding its own declared cap is a caller
+// contract violation this function refuses to silently absorb), not a re-sampling
+// parameter — `outSortedDistances`/`outCount` need no more than `sampleLimit` capacity.
+// Dot -> `InvalidArgument` (RankDistance is undefined there, exactly as
+// KthNeighborDistance). One pass per bank per parameter set; cached per section 25.3.
+//
+// Rejections (InvalidArgument, no write): `k < 1`; `k >= bank.count`; `sampleLimit < 1`;
+// `bank.count > sampleLimit`; `bank.count < 1`; a null `bank.rows`/`outSortedDistances`/
+// `outCount`; `bank.metric == Metric::Dot`. `workspace` warm for `k + 1` (self-exclusion
+// widens the top-k heap by one internally, mirroring `BuildKnnNeighbors`).
+Status CalibrateNoveltyBaseline(
+	const BankView& bank,
+	int32_t k,
+	int32_t sampleLimit,
+	float* outSortedDistances,
+	int32_t* outCount,
+	Workspace& workspace);
 
 } // namespace superfaiss
