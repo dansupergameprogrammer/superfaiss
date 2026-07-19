@@ -16272,17 +16272,33 @@ static void TestM3CorrespondencePermutationFeat()
 			aSrc.push_back(d == i ? (100.0f + 0.1f * static_cast<float>(i)) : 0.0f);
 		}
 	}
-	// A-only noise: reuses landmark slots 0 and 1 at a SMALL magnitude — always loses the
-	// back-verification race to the true landmark pair (constructed, not tie-luck: the
-	// true landmark pair is an exact distance-0 match, strictly better than any nonzero
-	// distance to a noise row sharing its slot).
+	// A-only noise: reuses landmark slots 0 and 1, at a magnitude CLOSE to but distinct
+	// from that same axis's landmark (95 + 0.1*axis, vs. the landmark's 100 + 0.1*axis --
+	// a fixed ~5.0 gap). A small, UNRELATED magnitude (the original construction) is a
+	// geometry bug: two different-axis noise rows with small, similar magnitudes end up
+	// mutually CLOSER to each other (a cross-axis one-hot distance of
+	// sqrt(mag_i^2 + mag_j^2), tiny when both magnitudes are small) than either is to its
+	// own same-axis landmark (a same-axis distance of |100 - mag|, large when mag is
+	// small) -- so a noise row's "nearest in B" becomes another noise row instead of its
+	// own-axis landmark, and back-verification can then spuriously succeed between two
+	// noise rows (confirmed by hand arithmetic, build-and-execute, not reasoning: a 2026-
+	// 07-19 review found sqrt(5^2+7^2)=8.60 vs. |100-5|=95, so the OLD 5/6/7/8 magnitudes
+	// broke the "noise always loses" guarantee). Anchoring the magnitude near the SAME
+	// axis's landmark instead makes the same-axis distance small (~5.0) and every
+	// cross-axis distance (to any other landmark OR any other noise row) large (>130,
+	// since one-hot magnitudes near 95-100 combine to sqrt(a^2+b^2) far above 5.0) --
+	// same-axis proximity now unconditionally dominates, so a noise row's nearest-in-B is
+	// always its OWN axis's landmark copy, which in turn always prefers the TRUE
+	// same-axis landmark pair over the noise row in its own back-verification (the true
+	// pair's distance is ~0.05-0.1, the noise row's is ~5.0) -- the "noise always loses"
+	// guarantee restored by construction, not tie luck.
 	const int32_t aNoise0 = landmarkCount, aNoise1 = landmarkCount + 1;
-	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 0 ? 5.0f : 0.0f);
-	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 1 ? 6.0f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 0 ? 95.0f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 1 ? 95.1f : 0.0f);
 	const int32_t fullACount = landmarkCount + 2;
 
 	// B = a PERMUTATION of the landmarks (reversed order) + 2 B-only noise rows (slots 2,3
-	// at a small magnitude, same reasoning).
+	// at the same near-landmark-magnitude anchoring, same reasoning).
 	for (int32_t i = 0; i < landmarkCount; ++i)
 	{
 		const int32_t landmark = landmarkCount - 1 - i;
@@ -16291,8 +16307,8 @@ static void TestM3CorrespondencePermutationFeat()
 			bSrc.push_back(d == landmark ? (100.0f + 0.1f * static_cast<float>(landmark)) : 0.0f);
 		}
 	}
-	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 2 ? 7.0f : 0.0f);
-	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 3 ? 8.0f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 2 ? 95.2f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 3 ? 95.3f : 0.0f);
 	const int32_t fullBCount = landmarkCount + 2;
 
 	GBank fullA(aSrc, fullACount, dims, Quantization::Float32, Metric::L2);
@@ -16315,6 +16331,37 @@ static void TestM3CorrespondencePermutationFeat()
 	GBank sampleA(sampleSrc, sampleCount, dims, Quantization::Float32, Metric::L2);
 
 	const int32_t matchK = 3;
+
+	// Fixture self-check (independent of the entry under test, mirroring the CSLS-
+	// direction cell's discipline): the oracle ALONE must already show every landmark
+	// recovered, zero spurious matches, and both noise rows unmatched -- proves the
+	// construction is achievable before any implementation is compared against it.
+	{
+		int32_t refSpurious = 0, refRecovered = 0, refNoiseUnmatched = 0;
+		for (int32_t i = 0; i < sampleCount; ++i)
+		{
+			const int32_t nativeA = sampleSourceIndices[static_cast<size_t>(i)];
+			const std::vector<float> queryA = M2PaddedProbeFromRow(fullA, nativeA);
+			const M3RefResult ref =
+				M3RefMatch(fullA, nullptr, fullB, nullptr, nativeA, queryA.data(), matchK);
+			if (nativeA < landmarkCount)
+			{
+				const int32_t expectB = landmarkCount - 1 - nativeA;
+				if (ref.matched && ref.sourceIndexB == expectB) ++refRecovered;
+				else ++refSpurious;
+			}
+			else
+			{
+				if (!ref.matched) ++refNoiseUnmatched;
+				else ++refSpurious;
+			}
+		}
+		CHECK_MSG(refRecovered == landmarkCount / 4 && refSpurious == 0 && refNoiseUnmatched == 2,
+			"Correspondence FEAT fixture self-check (oracle only): recovered=%d (want %d) "
+			"spurious=%d (want 0) noiseUnmatched=%d (want 2)", refRecovered, landmarkCount / 4,
+			refSpurious, refNoiseUnmatched);
+	}
+
 	Workspace ws; ws.Reserve(matchK, 1);
 	std::vector<MatchPair> pairs(static_cast<size_t>(sampleCount));
 	int32_t pairCount = -999;
