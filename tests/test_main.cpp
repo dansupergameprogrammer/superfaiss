@@ -8,8 +8,9 @@
 // epsilon boundary check rather than exact rank equality.
 
 #include "superfaiss/superfaiss.h"
-#include "superfaiss/graph.h"   // V3.2 M1 (Bank Inspector I)
-#include "superfaiss/novelty.h" // V3.2 M2
+#include "superfaiss/graph.h"    // V3.2 M1 (Bank Inspector I)
+#include "superfaiss/novelty.h"  // V3.2 M2
+#include "superfaiss/matching.h" // V3.2 M3
 
 #include "xd_fixtures.h"
 
@@ -16007,6 +16008,598 @@ static void TestM2TwoLimbVerdictFeat()
 	}
 }
 
+// ===========================================================================
+// V3.2 red suite (Curie) — M3 matching.h: MutualNearestMatches (plan 25.4, RE-MECHANIZED
+// D-V32-16), the sampled-A-verified-against-full-banks mutual matcher + CSLS margins that
+// back the Correspondence view. RED SCAFFOLD: matching.cpp's body returns Ok and writes
+// nothing. Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+//
+// Oracle discipline (the D-V32 strike loop, "build don't reason"): the mutual-match +
+// CSLS oracle (M3RefMatch) is an independent recode of the plan's pinned two-pass
+// mechanism, built over the SAME double-precision brute-force machinery M1's REF already
+// established (RefHit/RefBetter — ties ascending index, the library's own convention) —
+// never calls MutualNearestMatches itself. The Correspondence FEAT's ground truth is a
+// CONSTRUCTED permutation (well-separated one-hot landmarks, tie-free by distinct
+// magnitude), never a re-run of the implementation.
+// ===========================================================================
+
+namespace
+{
+	// Sim(metric, score) = -RankDistance(metric, score) (D-V32-20): L2's raw score is
+	// lower-is-better and is negated; Cosine/Dot's raw score is already
+	// similarity-directioned (an additive constant shift is immaterial here — it cancels
+	// exactly in the 2*sim - r_B - r_A combination, so plain `score` is used directly).
+	double M3Sim(Metric metric, double score)
+	{
+		return metric == Metric::L2 ? -score : score;
+	}
+
+	// Brute-force top-k (best-first, ties ascending index — RefBetter, the library's own
+	// pinned convention) of `query` ([0,dims) valid floats) against `target`, honoring
+	// `excludeBits` (target's own source-space tombstones).
+	std::vector<RefHit> M3TopK(const GBank& target, const float* query, int32_t k,
+		const uint32_t* excludeBits)
+	{
+		std::vector<RefHit> hits;
+		const int32_t dims = target.view.dims;
+		for (int32_t r = 0; r < target.view.count; ++r)
+		{
+			if (IsExcluded(excludeBits, r))
+			{
+				continue;
+			}
+			const double* row = &target.refRows[static_cast<size_t>(r) * dims];
+			double score = 0.0;
+			if (target.view.metric == Metric::L2)
+			{
+				for (int32_t i = 0; i < dims; ++i)
+				{
+					const double d = static_cast<double>(query[i]) - row[i];
+					score += d * d;
+				}
+			}
+			else
+			{
+				for (int32_t i = 0; i < dims; ++i)
+				{
+					score += static_cast<double>(query[i]) * row[i];
+				}
+			}
+			hits.push_back({r, score});
+		}
+		std::sort(hits.begin(), hits.end(),
+			[&](const RefHit& a, const RefHit& b) { return RefBetter(a, b, target.view.metric); });
+		if (static_cast<int32_t>(hits.size()) > k)
+		{
+			hits.resize(static_cast<size_t>(k));
+		}
+		return hits;
+	}
+
+	struct M3RefResult
+	{
+		bool matched;
+		int32_t sourceIndexB;
+		double margin;
+	};
+
+	// Independent oracle for one sampled A row's MutualNearestMatches outcome
+	// (D-V32-16/20): pass 1 (top-matchK of `queryA` in fullB — candidate = top-1, r_B =
+	// mean Sim of the top-matchK), the mutual back-verification (pass 2's top-1 in fullA
+	// must equal `nativeSourceIndexA`), and the CSLS margin from the two retrievals — no
+	// third pass, matching the contract.
+	M3RefResult M3RefMatch(const GBank& fullA, const uint32_t* exclA, const GBank& fullB,
+		const uint32_t* exclB, int32_t nativeSourceIndexA, const float* queryA, int32_t matchK)
+	{
+		const std::vector<RefHit> topB = M3TopK(fullB, queryA, matchK, exclB);
+		if (topB.empty())
+		{
+			return {false, -1, 0.0};
+		}
+		const int32_t candidateB = topB[0].index;
+		double rB = 0.0;
+		for (const RefHit& h : topB)
+		{
+			rB += M3Sim(fullB.view.metric, h.score);
+		}
+		rB /= static_cast<double>(topB.size());
+		const double simAB = M3Sim(fullB.view.metric, topB[0].score);
+
+		const std::vector<float> queryB = M2PaddedProbeFromRow(fullB, candidateB);
+		const std::vector<RefHit> topA = M3TopK(fullA, queryB.data(), matchK, exclA);
+		if (topA.empty())
+		{
+			return {false, -1, 0.0};
+		}
+		double rA = 0.0;
+		for (const RefHit& h : topA)
+		{
+			rA += M3Sim(fullA.view.metric, h.score);
+		}
+		rA /= static_cast<double>(topA.size());
+
+		if (topA[0].index != nativeSourceIndexA)
+		{
+			return {false, -1, 0.0};
+		}
+		const double margin = 2.0 * simAB - rB - rA;
+		return {true, candidateB, margin};
+	}
+}
+
+// M3 / dim 2 — MutualNearestMatches trust boundaries: empty views, matchK bounds, dims/
+// metric mismatch, null buffers, all InvalidArgument with no output write.
+static void TestM3MutualNearestMatchesTrustBoundaries()
+{
+	Rng rng(0x3A11);
+	const int32_t dims = 8, count = 6;
+	std::vector<float> aSrc, bSrc;
+	for (int32_t i = 0; i < count * dims; ++i) aSrc.push_back(rng.NextFloat());
+	for (int32_t i = 0; i < count * dims; ++i) bSrc.push_back(rng.NextFloat());
+	GBank fullA(aSrc, count, dims, Quantization::Float32, Metric::L2);
+	GBank fullB(bSrc, count, dims, Quantization::Float32, Metric::L2);
+	std::vector<int32_t> sampleIdx = {0, 1, 2};
+	std::vector<float> sampleSrc(aSrc.begin(), aSrc.begin() + 3 * dims);
+	GBank sampleA(sampleSrc, 3, dims, Quantization::Float32, Metric::L2);
+
+	Workspace ws; ws.Reserve(4, 1);
+	std::vector<MatchPair> pairs(3, MatchPair{-777, -777, -777.0f});
+	int32_t pairCount = -999;
+
+	auto poisonAndCall = [&](const BankView& sv, const int32_t* ssi, const BankView& fb,
+		const uint32_t* eb, const BankView& fa, const uint32_t* ea, int32_t mk) -> Status {
+		pairs.assign(3, MatchPair{-777, -777, -777.0f});
+		pairCount = -999;
+		return MutualNearestMatches(sv, ssi, fb, eb, fa, ea, mk, pairs.data(), &pairCount, ws);
+	};
+
+	{
+		GBank emptyA(std::vector<float>{}, 0, dims, Quantization::Float32, Metric::L2);
+		CHECK(poisonAndCall(emptyA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+			nullptr, 2) == Status::InvalidArgument);
+	}
+	{
+		GBank emptyB(std::vector<float>{}, 0, dims, Quantization::Float32, Metric::L2);
+		CHECK(poisonAndCall(sampleA.view, sampleIdx.data(), emptyB.view, nullptr, fullA.view,
+			nullptr, 2) == Status::InvalidArgument);
+	}
+	{
+		GBank emptyA2(std::vector<float>{}, 0, dims, Quantization::Float32, Metric::L2);
+		CHECK(poisonAndCall(sampleA.view, sampleIdx.data(), fullB.view, nullptr, emptyA2.view,
+			nullptr, 2) == Status::InvalidArgument);
+	}
+	CHECK_MSG(poisonAndCall(sampleA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, 0) == Status::InvalidArgument, "matchK < 1 must reject");
+	CHECK_MSG(poisonAndCall(sampleA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, count + 1) == Status::InvalidArgument,
+		"matchK greater than the available rows in fullB/fullA must reject");
+	{
+		std::vector<float> wideSrc;
+		for (int32_t i = 0; i < count * (dims + 1); ++i) wideSrc.push_back(rng.NextFloat());
+		GBank wideB(wideSrc, count, dims + 1, Quantization::Float32, Metric::L2);
+		CHECK_MSG(poisonAndCall(sampleA.view, sampleIdx.data(), wideB.view, nullptr, fullA.view,
+			nullptr, 2) == Status::InvalidArgument, "a dims mismatch must reject");
+	}
+	{
+		GBank cosB(bSrc, count, dims, Quantization::Float32, Metric::Cosine);
+		CHECK_MSG(poisonAndCall(sampleA.view, sampleIdx.data(), cosB.view, nullptr, fullA.view,
+			nullptr, 2) == Status::InvalidArgument, "a metric mismatch must reject");
+	}
+	CHECK(MutualNearestMatches(sampleA.view, nullptr, fullB.view, nullptr, fullA.view,
+		nullptr, 2, pairs.data(), &pairCount, ws) == Status::InvalidArgument);
+	CHECK(MutualNearestMatches(sampleA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, 2, nullptr, &pairCount, ws) == Status::InvalidArgument);
+	CHECK(MutualNearestMatches(sampleA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, 2, pairs.data(), nullptr, ws) == Status::InvalidArgument);
+	CHECK_MSG(pairs[0].sourceIndexA == -777, "a rejected call must not write outPairs");
+}
+
+// M3 / dim 6 + dim 7 — broad randomized correctness across metric x quant: entry == oracle
+// on every row, full x full (the degenerate sample = full view case), including the
+// unmatched leg.
+static void TestM3MutualNearestMatchesCorrectness()
+{
+	Rng rng(0x7788);
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			const int32_t dims = 16, aCount = 20, bCount = 18;
+			std::vector<float> aSrc, bSrc;
+			for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
+			for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
+			GBank fullA(aSrc, aCount, dims, quant, metric);
+			GBank fullB(bSrc, bCount, dims, quant, metric);
+
+			std::vector<int32_t> sampleSourceIndices;
+			for (int32_t i = 0; i < aCount; ++i) sampleSourceIndices.push_back(i);
+
+			const int32_t matchK = 4;
+			Workspace ws; ws.Reserve(matchK, 1);
+			std::vector<MatchPair> pairs(static_cast<size_t>(aCount));
+			int32_t pairCount = -999;
+			CHECK(MutualNearestMatches(fullA.view, sampleSourceIndices.data(), fullB.view, nullptr,
+				fullA.view, nullptr, matchK, pairs.data(), &pairCount, ws) == Status::Ok);
+			CHECK(pairCount == aCount);
+
+			for (int32_t i = 0; i < aCount; ++i)
+			{
+				const std::vector<float> queryA = M2PaddedProbeFromRow(fullA, i);
+				const M3RefResult ref =
+					M3RefMatch(fullA, nullptr, fullB, nullptr, i, queryA.data(), matchK);
+				const MatchPair& p = pairs[static_cast<size_t>(i)];
+				CHECK_MSG(p.sourceIndexA == i, "sourceIndexA must be the native A index");
+				if (ref.matched)
+				{
+					CHECK_MSG(p.sourceIndexB == ref.sourceIndexB,
+						"correctness (metric=%d quant=%d) row %d: entry=%d oracle=%d",
+						static_cast<int>(metric), static_cast<int>(quant), i, p.sourceIndexB,
+						ref.sourceIndexB);
+					const double delta = std::fabs(static_cast<double>(p.cslsMargin) - ref.margin);
+					CHECK_MSG(delta < 1e-3 * std::max(1.0, std::fabs(ref.margin)),
+						"correctness (metric=%d quant=%d) row %d margin: entry=%.6g oracle=%.6g",
+						static_cast<int>(metric), static_cast<int>(quant), i,
+						static_cast<double>(p.cslsMargin), ref.margin);
+				}
+				else
+				{
+					CHECK_MSG(p.sourceIndexB == -1,
+						"correctness (metric=%d quant=%d) row %d: oracle unmatched, entry=%d",
+						static_cast<int>(metric), static_cast<int>(quant), i, p.sourceIndexB);
+				}
+			}
+		}
+	}
+}
+
+// M3 / dim 10 (the crux) — the Correspondence FEAT (D-V32-16/17): bank B is a PERMUTATION
+// of bank A's landmarks (+ noise rows on each side), sized ABOVE a small sample cap so
+// striding engages. Every checked landmark's true partner is recovered (kernel-true both
+// directions), noise rows report unmatched, zero spurious matches — the deleted design's
+// tombstone (88-98% spurious under the old two-sided-sample mechanic).
+static void TestM3CorrespondencePermutationFeat()
+{
+	const int32_t dims = 48;
+	const int32_t landmarkCount = 48;
+	std::vector<float> aSrc, bSrc;
+	// Landmarks: one-hot at index i, magnitude (100 + 0.1*i) — pairwise well-separated
+	// under every metric (orthogonal axes; distinct magnitudes remove any residual
+	// symmetry, so the fixture is tie-free the same way M1's arc fixture is).
+	for (int32_t i = 0; i < landmarkCount; ++i)
+	{
+		for (int32_t d = 0; d < dims; ++d)
+		{
+			aSrc.push_back(d == i ? (100.0f + 0.1f * static_cast<float>(i)) : 0.0f);
+		}
+	}
+	// A-only noise: reuses landmark slots 0 and 1 at a SMALL magnitude — always loses the
+	// back-verification race to the true landmark pair (constructed, not tie-luck: the
+	// true landmark pair is an exact distance-0 match, strictly better than any nonzero
+	// distance to a noise row sharing its slot).
+	const int32_t aNoise0 = landmarkCount, aNoise1 = landmarkCount + 1;
+	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 0 ? 5.0f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) aSrc.push_back(d == 1 ? 6.0f : 0.0f);
+	const int32_t fullACount = landmarkCount + 2;
+
+	// B = a PERMUTATION of the landmarks (reversed order) + 2 B-only noise rows (slots 2,3
+	// at a small magnitude, same reasoning).
+	for (int32_t i = 0; i < landmarkCount; ++i)
+	{
+		const int32_t landmark = landmarkCount - 1 - i;
+		for (int32_t d = 0; d < dims; ++d)
+		{
+			bSrc.push_back(d == landmark ? (100.0f + 0.1f * static_cast<float>(landmark)) : 0.0f);
+		}
+	}
+	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 2 ? 7.0f : 0.0f);
+	for (int32_t d = 0; d < dims; ++d) bSrc.push_back(d == 3 ? 8.0f : 0.0f);
+	const int32_t fullBCount = landmarkCount + 2;
+
+	GBank fullA(aSrc, fullACount, dims, Quantization::Float32, Metric::L2);
+	GBank fullB(bSrc, fullBCount, dims, Quantization::Float32, Metric::L2);
+
+	// Sample: every 4th landmark (12 of 48 — striding engages; "N of M A-rows checked" is
+	// 14 of 50) plus BOTH A-only noise rows.
+	std::vector<int32_t> sampleSourceIndices;
+	for (int32_t i = 0; i < landmarkCount; i += 4) sampleSourceIndices.push_back(i);
+	sampleSourceIndices.push_back(aNoise0);
+	sampleSourceIndices.push_back(aNoise1);
+	const int32_t sampleCount = static_cast<int32_t>(sampleSourceIndices.size());
+
+	std::vector<float> sampleSrc;
+	for (int32_t idx : sampleSourceIndices)
+	{
+		const float* row = aSrc.data() + static_cast<size_t>(idx) * dims;
+		sampleSrc.insert(sampleSrc.end(), row, row + dims);
+	}
+	GBank sampleA(sampleSrc, sampleCount, dims, Quantization::Float32, Metric::L2);
+
+	const int32_t matchK = 3;
+	Workspace ws; ws.Reserve(matchK, 1);
+	std::vector<MatchPair> pairs(static_cast<size_t>(sampleCount));
+	int32_t pairCount = -999;
+	CHECK(MutualNearestMatches(sampleA.view, sampleSourceIndices.data(), fullB.view, nullptr,
+		fullA.view, nullptr, matchK, pairs.data(), &pairCount, ws) == Status::Ok);
+	CHECK_MSG(pairCount == sampleCount,
+		"MutualNearestMatches outPairCount must equal sampleViewA.count (%d), got %d",
+		sampleCount, pairCount);
+
+	int32_t spurious = 0, recovered = 0, noiseUnmatched = 0;
+	for (int32_t i = 0; i < sampleCount; ++i)
+	{
+		const MatchPair& p = pairs[static_cast<size_t>(i)];
+		const int32_t nativeA = sampleSourceIndices[static_cast<size_t>(i)];
+		CHECK_MSG(p.sourceIndexA == nativeA,
+			"outPairs[%d].sourceIndexA must be the native A index %d, got %d", i, nativeA,
+			p.sourceIndexA);
+		if (nativeA < landmarkCount)
+		{
+			const int32_t expectB = landmarkCount - 1 - nativeA;
+			if (p.sourceIndexB == expectB)
+			{
+				++recovered;
+			}
+			else
+			{
+				++spurious;
+			}
+		}
+		else
+		{
+			if (p.sourceIndexB == -1)
+			{
+				++noiseUnmatched;
+			}
+			else
+			{
+				++spurious;
+			}
+		}
+	}
+	CHECK_MSG(recovered == landmarkCount / 4,
+		"Correspondence FEAT: every checked landmark's true partner must be recovered, got "
+		"%d of %d", recovered, landmarkCount / 4);
+	CHECK_MSG(spurious == 0, "Correspondence FEAT: zero spurious matches expected, got %d",
+		spurious);
+	CHECK_MSG(noiseUnmatched == 2,
+		"Correspondence FEAT: both A-only noise rows must report unmatched, got %d of 2",
+		noiseUnmatched);
+
+	// Cross-check every row against the independent oracle too.
+	for (int32_t i = 0; i < sampleCount; ++i)
+	{
+		const int32_t nativeA = sampleSourceIndices[static_cast<size_t>(i)];
+		const std::vector<float> queryA = M2PaddedProbeFromRow(fullA, nativeA);
+		const M3RefResult ref =
+			M3RefMatch(fullA, nullptr, fullB, nullptr, nativeA, queryA.data(), matchK);
+		const MatchPair& p = pairs[static_cast<size_t>(i)];
+		if (ref.matched)
+		{
+			CHECK_MSG(p.sourceIndexB == ref.sourceIndexB,
+				"Correspondence FEAT oracle cross-check, native A row %d: entry=%d oracle=%d",
+				nativeA, p.sourceIndexB, ref.sourceIndexB);
+		}
+		else
+		{
+			CHECK_MSG(p.sourceIndexB == -1,
+				"Correspondence FEAT oracle cross-check, native A row %d: oracle unmatched, "
+				"entry=%d", nativeA, p.sourceIndexB);
+		}
+	}
+}
+
+// M3 / dim 7 (kernel-true contract claim) — the reported pair set for the checked A rows
+// is INVARIANT to the sample size: a cap-3 sample and a cap-10 superset sample must report
+// bit-identical results for the OVERLAPPING rows, since scoring always runs against the
+// SAME full B/A views regardless of how many other A rows were sampled alongside them —
+// exactly what the deleted two-sided-sample design violated.
+static void TestM3KernelTrueSampleInvariance()
+{
+	Rng rng(0x9A11);
+	const int32_t dims = 12, aCount = 30, bCount = 25;
+	std::vector<float> aSrc, bSrc;
+	for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
+	for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
+	GBank fullA(aSrc, aCount, dims, Quantization::Float32, Metric::L2);
+	GBank fullB(bSrc, bCount, dims, Quantization::Float32, Metric::L2);
+	const int32_t matchK = 3;
+	Workspace ws; ws.Reserve(matchK, 1);
+
+	std::vector<int32_t> smallIdx = {0, 1, 2};
+	std::vector<int32_t> largeIdx;
+	for (int32_t i = 0; i < 10; ++i) largeIdx.push_back(i);
+
+	auto runSample = [&](const std::vector<int32_t>& idx, std::vector<MatchPair>& out) {
+		std::vector<float> src;
+		for (int32_t i : idx)
+		{
+			const float* row = aSrc.data() + static_cast<size_t>(i) * dims;
+			src.insert(src.end(), row, row + dims);
+		}
+		GBank sample(src, static_cast<int32_t>(idx.size()), dims, Quantization::Float32, Metric::L2);
+		out.resize(idx.size());
+		int32_t n = -999;
+		CHECK(MutualNearestMatches(sample.view, idx.data(), fullB.view, nullptr, fullA.view,
+			nullptr, matchK, out.data(), &n, ws) == Status::Ok);
+		CHECK(n == static_cast<int32_t>(idx.size()));
+	};
+
+	std::vector<MatchPair> smallOut, largeOut;
+	runSample(smallIdx, smallOut);
+	runSample(largeIdx, largeOut);
+
+	for (size_t i = 0; i < smallIdx.size(); ++i)
+	{
+		CHECK_MSG(smallOut[i].sourceIndexA == largeOut[i].sourceIndexA &&
+				smallOut[i].sourceIndexB == largeOut[i].sourceIndexB &&
+				smallOut[i].cslsMargin == largeOut[i].cslsMargin,
+			"kernel-true SampleLimit-invariance: native A row %d differs between a cap-3 "
+			"sample and a cap-10 sample (sourceIndexB %d vs %d, margin %.9g vs %.9g)",
+			smallIdx[i], smallOut[i].sourceIndexB, largeOut[i].sourceIndexB,
+			static_cast<double>(smallOut[i].cslsMargin), static_cast<double>(largeOut[i].cslsMargin));
+	}
+}
+
+// M3 / dim 6 (numerical edges, audit G-4) — CSLS direction per metric: on each of
+// Dot/Cosine/L2, a constructed EXACT pair must out-margin a constructed PERTURBED-but-
+// still-mutual pair, never only "finite and deterministic" (the sixth-fracture-shaped
+// concern: an un-converted L2 score would invert this). The fixture's own oracle self-
+// check (independent of the entry under test) proves the construction is sound before the
+// entry is compared against it.
+static void TestM3CslsDirectionPerMetric()
+{
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		const int32_t dims = 8;
+		auto row = [&](int32_t axis, float mag) {
+			std::vector<float> v(static_cast<size_t>(dims), 0.0f);
+			v[static_cast<size_t>(axis)] = mag;
+			return v;
+		};
+		std::vector<std::vector<float>> aRows = {
+			row(0, 10.0f), row(1, 10.0f), row(2, 20.0f), row(3, 20.0f), row(4, 20.0f), row(5, 20.0f)};
+		std::vector<std::vector<float>> bRows = aRows;
+		bRows[1] = row(1, 9.5f);
+		bRows[1][7] = 1.0f; // small off-axis perturbation -- degrades sim under every metric
+
+		std::vector<float> aSrc, bSrc;
+		for (auto& r : aRows) aSrc.insert(aSrc.end(), r.begin(), r.end());
+		for (auto& r : bRows) bSrc.insert(bSrc.end(), r.begin(), r.end());
+
+		GBank fullA(aSrc, 6, dims, Quantization::Float32, metric);
+		GBank fullB(bSrc, 6, dims, Quantization::Float32, metric);
+		std::vector<int32_t> sampleSourceIndices = {0, 1};
+
+		const int32_t matchK = 3;
+
+		// Fixture self-check: the oracle alone (no entry involved) must show the exact
+		// pair beating the perturbed pair.
+		const std::vector<float> queryRow0 = M2PaddedProbeFromRow(fullA, 0);
+		const std::vector<float> queryRow1 = M2PaddedProbeFromRow(fullA, 1);
+		const M3RefResult ref0 =
+			M3RefMatch(fullA, nullptr, fullB, nullptr, 0, queryRow0.data(), matchK);
+		const M3RefResult ref1 =
+			M3RefMatch(fullA, nullptr, fullB, nullptr, 1, queryRow1.data(), matchK);
+		CHECK_MSG(ref0.matched && ref1.matched && ref0.margin > ref1.margin,
+			"CSLS direction (metric=%d) fixture self-check: oracle margins exact=%.6g "
+			"perturbed=%.6g (matched0=%d matched1=%d)", static_cast<int>(metric), ref0.margin,
+			ref1.margin, ref0.matched, ref1.matched);
+
+		Workspace ws; ws.Reserve(matchK, 1);
+		std::vector<MatchPair> pairs(2);
+		int32_t pairCount = -999;
+		CHECK(MutualNearestMatches(fullA.view, sampleSourceIndices.data(), fullB.view, nullptr,
+			fullA.view, nullptr, matchK, pairs.data(), &pairCount, ws) == Status::Ok);
+
+		CHECK_MSG(pairs[0].sourceIndexB == 0 && pairs[1].sourceIndexB == 1,
+			"CSLS direction (metric=%d): both the exact and the perturbed pair must be "
+			"mutual matches, got sourceIndexB=[%d,%d]", static_cast<int>(metric),
+			pairs[0].sourceIndexB, pairs[1].sourceIndexB);
+		CHECK_MSG(pairs[0].cslsMargin > pairs[1].cslsMargin,
+			"CSLS direction (metric=%d): the EXACT pair's margin (%.6g) must beat the "
+			"perturbed pair's margin (%.6g) -- a nearer pair must never score lower",
+			static_cast<int>(metric), static_cast<double>(pairs[0].cslsMargin),
+			static_cast<double>(pairs[1].cslsMargin));
+		CHECK_MSG(std::fabs(static_cast<double>(pairs[0].cslsMargin) - ref0.margin) <
+					1e-3 * std::max(1.0, std::fabs(ref0.margin)) &&
+				std::fabs(static_cast<double>(pairs[1].cslsMargin) - ref1.margin) <
+					1e-3 * std::max(1.0, std::fabs(ref1.margin)),
+			"CSLS direction (metric=%d): entry margins must match the oracle (exact "
+			"entry=%.6g oracle=%.6g; perturbed entry=%.6g oracle=%.6g)",
+			static_cast<int>(metric), static_cast<double>(pairs[0].cslsMargin), ref0.margin,
+			static_cast<double>(pairs[1].cslsMargin), ref1.margin);
+	}
+}
+
+// M3 / dim 8 (composition) — a tombstoned B row is never reported as a match, and the
+// reported outcome (a different match, or unmatched) agrees with the oracle recomputed
+// WITH the same exclusion honored.
+static void TestM3ExclusionHonored()
+{
+	Rng rng(0xE9C1);
+	const int32_t dims = 12, aCount = 3, bCount = 5;
+	std::vector<float> aSrc, bSrc;
+	for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
+	for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
+	GBank fullA(aSrc, aCount, dims, Quantization::Float32, Metric::L2);
+	GBank fullB(bSrc, bCount, dims, Quantization::Float32, Metric::L2);
+
+	std::vector<int32_t> sampleIdx = {0, 1, 2};
+	const int32_t matchK = 2;
+	Workspace ws; ws.Reserve(matchK, 1);
+
+	std::vector<MatchPair> baseline(3);
+	int32_t n = -999;
+	CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, matchK, baseline.data(), &n, ws) == Status::Ok);
+
+	for (int32_t r = 0; r < aCount; ++r)
+	{
+		if (baseline[static_cast<size_t>(r)].sourceIndexB < 0)
+		{
+			continue; // nothing to exclude if row r has no baseline match
+		}
+		const int32_t excludeB = baseline[static_cast<size_t>(r)].sourceIndexB;
+		std::vector<uint32_t> exclB((static_cast<size_t>(bCount) + 31) / 32, 0u);
+		exclB[static_cast<size_t>(excludeB) >> 5] |= (1u << (excludeB & 31));
+
+		std::vector<MatchPair> excluded(3);
+		int32_t n2 = -999;
+		CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, exclB.data(),
+			fullA.view, nullptr, matchK, excluded.data(), &n2, ws) == Status::Ok);
+		CHECK_MSG(excluded[static_cast<size_t>(r)].sourceIndexB != excludeB,
+			"a tombstoned B row must never be reported as a match (row %d, excluded B=%d)", r,
+			excludeB);
+
+		const std::vector<float> queryA = M2PaddedProbeFromRow(fullA, r);
+		const M3RefResult ref =
+			M3RefMatch(fullA, nullptr, fullB, exclB.data(), r, queryA.data(), matchK);
+		const MatchPair& p = excluded[static_cast<size_t>(r)];
+		if (ref.matched)
+		{
+			CHECK_MSG(p.sourceIndexB == ref.sourceIndexB,
+				"exclusion-honored correctness, row %d: entry=%d oracle=%d", r, p.sourceIndexB,
+				ref.sourceIndexB);
+		}
+		else
+		{
+			CHECK_MSG(p.sourceIndexB == -1,
+				"exclusion-honored correctness, row %d: oracle unmatched, entry=%d", r,
+				p.sourceIndexB);
+		}
+	}
+}
+
+// M3 / dim 6 — repeat-call bit-equality.
+static void TestM3RepeatDeterminism()
+{
+	Rng rng(0xDE7E);
+	const int32_t dims = 16, aCount = 14, bCount = 12;
+	std::vector<float> aSrc, bSrc;
+	for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
+	for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
+	GBank fullA(aSrc, aCount, dims, Quantization::Int8, Metric::Cosine);
+	GBank fullB(bSrc, bCount, dims, Quantization::Int8, Metric::Cosine);
+	std::vector<int32_t> sampleIdx;
+	for (int32_t i = 0; i < aCount; ++i) sampleIdx.push_back(i);
+
+	const int32_t matchK = 3;
+	Workspace ws; ws.Reserve(matchK, 1);
+	std::vector<MatchPair> out1(static_cast<size_t>(aCount)), out2(static_cast<size_t>(aCount));
+	int32_t n1 = -999, n2 = -999;
+	CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, matchK, out1.data(), &n1, ws) == Status::Ok);
+	CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, matchK, out2.data(), &n2, ws) == Status::Ok);
+	CHECK(n1 == n2);
+	for (int32_t i = 0; i < n1; ++i)
+	{
+		CHECK_MSG(out1[static_cast<size_t>(i)].sourceIndexB == out2[static_cast<size_t>(i)].sourceIndexB &&
+				out1[static_cast<size_t>(i)].cslsMargin == out2[static_cast<size_t>(i)].cslsMargin,
+			"MutualNearestMatches repeat call must be bit-identical (row %d)", i);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -16132,6 +16725,15 @@ int main()
 	TestM2KthNeighborDistance();
 	TestM2CalibrateNoveltyBaseline();
 	TestM2TwoLimbVerdictFeat();
+
+	// V3.2 red suite (Curie): Bank Inspector I — module M3 matching.h (plan section 25).
+	TestM3MutualNearestMatchesTrustBoundaries();
+	TestM3MutualNearestMatchesCorrectness();
+	TestM3CorrespondencePermutationFeat();
+	TestM3KernelTrueSampleInvariance();
+	TestM3CslsDirectionPerMetric();
+	TestM3ExclusionHonored();
+	TestM3RepeatDeterminism();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
