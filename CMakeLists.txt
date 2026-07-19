@@ -15,6 +15,7 @@ add_library(superfaiss STATIC
 	src/analytics.cpp
 	src/pca.cpp
 	src/scratch.cpp
+	src/graph.cpp
 )
 target_include_directories(superfaiss PUBLIC include)
 

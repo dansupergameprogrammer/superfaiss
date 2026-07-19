@@ -8,6 +8,7 @@
 // epsilon boundary check rather than exact rank equality.
 
 #include "superfaiss/superfaiss.h"
+#include "superfaiss/graph.h" // V3.2 M1 (Bank Inspector I)
 
 #include "xd_fixtures.h"
 
@@ -14219,6 +14220,643 @@ static void TestRelabelDemoteFeat()
 	}
 }
 
+// ===========================================================================
+// V3.2 red suite (Curie, 2026-07-18): Bank Inspector I — module M1 graph.h
+// (plan section 25, Coverage Model section 25.9). Realizes the M1 cells against
+// the RED SCAFFOLD stub at src/graph.cpp (every body returns Ok and writes
+// nothing — the proven V3.1 no-op-stub pattern), so every cell below fails for
+// its cell's reason: a FEAT/exactness cell reads its poison-initialized output
+// buffer where it expects the constructed component structure; a dim-2 rejection
+// cell sees Ok where it expects InvalidArgument.
+// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+//
+// Oracle discipline (the D-V32 strike loop, "build don't reason"):
+//  * the neighbor/edge REF is a double-precision brute force over the DEQUANTIZED
+//    rows the kernel actually scores (GBank::refRows), same total order as the
+//    library (score, then ascending index);
+//  * the duplicate-union / multi-block-separation / fringe geometries are the
+//    EXECUTED construction_check.cpp fixtures (Claude/Loki/strike8, 10/10 true
+//    counts) ported verbatim — well-separated so float-vs-double ranking cannot
+//    disagree; the component-count oracle is the construction, not intuition
+//    (the D-V32-25 corollary);
+//  * the Structure FEAT ground truth is CONSTRUCTED (planted blobs/isolates/
+//    duplicate blocks), never a re-run of the implementation — a wrong-but-
+//    deterministic grapher fails it (dimension 10).
+// ===========================================================================
+
+namespace
+{
+	// A baked in-memory bank built from EXPLICIT source rows (the constructed-
+	// geometry sibling of TestBank, which fills random rows). refRows holds the
+	// double-precision dequantized values the kernel effectively scores.
+	struct GBank
+	{
+		std::vector<float> source;
+		std::vector<double> refRows;
+		AlignedBuf payload;
+		std::vector<float> scales;
+		BankView view;
+
+		GBank(const std::vector<float>& src, int32_t count, int32_t dims,
+			Quantization quant, Metric metric)
+			: payload(static_cast<size_t>(count > 0 ? count : 1) *
+				PaddedDims(dims, quant) * ElementSize(quant))
+		{
+			source = src;
+			if (metric == Metric::Cosine && count > 0)
+			{
+				CHECK(NormalizeRows(source.data(), count, dims, nullptr) == Status::Ok);
+			}
+			const int32_t pd = PaddedDims(dims, quant);
+			refRows.resize(static_cast<size_t>(count) * dims);
+			if (quant == Quantization::Float32)
+			{
+				PadRowsFloat32(source.data(), count, dims, pd, payload.F32());
+				for (size_t i = 0; i < source.size(); ++i)
+				{
+					refRows[i] = static_cast<double>(source[i]);
+				}
+			}
+			else
+			{
+				scales.resize(static_cast<size_t>(count > 0 ? count : 1));
+				QuantizeRowsInt8(source.data(), count, dims, pd, payload.I8(), scales.data());
+				for (int32_t r = 0; r < count; ++r)
+				{
+					for (int32_t i = 0; i < dims; ++i)
+					{
+						refRows[static_cast<size_t>(r) * dims + i] =
+							static_cast<double>(scales[r]) *
+							payload.I8()[static_cast<int64_t>(r) * pd + i];
+					}
+				}
+			}
+			view.rows = payload.ptr;
+			view.scales = quant == Quantization::Int8 ? scales.data() : nullptr;
+			view.count = count;
+			view.dims = dims;
+			view.paddedDims = pd;
+			view.quant = quant;
+			view.metric = metric;
+		}
+	};
+
+	// Union-find with smallest-index-as-root (ids canonicalize to the smallest
+	// member row index — the pinned convention, matching construction_check.cpp).
+	struct DSU
+	{
+		std::vector<int32_t> parent;
+		explicit DSU(int32_t n) : parent(static_cast<size_t>(n))
+		{
+			for (int32_t i = 0; i < n; ++i) parent[i] = i;
+		}
+		int32_t Find(int32_t x)
+		{
+			while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+			return x;
+		}
+		void Union(int32_t a, int32_t b)
+		{
+			a = Find(a); b = Find(b);
+			if (a < b) parent[b] = a; else if (b < a) parent[a] = b;
+		}
+	};
+
+	// Brute-force top-k neighbor indices per row, from the dequantized rows, in the
+	// library's total order. The query for row r is row r's own dequantized value
+	// (DequantizeRowAsQuery), exactly what BuildKnnNeighbors probes with.
+	std::vector<int32_t> BruteKnn(const GBank& b, int32_t k, bool excludeSelf)
+	{
+		const int32_t n = b.view.count, dims = b.view.dims;
+		const Metric m = b.view.metric;
+		std::vector<int32_t> out(static_cast<size_t>(n) * k, -1);
+		for (int32_t r = 0; r < n; ++r)
+		{
+			std::vector<RefHit> hits;
+			hits.reserve(static_cast<size_t>(n));
+			const double* rr = &b.refRows[static_cast<size_t>(r) * dims];
+			for (int32_t s = 0; s < n; ++s)
+			{
+				if (excludeSelf && s == r) continue;
+				const double* ss = &b.refRows[static_cast<size_t>(s) * dims];
+				double score = 0.0;
+				if (m == Metric::L2)
+				{
+					for (int32_t i = 0; i < dims; ++i) { const double d = rr[i] - ss[i]; score += d * d; }
+				}
+				else
+				{
+					for (int32_t i = 0; i < dims; ++i) score += rr[i] * ss[i];
+				}
+				hits.push_back({s, score});
+			}
+			std::sort(hits.begin(), hits.end(),
+				[&](const RefHit& a, const RefHit& c) { return RefBetter(a, c, m); });
+			for (int32_t j = 0; j < k && j < static_cast<int32_t>(hits.size()); ++j)
+			{
+				out[static_cast<size_t>(r) * k + j] = hits[j].index;
+			}
+		}
+		return out;
+	}
+
+	// Brute mutual flags from a neighbor list (edge (i,j) mutual iff each lists the other).
+	std::vector<uint8_t> BruteMutual(const std::vector<int32_t>& nb, int32_t n, int32_t k)
+	{
+		auto inList = [&](int32_t row, int32_t x) {
+			for (int32_t t = 0; t < k; ++t) if (nb[static_cast<size_t>(row) * k + t] == x) return true;
+			return false;
+		};
+		std::vector<uint8_t> flags(static_cast<size_t>(n) * k, 0);
+		for (int32_t i = 0; i < n; ++i)
+		{
+			for (int32_t t = 0; t < k; ++t)
+			{
+				const int32_t j = nb[static_cast<size_t>(i) * k + t];
+				if (j >= 0 && inList(j, i)) flags[static_cast<size_t>(i) * k + t] = 1;
+			}
+		}
+		return flags;
+	}
+
+	// Exact-duplicate group representative per row: the smallest row index with
+	// identical stored bytes (and scale, for int8). Same-decode-different-bytes rows
+	// are NOT grouped.
+	std::vector<int32_t> BruteGroupOf(const GBank& b)
+	{
+		const int32_t n = b.view.count;
+		const size_t rb = static_cast<size_t>(b.view.paddedDims) * ElementSize(b.view.quant);
+		std::vector<int32_t> g(static_cast<size_t>(n));
+		for (int32_t i = 0; i < n; ++i)
+		{
+			g[i] = i;
+			for (int32_t j = 0; j < i; ++j)
+			{
+				bool same = std::memcmp(static_cast<const char*>(b.view.rows) + static_cast<size_t>(i) * rb,
+					static_cast<const char*>(b.view.rows) + static_cast<size_t>(j) * rb, rb) == 0;
+				if (same && b.view.quant == Quantization::Int8) same = b.scales[i] == b.scales[j];
+				if (same) { g[i] = g[j]; break; }
+			}
+		}
+		return g;
+	}
+
+	// Construction-form connected components (the executed construction_check.cpp
+	// mechanism): per-row k-NN over the untouched population (self-excluded), union
+	// byte+scale-identical rows (construction edges), then mutual edges; ids = smallest
+	// member. The REF oracle for ConnectedComponents on well-separated fixtures.
+	std::vector<int32_t> BruteComponents(const GBank& b, int32_t k)
+	{
+		const int32_t n = b.view.count;
+		const std::vector<int32_t> nb = BruteKnn(b, k, true);
+		const std::vector<int32_t> g = BruteGroupOf(b);
+		DSU dsu(n);
+		for (int32_t r = 0; r < n; ++r) if (g[r] != r) dsu.Union(r, g[r]);
+		auto inList = [&](int32_t row, int32_t x) {
+			for (int32_t t = 0; t < k; ++t) if (nb[static_cast<size_t>(row) * k + t] == x) return true;
+			return false;
+		};
+		for (int32_t i = 0; i < n; ++i)
+		{
+			for (int32_t t = 0; t < k; ++t)
+			{
+				const int32_t j = nb[static_cast<size_t>(i) * k + t];
+				if (j > i && inList(j, i)) dsu.Union(i, j);
+			}
+		}
+		std::vector<int32_t> id(static_cast<size_t>(n));
+		for (int32_t i = 0; i < n; ++i) id[i] = dsu.Find(i);
+		return id;
+	}
+
+	int32_t ComponentCount(const std::vector<int32_t>& ids)
+	{
+		std::vector<int32_t> seen;
+		for (int32_t x : ids) if (std::find(seen.begin(), seen.end(), x) == seen.end()) seen.push_back(x);
+		return static_cast<int32_t>(seen.size());
+	}
+
+	// Run the full M1 pipeline through the module under test into caller buffers.
+	// Returns the aggregate status (first non-Ok, else Ok). outIds is poison-init'd by
+	// the caller so a no-op stub leaves it detectably wrong.
+	Status RunM1Pipeline(const GBank& b, int32_t k, std::vector<int32_t>& outIds)
+	{
+		const int32_t n = b.view.count;
+		// Distinct-per-row poison: a no-op stub that writes nothing leaves each row its
+		// own singleton, so ComponentCount == n (never the small expected counts) — the
+		// FEAT cells fail red rather than falsely reading a single uniform-poison component.
+		for (int32_t r = 0; r < n; ++r) outIds[r] = -(r + 2);
+		std::vector<int32_t> nb(static_cast<size_t>(n) * k, -999);
+		std::vector<uint8_t> flags(static_cast<size_t>(n) * k, 0xEE);
+		std::vector<int32_t> groups(static_cast<size_t>(n), -999);
+		std::vector<int32_t> ufScratch(static_cast<size_t>(n), 0);
+		std::vector<int32_t> hashScratch(static_cast<size_t>(n), 0);
+		Workspace ws;
+		ws.Reserve(k + 1, 1);
+		Status s = BuildKnnNeighbors(b.view, k, true, nb.data(), ws);
+		if (s != Status::Ok) return s;
+		s = MutualFilter(n, k, nb.data(), flags.data());
+		if (s != Status::Ok) return s;
+		s = BuildDuplicateGroups(b.view, groups.data(), hashScratch.data());
+		if (s != Status::Ok) return s;
+		return ConnectedComponents(n, k, nb.data(), flags.data(), groups.data(),
+			outIds.data(), ufScratch.data());
+	}
+
+	// A tight blob of `m` rows jittered around `centre` (dims), jitter << inter-centre
+	// gap so every blob row's whole top-k stays inside the blob (one component, robust
+	// to float-vs-double ranking).
+	void PushBlob(std::vector<float>& src, int32_t dims, const std::vector<float>& centre,
+		int32_t m, Rng& rng, float jitter)
+	{
+		for (int32_t i = 0; i < m; ++i)
+			for (int32_t d = 0; d < dims; ++d)
+				src.push_back(centre[static_cast<size_t>(d)] + jitter * rng.NextFloat());
+	}
+}
+
+// M1 / dim 2 (trust boundaries) — every module rejects k<1, k>=count, count 0/1 where a
+// k-th neighbor cannot exist, and null buffers, with InvalidArgument and no output write.
+static void TestM1TrustBoundaries()
+{
+	Rng rng(0xB1);
+	std::vector<float> src;
+	const int32_t dims = 8, count = 6;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+	Workspace ws; ws.Reserve(8, 1);
+	std::vector<int32_t> nb(static_cast<size_t>(count) * 4, -999);
+
+	// k < 1 and k >= count reject.
+	CHECK_MSG(BuildKnnNeighbors(b.view, 0, true, nb.data(), ws) == Status::InvalidArgument,
+		"BuildKnnNeighbors k=0 must reject");
+	CHECK_MSG(BuildKnnNeighbors(b.view, count, true, nb.data(), ws) == Status::InvalidArgument,
+		"BuildKnnNeighbors k>=count must reject");
+	// Null buffer rejects, no write.
+	CHECK_MSG(BuildKnnNeighbors(b.view, 2, true, nullptr, ws) == Status::InvalidArgument,
+		"BuildKnnNeighbors null out must reject");
+	CHECK_MSG(nb[0] == -999, "rejected BuildKnnNeighbors must not write output");
+
+	std::vector<uint8_t> flags(static_cast<size_t>(count) * 2, 0xEE);
+	CHECK_MSG(MutualFilter(count, 0, nb.data(), flags.data()) == Status::InvalidArgument,
+		"MutualFilter k=0 must reject");
+	CHECK_MSG(MutualFilter(0, 2, nb.data(), flags.data()) == Status::InvalidArgument,
+		"MutualFilter count=0 must reject");
+	CHECK_MSG(MutualFilter(count, 2, nullptr, flags.data()) == Status::InvalidArgument,
+		"MutualFilter null neighbors must reject");
+
+	std::vector<int32_t> groups(static_cast<size_t>(count), -999), hs(static_cast<size_t>(count), 0);
+	CHECK_MSG(BuildDuplicateGroups(b.view, nullptr, hs.data()) == Status::InvalidArgument,
+		"BuildDuplicateGroups null out must reject");
+
+	std::vector<int32_t> ids(static_cast<size_t>(count), -999), uf(static_cast<size_t>(count), 0);
+	CHECK_MSG(ConnectedComponents(count, 2, nullptr, flags.data(), groups.data(), ids.data(), uf.data())
+		== Status::InvalidArgument, "ConnectedComponents null neighbors must reject");
+	CHECK_MSG(ids[0] == -999, "rejected ConnectedComponents must not write output");
+
+	// count 0 and count 1: no k-th neighbor can exist (G-2, the empty/singleton extreme).
+	{
+		std::vector<float> empty;
+		GBank b0(empty, 0, dims, Quantization::Float32, Metric::L2);
+		std::vector<int32_t> nb0(1, -999);
+		Workspace ws0; ws0.Reserve(2, 1);
+		CHECK_MSG(BuildKnnNeighbors(b0.view, 1, true, nb0.data(), ws0) == Status::InvalidArgument,
+			"BuildKnnNeighbors on empty bank (count=0) must reject — no k-th neighbor");
+		std::vector<float> one(src.begin(), src.begin() + dims);
+		GBank b1(one, 1, dims, Quantization::Float32, Metric::L2);
+		std::vector<int32_t> nb1(1, -999);
+		CHECK_MSG(BuildKnnNeighbors(b1.view, 1, true, nb1.data(), ws0) == Status::InvalidArgument,
+			"BuildKnnNeighbors on singleton (count=1, self-excluded) must reject — no k-th neighbor");
+	}
+}
+
+// M1 / dim 2 (byte-confirm) + dim 7 (int8 same-decode-different-scale NOT unioned) —
+// grouping is FULL BYTE equality, not decode equality: a scalar-multiple pair that
+// decodes to the same direction but stores different int8 bytes/scale is a near-
+// duplicate, never grouped.
+static void TestM1DuplicateGroupingByteConfirm()
+{
+	const int32_t dims = 8;
+	// Rows 0,1 byte-identical (same float content). Row 2 = 2*row0 (L2: different
+	// content, so different group by definition). Row 3 unique.
+	std::vector<float> src = {
+		0.5f, -0.25f, 0.75f, 0.1f, -0.4f, 0.2f, 0.6f, -0.3f,   // row 0
+		0.5f, -0.25f, 0.75f, 0.1f, -0.4f, 0.2f, 0.6f, -0.3f,   // row 1 == row 0
+		1.0f, -0.5f, 1.5f, 0.2f, -0.8f, 0.4f, 1.2f, -0.6f,     // row 2 = 2*row0
+		-0.9f, 0.1f, 0.3f, -0.7f, 0.55f, -0.15f, 0.05f, 0.8f,  // row 3 unique
+	};
+	const int32_t count = 4;
+	for (Quantization q : {Quantization::Float32, Quantization::Int8})
+	{
+		GBank b(src, count, dims, q, Metric::L2);
+		std::vector<int32_t> g(static_cast<size_t>(count), -999), hs(static_cast<size_t>(count), 0);
+		const Status s = BuildDuplicateGroups(b.view, g.data(), hs.data());
+		CHECK_MSG(s == Status::Ok, "BuildDuplicateGroups must succeed on a valid bank");
+		const std::vector<int32_t> ref = BruteGroupOf(b);
+		for (int32_t r = 0; r < count; ++r)
+			CHECK_MSG(g[r] == ref[r], "groupOf[%d]=%d expected %d (byte-confirmed identity)", r, g[r], ref[r]);
+		// Rows 0 and 1 share a group; row 2 (scalar multiple) does NOT (different bytes).
+		CHECK_MSG(g[1] == 0, "byte-identical rows 0,1 must group");
+		CHECK_MSG(g[2] == 2, "scalar-multiple row 2 stores different bytes -> not grouped (near-duplicate)");
+		CHECK_MSG(g[3] == 3, "unique row 3 is its own group");
+	}
+}
+
+// M1 / dim 7 (edges exact) + G-3 (per-metric generality) — the built neighbor list,
+// mutual flags, and component ids equal the double-precision brute force on a well-
+// separated fixture, for Dot, Cosine, and L2, int8 and float32.
+static void TestM1EdgesExactAcrossMetrics()
+{
+	Rng rng(0x7E5);
+	const int32_t dims = 32, blobs = 4, per = 12, k = 5;
+	const int32_t count = blobs * per;
+	for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+	{
+		for (Quantization q : {Quantization::Float32, Quantization::Int8})
+		{
+			// Well-separated blobs so top-k membership is unambiguous (no float/double ties).
+			std::vector<float> src;
+			for (int32_t bl = 0; bl < blobs; ++bl)
+			{
+				std::vector<float> centre(static_cast<size_t>(dims), 0.0f);
+				centre[static_cast<size_t>(bl)] = 20.0f * (bl + 1);
+				PushBlob(src, dims, centre, per, rng, 0.05f);
+			}
+			GBank b(src, count, dims, q, metric);
+			Workspace ws; ws.Reserve(k + 1, 1);
+			std::vector<int32_t> nb(static_cast<size_t>(count) * k, -999);
+			CHECK(BuildKnnNeighbors(b.view, k, true, nb.data(), ws) == Status::Ok);
+			const std::vector<int32_t> refNb = BruteKnn(b, k, true);
+			int32_t nbMismatch = 0;
+			for (size_t i = 0; i < nb.size(); ++i) if (nb[i] != refNb[i]) ++nbMismatch;
+			CHECK_MSG(nbMismatch == 0, "neighbor list must equal brute force (metric=%d quant=%d): %d mismatches",
+				(int)metric, (int)q, nbMismatch);
+
+			std::vector<uint8_t> flags(static_cast<size_t>(count) * k, 0xEE);
+			CHECK(MutualFilter(count, k, nb.data(), flags.data()) == Status::Ok);
+			const std::vector<uint8_t> refFlags = BruteMutual(refNb, count, k);
+			int32_t flagMismatch = 0;
+			for (size_t i = 0; i < flags.size(); ++i) if (flags[i] != refFlags[i]) ++flagMismatch;
+			CHECK_MSG(flagMismatch == 0, "mutual flags must equal brute force (metric=%d quant=%d)", (int)metric, (int)q);
+
+			std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+			CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+			const std::vector<int32_t> refIds = BruteComponents(b, k);
+			// Each blob is one component; ids equal the brute-force partition exactly.
+			int32_t idMismatch = 0;
+			for (int32_t r = 0; r < count; ++r) if (ids[r] != refIds[r]) ++idMismatch;
+			CHECK_MSG(idMismatch == 0, "component ids must equal brute force (metric=%d quant=%d)", (int)metric, (int)q);
+			CHECK_MSG(ComponentCount(ids) == blobs, "well-separated blobs -> %d components (metric=%d quant=%d), got %d",
+				blobs, (int)metric, (int)q, ComponentCount(ids));
+		}
+	}
+}
+
+// M1 / dim 4 + dim 7 + dim 10 (identical => one component; multi-block separation) —
+// the EXECUTED construction_check.cpp geometries ported verbatim (strike 7/8, 10/10 true
+// counts): an exact-duplicate block of m>k+1 collapses to ONE component; D well-separated
+// duplicate blocks yield exactly D components (construction edges never fabricate cross-
+// block edges); interleaved index order changes nothing.
+static void TestM1DuplicateUnionConstructionCounts()
+{
+	auto sep = [](int32_t bl) {
+		std::vector<float> v(8, 0.0f); v[0] = 100.0f * (bl + 1); v[1] = 7.0f * bl; return v;
+	};
+	const int32_t dims = 8;
+	// strike 7: one identical block of 10, k=2 (m > k+1) -> 1 component.
+	{
+		std::vector<float> src;
+		for (int32_t i = 0; i < 10; ++i) { auto c = sep(0); src.insert(src.end(), c.begin(), c.end()); }
+		GBank b(src, 10, dims, Quantization::Float32, Metric::L2);
+		std::vector<int32_t> ids(10, -999);
+		CHECK(RunM1Pipeline(b, 2, ids) == Status::Ok);
+		CHECK_MSG(ComponentCount(ids) == 1, "identical block m=10,k=2 -> 1 component (construction union), got %d",
+			ComponentCount(ids));
+	}
+	// strike 8: D in {2,3,5} well-separated duplicate blocks x8, k=4 -> D components,
+	// contiguous AND interleaved index order.
+	for (int32_t D : {2, 3, 5})
+	{
+		const int32_t m = 8, k = 4, count = D * m;
+		for (int interleave = 0; interleave < 2; ++interleave)
+		{
+			std::vector<int32_t> blockOf(static_cast<size_t>(count));
+			for (int32_t r = 0; r < count; ++r) blockOf[r] = interleave ? (r % D) : (r / m);
+			std::vector<float> src;
+			for (int32_t r = 0; r < count; ++r) { auto c = sep(blockOf[r]); src.insert(src.end(), c.begin(), c.end()); }
+			GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+			std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+			CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+			CHECK_MSG(ComponentCount(ids) == D,
+				"%d duplicate blocks (interleave=%d) -> %d components, got %d",
+				D, interleave, D, ComponentCount(ids));
+		}
+	}
+	// unequal block sizes 3/8/17 -> 3 components.
+	{
+		const int32_t k = 4;
+		const int32_t sizes[] = {3, 8, 17};
+		std::vector<float> src; int32_t count = 0;
+		for (int32_t bl = 0; bl < 3; ++bl)
+			for (int32_t i = 0; i < sizes[bl]; ++i) { auto c = sep(bl); src.insert(src.end(), c.begin(), c.end()); ++count; }
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+		CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+		CHECK_MSG(ComponentCount(ids) == 3, "unequal blocks 3/8/17 -> 3 components, got %d", ComponentCount(ids));
+	}
+	// int8 same-decode-different-scale must NOT union (identity is stored content):
+	// two byte-different blocks that dequantize to parallel directions stay separate.
+	{
+		const int32_t k = 3, count = 12;
+		std::vector<float> src;
+		for (int32_t i = 0; i < 6; ++i) { std::vector<float> c(8, 0.0f); c[0] = 1.0f; c[1] = 0.5f; src.insert(src.end(), c.begin(), c.end()); }
+		for (int32_t i = 0; i < 6; ++i) { std::vector<float> c(8, 0.0f); c[0] = 50.0f; c[1] = 25.0f; src.insert(src.end(), c.begin(), c.end()); }
+		GBank b(src, count, dims, Quantization::Int8, Metric::L2);
+		std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+		CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+		CHECK_MSG(ComponentCount(ids) == 2, "same-decode-different-scale blocks stay 2 components (L2), got %d",
+			ComponentCount(ids));
+	}
+}
+
+// M1 / dim 4 + dim 10 (traced fringe oracle) — the construction_check.cpp fringe pair
+// (m=k connects, m=k+1 saturates): an outside neighbour of an m>k block stays unconnected
+// because its partner's top-k is saturated by group-mates; when m<=k the edge forms. The
+// oracle is COMPUTED from the mechanism, never intuited (D-V32-25 corollary).
+static void TestM1FringeBoundary()
+{
+	auto sep = [](int32_t bl) {
+		std::vector<float> v(8, 0.0f); v[0] = 100.0f * (bl + 1); v[1] = 7.0f * bl; return v;
+	};
+	const int32_t dims = 8, k = 4;
+	for (int32_t m : {4, 5}) // m=k connects (1 comp); m=k+1 saturates (2 comps)
+	{
+		const int32_t count = m + 1;
+		std::vector<float> src;
+		for (int32_t i = 0; i < m; ++i) { auto c = sep(0); src.insert(src.end(), c.begin(), c.end()); }
+		std::vector<float> fringe = sep(0); fringe[2] += 0.5f; // near block 0, DISTINCT content
+		src.insert(src.end(), fringe.begin(), fringe.end());
+		GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+		std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+		CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+		const int32_t expect = (m <= k) ? 1 : 2;
+		CHECK_MSG(ComponentCount(ids) == expect,
+			"fringe m=%d,k=%d -> %d components (saturation semantics), got %d", m, k, expect, ComponentCount(ids));
+	}
+}
+
+// M1 / dim 6 (determinism) — repeat-call bit-equality of neighbors, flags, and component
+// ids; and component-id canonicalization to the smallest member under an ADVERSARIAL edge
+// input (ids are a property of the final partition, not insertion order).
+static void TestM1RepeatAndCanonicalId()
+{
+	Rng rng(0xD6);
+	const int32_t dims = 16, count = 40, k = 6;
+	std::vector<float> src;
+	for (int32_t bl = 0; bl < 4; ++bl)
+	{
+		std::vector<float> centre(static_cast<size_t>(dims), 0.0f);
+		centre[static_cast<size_t>(bl)] = 15.0f * (bl + 1);
+		PushBlob(src, dims, centre, 10, rng, 0.05f);
+	}
+	GBank b(src, count, dims, Quantization::Float32, Metric::Cosine);
+	std::vector<int32_t> ids1(static_cast<size_t>(count), -999), ids2(static_cast<size_t>(count), -777);
+	CHECK(RunM1Pipeline(b, k, ids1) == Status::Ok);
+	CHECK(RunM1Pipeline(b, k, ids2) == Status::Ok);
+	int32_t drift = 0;
+	for (int32_t r = 0; r < count; ++r) if (ids1[r] != ids2[r]) ++drift;
+	CHECK_MSG(drift == 0, "repeat-call component ids must be bit-identical, %d drifted", drift);
+
+	// Correctness against the brute-force partition (so the cell is red for a feature
+	// reason against the stub, not only vacuously deterministic).
+	const std::vector<int32_t> refIds = BruteComponents(b, k);
+	int32_t idMismatch = 0;
+	for (int32_t r = 0; r < count; ++r) if (ids1[r] != refIds[r]) ++idMismatch;
+	CHECK_MSG(idMismatch == 0, "component ids must equal the brute-force partition, %d mismatch", idMismatch);
+
+	// Canonicalization: every row's id is the smallest index in its component.
+	for (int32_t r = 0; r < count; ++r)
+	{
+		int32_t smallest = r;
+		for (int32_t s = 0; s < count; ++s) if (ids1[s] == ids1[r] && s < smallest) smallest = s;
+		CHECK_MSG(ids1[r] == smallest, "component id of row %d must be its smallest member %d, got %d",
+			r, smallest, ids1[r]);
+	}
+}
+
+// M1 / dim 1 (lifetime/reuse) — one warm workspace driven GROW-then-SHRINK-then-GROW
+// (large view, then small, then large) yields results bit-identical to fresh-workspace
+// runs (N-1: the adversarial order that exercises stale-byte leakage).
+static void TestM1WarmWorkspaceGrowShrink()
+{
+	Rng rng(0x1F);
+	const int32_t dims = 24, k = 5;
+	auto makeBank = [&](int32_t count) {
+		std::vector<float> src;
+		const int32_t blobs = count / 10;
+		for (int32_t bl = 0; bl < blobs; ++bl)
+		{
+			std::vector<float> centre(static_cast<size_t>(dims), 0.0f);
+			centre[static_cast<size_t>(bl % dims)] = 15.0f * (bl + 1);
+			PushBlob(src, dims, centre, 10, rng, 0.05f);
+		}
+		return GBank(src, blobs * 10, dims, Quantization::Int8, Metric::L2);
+	};
+	const int32_t sizes[] = {80, 20, 80}; // large, small, large
+	Workspace warm; warm.Reserve(k + 1, 1);
+	for (int32_t count : sizes)
+	{
+		GBank b = makeBank(count);
+		std::vector<int32_t> nbWarm(static_cast<size_t>(count) * k, -999);
+		CHECK(BuildKnnNeighbors(b.view, k, true, nbWarm.data(), warm) == Status::Ok);
+		Workspace fresh; fresh.Reserve(k + 1, 1);
+		std::vector<int32_t> nbFresh(static_cast<size_t>(count) * k, -111);
+		CHECK(BuildKnnNeighbors(b.view, k, true, nbFresh.data(), fresh) == Status::Ok);
+		int32_t diff = 0;
+		for (size_t i = 0; i < nbWarm.size(); ++i) if (nbWarm[i] != nbFresh[i]) ++diff;
+		CHECK_MSG(diff == 0, "warm-reuse (count=%d in grow-shrink-grow) must equal fresh, %d differ", count, diff);
+	}
+}
+
+// M1 / dim 10 (Structure FEAT, the crux) — constructed ground truth: three tight, well-
+// separated blobs (each one component) + two planted isolates (outliers) + well-separated
+// exact-duplicate blocks (D in {2,3,5} via the block-count parameter) each collapsing to
+// one component. Row count above a query chunk boundary so the batch path's chunking
+// engages (the core-level "setting that matters"; the above-SampleLimit engagement is the
+// Panel FEAT's, where sampling exists). A wrong-but-deterministic grapher (merges blobs,
+// fragments them, or fabricates cross-block edges) fails.
+static void TestM1StructureFeat()
+{
+	for (int32_t D : {2, 3, 5})
+	{
+		Rng rng(0xFEA7u + static_cast<uint64_t>(D));
+		const int32_t dims = 64, k = 16, minComp = 3;
+		const int32_t blobSize = 400; // 3 blobs = 1200 rows -> above a 64-dim int8 chunk (1024 rows)
+		std::vector<float> src;
+		std::vector<int32_t> planted; // ground-truth: component tag per row (-1 = isolate/outlier)
+		int32_t compTag = 0;
+		// Three tight, far-apart blobs.
+		for (int32_t bl = 0; bl < 3; ++bl)
+		{
+			std::vector<float> centre(static_cast<size_t>(dims), 0.0f);
+			centre[static_cast<size_t>(bl * 5)] = 50.0f * (bl + 1);
+			PushBlob(src, dims, centre, blobSize, rng, 0.05f);
+			for (int32_t i = 0; i < blobSize; ++i) planted.push_back(compTag);
+			++compTag;
+		}
+		// D well-separated exact-duplicate blocks (each block byte-identical, size 6 > k+? but
+		// unioned by construction regardless of k), each its own component.
+		for (int32_t d = 0; d < D; ++d)
+		{
+			std::vector<float> c(static_cast<size_t>(dims), 0.0f);
+			c[static_cast<size_t>(dims - 1 - d)] = 500.0f * (d + 1);
+			for (int32_t i = 0; i < 6; ++i) { src.insert(src.end(), c.begin(), c.end()); planted.push_back(compTag); }
+			++compTag;
+		}
+		// Two planted isolates: far from everything, no neighbours -> outliers.
+		for (int32_t iso = 0; iso < 2; ++iso)
+		{
+			std::vector<float> c(static_cast<size_t>(dims), 0.0f);
+			c[static_cast<size_t>(dims / 2 + iso)] = 9000.0f * (iso + 1);
+			src.insert(src.end(), c.begin(), c.end());
+			planted.push_back(-1);
+		}
+		const int32_t count = static_cast<int32_t>(planted.size());
+		GBank b(src, count, dims, Quantization::Int8, Metric::L2);
+		std::vector<int32_t> ids(static_cast<size_t>(count), -999);
+		CHECK(RunM1Pipeline(b, k, ids) == Status::Ok);
+
+		// Count components of size >= minComp; assert exactly (3 + D).
+		std::vector<int32_t> reps, sizes;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			auto it = std::find(reps.begin(), reps.end(), ids[r]);
+			if (it == reps.end()) { reps.push_back(ids[r]); sizes.push_back(1); }
+			else sizes[static_cast<size_t>(it - reps.begin())]++;
+		}
+		int32_t bigComps = 0, outliers = 0;
+		for (size_t c = 0; c < reps.size(); ++c) { if (sizes[c] >= minComp) ++bigComps; else outliers += sizes[c]; }
+		CHECK_MSG(bigComps == 3 + D, "Structure FEAT (D=%d): expected %d components >= minComp, got %d",
+			D, 3 + D, bigComps);
+		CHECK_MSG(outliers == 2, "Structure FEAT (D=%d): expected 2 isolates in outliers, got %d", D, outliers);
+
+		// Membership: every pair of rows planted in the same blob/block shares a component;
+		// each isolate is alone.
+		int32_t membershipViolations = 0;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			if (planted[r] < 0) continue;
+			// same-tag rows must share ids[r]; use the first row of each tag as anchor
+			for (int32_t s = r + 1; s < count; ++s)
+			{
+				if (planted[s] != planted[r]) continue;
+				if (ids[s] != ids[r]) { ++membershipViolations; break; }
+			}
+		}
+		CHECK_MSG(membershipViolations == 0, "Structure FEAT (D=%d): planted memberships must be one component each", D);
+	}
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -14328,6 +14966,17 @@ int main()
 	TestRelabelFeatOracle();
 	TestRelabelPromoteFeat();
 	TestRelabelDemoteFeat();
+
+	// V3.2 red suite (Curie): Bank Inspector I — module M1 graph.h (plan section 25).
+	// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+	TestM1TrustBoundaries();
+	TestM1DuplicateGroupingByteConfirm();
+	TestM1EdgesExactAcrossMetrics();
+	TestM1DuplicateUnionConstructionCounts();
+	TestM1FringeBoundary();
+	TestM1RepeatAndCanonicalId();
+	TestM1WarmWorkspaceGrowShrink();
+	TestM1StructureFeat();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
