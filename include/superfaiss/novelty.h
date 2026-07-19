@@ -54,6 +54,21 @@ Status NoveltyScore(
 //     (rejected upstream of this call on a Cosine bank).
 //   - float32, whole-row: the SAME two formulas, accumulated in DOUBLE over the plain
 //     floats (see the header note above), ending in the same subnormal floor.
+//     **Disclosed limit (F-M2-5, D-V32-51, 2026-07-19, Brunel's provisional call — Dan
+//     unavailable, PENDING his confirmation): this leg does NOT carry int8's "exact zero
+//     for any scalar multiple" guarantee.** Int8 exactness rests on cross/aSq/bSq being
+//     EXACT INTEGER sums (D-V32-47) — zero rounding until the one final division+sqrt, so
+//     parallel int8 codes give a provably exact ratio. Float32 has no such step: even
+//     constructing a scaled probe (`c * row`) is itself a rounded float32 multiplication,
+//     so the probe is not bit-exactly parallel to the row before this function ever sees
+//     it — confirmed executed (scale c in {0.1, 25, 1000} against a real Cosine bank:
+//     nonzero, scattered residuals, not a threshold-shaped failure — genuine rounding
+//     noise, not a formula defect). This entry still computes the honest distance; the
+//     guarantee that a nonzero result is impossible for a TRUE duplicate holds only for
+//     BYTE-IDENTICAL float32 probe/row (trivially exact there: cross == aSq == bSq). A
+//     caller reading this as limb 1 gets a real, non-thresholded distance on every float32
+//     input; it just cannot assume every scalar-multiple duplicate reads exactly 0 the way
+//     every int8 one does.
 //   - channel (either quant): the sliced form. The probe is quantized (int8 leg, via the
 //     same arithmetic QuantizeQueryXd uses) or read (float32 leg) over the WHOLE
 //     bank.paddedDims once, then BOTH operands restrict every sum to
