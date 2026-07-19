@@ -19,7 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <new>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -52,6 +56,62 @@ static int GFailures = 0;
 			std::printf("\n"); \
 		} \
 	} while (0)
+
+// ---------------------------------------------------------------------------
+// Raw heap-allocation counter (V3.2 S1 test support, Curie 2026-07-19).
+//
+// AllocationCount() (superfaiss/alloc.h) only sees traffic through the
+// SuperFAISS allocator seam (Workspace::Reserve*, via detail::SeamAlloc) —
+// a std::vector's default allocator calls ::operator new directly and is
+// invisible to it. A per-call std::vector<Hit>/std::vector<int32_t> output
+// buffer inside a core query path is exactly the S1 violation standing
+// against graph.h/novelty.h/matching.h (Claude/Poirot/afabc08-graph-h-m1-
+// review.md, Claude/Poirot/15a0668-s1s2s3-fix-verify.md, Claude/Poirot/
+// 524b373-matching-m3-review.md): "the accounting instrument is blind to
+// the one allocation that violates it." An AllocationCount()-only assertion
+// around such a call would report flat whether or not the violation is
+// present, so it cannot serve as the S1 oracle by itself — it would be a
+// cell that looks swept but proves nothing (Curie's own "a test targets its
+// cell and fails for its reason" discipline).
+//
+// A scoped, thread-local override of the global ::operator new/delete
+// closes that blind spot for these tests only. The thread-local flag is OFF
+// by default, so every other check in this file allocates exactly as it
+// always has; the override only counts while a ScopedRawNewTracking is
+// alive on the calling thread.
+namespace
+{
+	std::atomic<uint64_t> GRawNewCalls{0};
+}
+thread_local bool GTrackRawNew = false;
+
+struct ScopedRawNewTracking
+{
+	ScopedRawNewTracking() { GRawNewCalls.store(0, std::memory_order_relaxed); GTrackRawNew = true; }
+	~ScopedRawNewTracking() { GTrackRawNew = false; }
+	ScopedRawNewTracking(const ScopedRawNewTracking&) = delete;
+	ScopedRawNewTracking& operator=(const ScopedRawNewTracking&) = delete;
+	uint64_t Count() const { return GRawNewCalls.load(std::memory_order_relaxed); }
+};
+
+void* operator new(std::size_t sz)
+{
+	if (GTrackRawNew)
+	{
+		GRawNewCalls.fetch_add(1, std::memory_order_relaxed);
+	}
+	void* p = std::malloc(sz != 0 ? sz : 1);
+	if (p == nullptr)
+	{
+		throw std::bad_alloc();
+	}
+	return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void* operator new[](std::size_t sz) { return operator new(sz); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -16653,6 +16713,273 @@ static void TestM3RepeatDeterminism()
 	}
 }
 
+// ===========================================================================
+// V3.2 — S4/S1 contract-cleanliness fixes (Curie, 2026-07-19): two Poirot
+// findings standing across all three Tier-1 core modules (graph.h/novelty.h/
+// matching.h), closed together per plan Sec.25.4. Casebooks:
+// Claude/Poirot/afabc08-graph-h-m1-review.md (S1 named, S2 — the decode
+// duplicate — closed by 15a0668), Claude/Poirot/15a0668-s1s2s3-fix-verify.md
+// (S1 relocated into the batch output buffers, not closed), Claude/Poirot/
+// 524b373-matching-m3-review.md (S4 — matching.cpp forked a second decode
+// body; S1 O1 — confirmed standing, ripe for "all three modules together").
+// Test design: Claude/Curie/superfaiss-v3.2-s4-s1-shared-helper-workspace-
+// tracking-test-design-2026-07-19.md.
+// ===========================================================================
+
+namespace
+{
+	// Reads a source file's full text for a structural (symbol-presence)
+	// assertion. Used only by the S4 shared-decode-helper pin below — this
+	// project's established grep/structural-oracle convention (the Bank
+	// Inspector I slot-3 concurrency-grep cell, D-V32-53) applied to the core
+	// module tree. Returns empty on a read failure rather than throwing, so a
+	// bad path fails the CHECK loudly instead of silently reporting green.
+	std::string ReadWholeSourceFile(const char* path)
+	{
+		std::ifstream f(path, std::ios::binary);
+		if (!f)
+		{
+			return std::string();
+		}
+		std::ostringstream ss;
+		ss << f.rdbuf();
+		return ss.str();
+	}
+}
+
+// S4 (matching.h, standing since afabc08's M1 S2) — the row->query decode is a
+// NAMED, SHARED step across all three Tier-1 core modules (plan Sec.25.4 temper
+// S1): "All three modules therefore share one helper, DequantizeRowAsQuery(bank,
+// row, outFloatQuery)." graph.h/novelty.h were routed through it by 15a0668;
+// matching.cpp instead forked a second body, DequantizeRowForTarget (Poirot
+// 524b373-matching-m3-review.md S4) — correct today, but "nothing forces [it]
+// to agree tomorrow" once the shared helper and matching.h's cross-quantization
+// decode drift apart from a common origin. This structural pin realizes the M1
+// review's own O2 note ("the dim-7 equivalence cell ... has no shared symbol to
+// pin against"): the shared helper's declared contract must widen to a
+// targetPaddedDims parameter, and matching.cpp must call it — not merely have
+// two independently-written functions that happen to agree today. graph.cpp/
+// novelty.cpp are the already-fixed siblings; their rows are a green regression
+// guard, not new coverage. Red (matching.cpp's row, and the header's own
+// contract) until the fix routes matching.cpp through the generalized symbol
+// and deletes the private duplicate.
+static void TestS4SharedRowDecodeHelperAllThreeModules()
+{
+	const std::string header = ReadWholeSourceFile("include/superfaiss/inspector_common.h");
+	CHECK_MSG(!header.empty(), "could not read include/superfaiss/inspector_common.h "
+		"(run from the repo root, matching build.bat's own working directory)");
+	CHECK_MSG(header.find("DequantizeRowAsQuery") != std::string::npos,
+		"the shared helper symbol is missing from inspector_common.h");
+	CHECK_MSG(header.find("targetPaddedDims") != std::string::npos,
+		"DequantizeRowAsQuery's declared contract has no targetPaddedDims parameter yet "
+		"(the S4 generalization — see Claude/Poirot/524b373-matching-m3-review.md)");
+
+	struct ModuleExpectation
+	{
+		const char* path;
+		bool callsSharedHelper;    // the post-fix state every module must reach
+		bool definesPrivateDecode; // must be false in every module once fixed
+	};
+	const ModuleExpectation modules[] = {
+		{"src/graph.cpp", true, false},
+		{"src/novelty.cpp", true, false},
+		{"src/matching.cpp", true, false}, // matching.cpp is the RED row today
+	};
+
+	for (const auto& m : modules)
+	{
+		const std::string src = ReadWholeSourceFile(m.path);
+		CHECK_MSG(!src.empty(), "could not read %s (run from the repo root)", m.path);
+
+		const bool callsShared = src.find("DequantizeRowAsQuery(") != std::string::npos;
+		CHECK_MSG(callsShared == m.callsSharedHelper,
+			"%s must call the shared DequantizeRowAsQuery helper for row->query decode "
+			"(plan Sec.25.4 temper S1, 'a named, shared step, not an improvisation')", m.path);
+
+		// A private per-row decode duplicate — named DequantizeRow or
+		// DequantizeRowForTarget, the two shapes this exact class has taken
+		// (M1 S2, then M3 S4) — must not exist in any of the three modules.
+		const bool definesPrivate =
+			src.find("void DequantizeRow(") != std::string::npos ||
+			src.find("DequantizeRowForTarget(") != std::string::npos;
+		CHECK_MSG(definesPrivate == m.definesPrivateDecode,
+			"%s must not carry a private row->query decode duplicate "
+			"(one shared helper, three callers)", m.path);
+	}
+}
+
+// S1 (graph.h) — BuildKnnNeighbors' per-call std::vector<Hit>/std::vector<int32_t>
+// output buffers heap-allocate via global `new` on every call, untracked by the
+// allocator seam (Poirot afabc08-graph-h-m1-review.md S1; standing per 15a0668-
+// s1s2s3-fix-verify.md and confirmed again by 524b373-matching-m3-review.md O1,
+// "ripe for the all-three close"). Warm the workspace once, then assert zero raw
+// heap allocations (and a flat seam AllocationCount/GrowthCount) across repeated
+// calls on the same warm workspace. Red until the output buffers route through
+// workspace-tracked storage.
+static void TestS1FlatAllocationBuildKnnNeighbors()
+{
+	Rng rng(0x51A1);
+	const int32_t dims = 32, count = 200, k = 6;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank bank(src, count, dims, Quantization::Int8, Metric::L2);
+
+	Workspace ws;
+	std::vector<int32_t> nb(static_cast<size_t>(count) * k, -999);
+
+	// Warm-up: allowed to allocate, on either counter.
+	CHECK(BuildKnnNeighbors(bank.view, k, true, nb.data(), ws) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 20; ++i)
+		{
+			CHECK(BuildKnnNeighbors(bank.view, k, true, nb.data(), ws) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"BuildKnnNeighbors allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"BuildKnnNeighbors' seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// S1 (novelty.h, "baseline calibration" half) — CalibrateNoveltyBaseline shares
+// BuildKnnNeighbors' exact batch-output shape and the exact same defect (Poirot
+// 15a0668-s1s2s3-fix-verify.md S1 names this file:line directly — novelty.cpp's
+// allHits/hitCounts). Same construction as the graph.h cell above.
+static void TestS1FlatAllocationCalibrateNoveltyBaseline()
+{
+	Rng rng(0x51A2);
+	const int32_t dims = 24, count = 180, k = 5, sampleLimit = 512;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank bank(src, count, dims, Quantization::Int8, Metric::L2);
+
+	Workspace ws;
+	std::vector<float> baseline(static_cast<size_t>(count), -999.0f);
+	int32_t outCount = -999;
+
+	CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 20; ++i)
+		{
+			CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws)
+				== Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"CalibrateNoveltyBaseline allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"CalibrateNoveltyBaseline's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// S1 (novelty.h, "probe" half — bonus finding, not named in any prior casebook).
+// KthNeighborDistance calls workspace.Reserve(k, 1) and then STILL parks its
+// output in a fresh std::vector<Hit> instead of workspace.HeapStorage() — the
+// Reserve call is dead, exactly the shape the M1 review's own Minor finding
+// named in graph.cpp before the S3 batch fix ("Query re-reserves its own heap
+// internally, and this function passes a std::vector (not HeapStorage) as the
+// output, so nothing consumes the reservation"). No casebook has reviewed this
+// specific call site — found at the bench while authoring the S1 suite above,
+// and included here because it is the same class the campaign exists to close
+// and D-V32-52 already names KthNeighborDistance ("limb 2") as a call path a
+// slot-3 consumer exercises per-probe. Routed to Dan/Poirot as a bench finding
+// in the test-design artifact; not invented coverage — it is §25.4's own
+// zero-allocation contract applied to a call site that happens to share
+// novelty.cpp with the already-known CalibrateNoveltyBaseline instance.
+static void TestS1FlatAllocationKthNeighborDistanceProbe()
+{
+	Rng rng(0x51A3);
+	const int32_t dims = 16, count = 64, k = 4;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank bank(src, count, dims, Quantization::Float32, Metric::Cosine);
+	std::vector<float> query = M2PaddedProbeFromRow(bank, 0);
+
+	Workspace ws;
+	float out = -999.0f;
+
+	// Warm-up: allowed to allocate.
+	CHECK(KthNeighborDistance(bank.view, query.data(), k, nullptr, &out, ws) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 20; ++i)
+		{
+			CHECK(KthNeighborDistance(bank.view, query.data(), k, nullptr, &out, ws) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"KthNeighborDistance allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"KthNeighborDistance's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// S1 (matching.h) — MutualNearestMatches' two-pass batch output
+// (pass1Hits/pass1Counts/pass2Hits/pass2Counts) is an ordinary call-scoped
+// std::vector, explicitly disclosed in the module's own header comment as
+// "KNOWN, ACCEPTED ... kept for consistency until S1 is resolved for all three
+// modules together" (matching.cpp:14-21) — Poirot 524b373-matching-m3-review.md
+// O1 confirms this is now ripe. Repeat-call determinism (TestM3RepeatDeterminism,
+// above) already establishes distinctCount is stable across identical warm
+// calls, so this is a clean warm/steady-state measurement, mirroring the two
+// cells above.
+static void TestS1FlatAllocationMutualNearestMatches()
+{
+	Rng rng(0x51A4);
+	const int32_t dims = 16, aCount = 40, bCount = 36, matchK = 3;
+	std::vector<float> aSrc, bSrc;
+	for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
+	for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
+	GBank fullA(aSrc, aCount, dims, Quantization::Int8, Metric::Cosine);
+	GBank fullB(bSrc, bCount, dims, Quantization::Int8, Metric::Cosine);
+	std::vector<int32_t> sampleIdx;
+	for (int32_t i = 0; i < aCount; ++i) sampleIdx.push_back(i);
+
+	Workspace ws;
+	std::vector<MatchPair> out(static_cast<size_t>(aCount));
+	int32_t outCount = -999;
+
+	// Warm-up: allowed to allocate.
+	CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+		nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 20; ++i)
+		{
+			CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
+				nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"MutualNearestMatches allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"MutualNearestMatches' seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -16787,6 +17114,15 @@ int main()
 	TestM3CslsDirectionPerMetric();
 	TestM3ExclusionHonored();
 	TestM3RepeatDeterminism();
+
+	// V3.2 — S4/S1 contract-cleanliness fixes (Curie, 2026-07-19): plan Sec.25.4.
+	// Test design: Claude/Curie/superfaiss-v3.2-s4-s1-shared-helper-workspace-
+	// tracking-test-design-2026-07-19.md.
+	TestS4SharedRowDecodeHelperAllThreeModules();
+	TestS1FlatAllocationBuildKnnNeighbors();
+	TestS1FlatAllocationCalibrateNoveltyBaseline();
+	TestS1FlatAllocationKthNeighborDistanceProbe();
+	TestS1FlatAllocationMutualNearestMatches();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
