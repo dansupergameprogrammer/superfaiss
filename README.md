@@ -189,6 +189,25 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   `capacity × channelCount × 4` bytes, ~3.0 MB at 100k rows / 8 channels (12.5% of the int8 row
   payload beside it), added on promote and freed on demote; Dot/L2 banks relabel by a table swap
   alone, no arena work. [API.md](docs/API.md).
+- **Bank-inspection primitives (v3.2).** Three header-only Tier-1 modules for asking "what does
+  this bank actually look like," not just "what's nearest" — pure functions over a caller-held
+  `BankView`, no new bank state, no persistence surface. `graph.h`: a mutual k-NN neighbor graph
+  (`BuildKnnNeighbors`), a symmetric-agreement filter (`MutualFilter`), byte-identical duplicate
+  grouping (`BuildDuplicateGroups`), and deterministic connected components over the result — the
+  clustering substrate behind "does this bank have natural clusters, or one undifferentiated
+  blob." `novelty.h`: a calibrated baseline (`CalibrateNoveltyBaseline`) plus a two-limb novelty
+  test — an exact-distance identity check (`NoveltyProbeDistance`, true 0.0 on Cosine, a disclosed
+  double-precision epsilon on L2's expanded form) and a statistical rank against the baseline
+  (`KthNeighborDistance` + `NoveltyScore`) — "is this new content actually different from what's
+  already in the bank, or a near-duplicate." `matching.h`: sampled-A-verified-against-full-banks
+  mutual nearest-neighbor correspondence with CSLS margins (`MutualNearestMatches`) — "which rows
+  in bank A correspond to rows in bank B," e.g. a player's saved memory bank against the shipped
+  reference bank. All three are PER-DEVICE deterministic (fixed sample, fixed order, pinned
+  tie-breaks) — no cross-device claim, unlike the query-path primitives above. Caller-owned
+  `Workspace` scratch throughout, zero steady-state allocation once warm, same as everything else
+  in this library. These are the primitives the UE plugin's Bank Inspector tool is built on
+  ([superfaiss-unreal](https://github.com/dansupergameprogrammer/superfaiss-unreal)); nothing
+  about them is UE-specific. [API.md](docs/API.md).
 
 ## What it deliberately is not
 

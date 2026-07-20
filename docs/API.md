@@ -406,6 +406,98 @@ iteration, no dims^2 matrix, no allocation, deterministic (fixed seed vector, se
 row-order accumulation). The projection-visualizer substrate; a degenerate direction
 yields a zero component rather than an error.
 
+## graph.h — mutual k-NN graph + connected components (v3.2)
+
+```cpp
+Status BuildKnnNeighbors(const BankView&, int32_t k, bool excludeSelf,
+                          int32_t* outNeighbors, Workspace&);
+Status MutualFilter     (int32_t count, int32_t k, const int32_t* neighbors,
+                          uint8_t* outMutualFlags);
+Status BuildDuplicateGroups(const BankView&, int32_t* outGroupOf, int32_t* scratch);
+Status ConnectedComponents(int32_t count, int32_t k, const int32_t* neighbors,
+                          const uint8_t* mutualFlags, const int32_t* duplicateGroups,
+                          int32_t* outComponentId, int32_t* unionFindScratch);
+```
+
+Post-processing over exact query output — touches no kernel, quantization, or format.
+`BuildKnnNeighbors` is a top-k query per row (ties break ascending index); `MutualFilter`
+keeps only edges where each row is in the other's top-k (a pure integer scan, no
+tolerance); `BuildDuplicateGroups` finds exact byte-identical rows by construction (a
+hash pass confirmed by full byte comparison — hash agreement alone never groups, so
+same-decode-different-bytes rows are near-duplicates, not duplicates, and stay ungrouped);
+`ConnectedComponents` unions duplicate-group edges first, then the surviving mutual edges
+in ascending `(i, j)` order, with component ids canonicalized to the smallest member row
+index — deterministic, never an allocation-order artifact. PER-DEVICE deterministic, no
+cross-device claim. Caller-owned `Workspace`/scratch throughout; every function rejects
+`k < 1`, `k >= count`, or a null buffer with no partial write.
+
+## novelty.h — k-th-neighbour distance + calibrated baseline (v3.2)
+
+```cpp
+Status NoveltyScore         (const float* sortedBaseline, int32_t count,
+                              float distance, float* outScore);
+Status NoveltyProbeDistance (const BankView&, const float* paddedProbeQuery,
+                              int32_t storedRow, int32_t channel /* -1 = whole-row */,
+                              float* outDistance);
+Status KthNeighborDistance  (const BankView&, const float* query, int32_t k,
+                              const uint32_t* excludeBits, float* outDistance, Workspace&);
+Status CalibrateNoveltyBaseline(const BankView&, int32_t k, int32_t sampleLimit,
+                              float* outSortedDistances, int32_t* outCount, Workspace&);
+```
+
+Two independent limbs, composed by the CALLER into a tri-state verdict (no separate
+"verdict" entry exists — the same caller-composes-from-primitives shape `compose.h`'s
+query construction uses). **Limb 1 (identity):** `NoveltyProbeDistance` is the metric's
+own exact distance between a probe and one stored row — on Cosine int8 this is a true
+bit-exact 0.0 for a real duplicate (the parallel-code int arithmetic never rounds until
+one final division+sqrt); on L2's expanded form it carries a disclosed double-precision
+cancellation residue even on an exact duplicate, so a caller checks it against a small
+epsilon (`1e-8f`), never bare equality. `channel == -1` scores the whole row; a channel
+index scores that sub-range only, and a zero-energy Cosine slice on either side rejects
+(`ZeroNormQuery`) rather than silently floors to a false match. Dot banks are rejected
+outright — the verdict domain is L2 and Cosine only. **Limb 2 (statistical rank):**
+`KthNeighborDistance` is a raw k-th-nearest-neighbour probe against a full view (ties are
+the caller's own exclusion set, not self-widened); `NoveltyScore` converts a distance
+into the baseline's empirical-CDF rank (ties resolve to the lowest rank), which the
+caller compares against a lambda threshold. `CalibrateNoveltyBaseline` builds that
+baseline over a caller-constructed sample view (it does not sample or stride itself),
+writing each row's own k-th-NN `RankDistance` in ascending order. PER-DEVICE
+deterministic; Dot is rejected on every entry point (`RankDistance` is undefined there).
+Caller-owned `Workspace` throughout; every function rejects malformed k/count/metric
+arguments with no partial write.
+
+## matching.h — mutual-NN correspondence + CSLS margins (v3.2)
+
+```cpp
+struct MatchPair { int32_t sourceIndexA = -1, sourceIndexB = -1; float cslsMargin = 0.0f; };
+
+Status MutualNearestMatches(
+    const BankView& sampleViewA, const int32_t* sampleSourceIndices,
+    const BankView& fullViewB,   const uint32_t* excludeBitsB,
+    const BankView& fullViewA,   const uint32_t* excludeBitsA,
+    int32_t matchK, MatchPair* outPairs, int32_t* outPairCount, Workspace&);
+```
+
+Sampled-A-verified-against-full-banks: for each row of a caller-constructed sample of
+bank A, its top-`matchK` forward candidate in the FULL live bank B, then back-verified
+against the FULL live bank A — a pair is mutual iff the candidate's own top-1 in full A
+is the original sampled row. Both retrievals run against complete banks, never a sample,
+so the sample bounds only how many A rows are CHECKED, never correctness of a reported
+pair (a design correction from an earlier two-sided-sample scheme that measured 0.9%
+recovery / 98% spurious matches at 500k rows). Every checked row gets an entry —
+`sourceIndexB = -1` and `cslsMargin = 0.0` mean honestly unmatched, not an error.
+`cslsMargin` is the paper's cross-domain similarity local scaling
+(`2*Sim(i,j) - r_B(i) - r_A(j)`), disclosed as a diagnostic on Dot/L2 banks (not the
+paper's calibrated cosine-only setting) — classification against a threshold (matched vs.
+ambiguous) is the caller's, exactly as `NoveltyScore`'s raw statistic is. `Dims` and
+`Metric` must match across all three views; `Quantization` may differ (matching runs on
+query scores over dequantized rows) — the field this library's flagship "archive vs.
+baked" use case rests on: a player's saved scratch-bank archive matched against the
+shipped reference bank. PER-DEVICE deterministic, no cross-device claim. This is the
+library's disclosed HEAVY pass — O(sample x full-B x dims) plus back-verification, linear
+in bank size, not sub-second at scale; a caller-side concern (chunking, progress, cancel),
+not part of this contract.
+
 ## scratch.h — mutable banks (v2.0, recall audit v2.3)
 
 ```cpp

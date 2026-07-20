@@ -16,13 +16,10 @@
 // as the int8 legs; this is pinned here so both the implementation and the test author's
 // independent oracle build against one arithmetic, not two that might silently diverge.
 //
-// AUTHORING STATE (Curie, 2026-07-18): NoveltyScore is authored and green. This round adds
-// the contract for NoveltyProbeDistance (F-M2-1 / D-V32-50, Dan's call, option A),
-// KthNeighborDistance, and CalibrateNoveltyBaseline — the two-limb tri-state verdict
+// CLOSED GREEN (M2, 2026-07-19; Poirot-reviewed). The two-limb tri-state verdict
 // (D-V32-31/47) is composed by the CALLER from these four functions (no separate "verdict"
 // entry exists; graph.h's precedent — ConnectedComponents composes BuildKnnNeighbors +
-// MutualFilter + BuildDuplicateGroups — is the same shape). RED SCAFFOLD bodies for the
-// three new entries ship in novelty.cpp (return Ok, write nothing) until Brunel implements.
+// MutualFilter + BuildDuplicateGroups — is the same shape).
 
 namespace superfaiss
 {

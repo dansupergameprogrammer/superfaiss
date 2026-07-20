@@ -9,6 +9,21 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [Unreleased]
+
+### Added
+- **Bank-inspection primitives (`graph.h`, `novelty.h`, `matching.h`) — Bank Inspector I.**
+  Three header-only Tier-1 modules answering "what does this bank actually look like,"
+  not just "what's nearest": a mutual k-NN neighbor graph + connected components
+  (`graph.h` — clustering); a two-limb novelty test, an exact-distance identity check
+  plus a statistical rank against a calibrated baseline (`novelty.h` — is this row new or
+  a near-duplicate); sampled-A-verified-against-full-banks mutual correspondence with
+  CSLS margins (`matching.h` — which rows in bank A correspond to rows in bank B, e.g. a
+  player's saved scratch archive against the shipped reference bank). All three are pure
+  functions over a caller-held `BankView` — no new bank state, no persistence surface,
+  PER-DEVICE deterministic, no cross-device claim. `superfaiss.h`'s umbrella header now
+  includes all three. See `docs/API.md` for the full contract of each.
+
 ## [3.1.2] — 2026-07-18
 
 ### Fixed

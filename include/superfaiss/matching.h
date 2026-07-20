@@ -26,9 +26,9 @@
 // core modules are single synchronous passes over whatever view they are handed; chunking
 // and calibrated-constant arithmetic are layered on top by the caller.
 //
-// AUTHORING STATE (Curie, 2026-07-19): first-round contract + red suite. See the
-// test-design artifact (`Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md`) for the
-// routed findings on points this round's plan text left ambiguous (F-M3-*).
+// CLOSED GREEN (M3, 2026-07-19; Poirot-reviewed SHIP, incl. the S4/S1 shared-decode-helper
+// and workspace-tracking fixes). See `Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md`
+// for the round's forced-reading disclosures on points the plan text left ambiguous (F-M3-*).
 
 namespace superfaiss
 {
