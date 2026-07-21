@@ -12508,11 +12508,11 @@ static void TestPerChannelRecallOracle()
 static void TestVersionHeaderCoherence()
 {
 	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
-		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.0, got %d", SUPERFAISS_VERSION_MAJOR);
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.1, got %d", SUPERFAISS_VERSION_MAJOR);
 	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 2,
-		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.0, got %d", SUPERFAISS_VERSION_MINOR);
-	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
-		"SUPERFAISS_VERSION_PATCH should be 0 for v3.2.0, got %d", SUPERFAISS_VERSION_PATCH);
+		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.1, got %d", SUPERFAISS_VERSION_MINOR);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 1,
+		"SUPERFAISS_VERSION_PATCH should be 1 for v3.2.1, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 // ===========================================================================

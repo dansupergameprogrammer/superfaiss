@@ -9,6 +9,26 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.2.1] — 2026-07-21
+
+### Fixed
+- **Test suite built and ran only on x86 Windows.** Two defects introduced with the
+  3.2.0 allocation-coverage cells, both in `tests/test_main.cpp`; the shipped library
+  (`include/`, `src/`) is byte-identical to 3.2.0 and unaffected.
+  - The kernel allocation cell referenced the `*ScalarAvx2` reference mirrors without
+    an architecture guard. They are compiled out on ARM, so the suite failed to LINK
+    on macOS arm64 rather than failing a test.
+  - The header-only-math allocation cell sized its decode buffer to `dims` where
+    `DequantizeRowAsQuery` writes `paddedDims` and zeroes the tail — an 8-float stack
+    overrun on a 24-dim int8 bank, which aborted the suite under glibc's stack
+    protector on both Linux jobs. Confirmed with AddressSanitizer, and the buffer is
+    now sized from `constexpr PaddedDims` so it tracks the contract.
+- Coherence checks added to this repository's CI (documented signatures match their
+  declaring header, every public symbol is documented, Markdown links resolve
+  case-exactly). They previously ran only in the consuming plugin repository against a
+  vendored copy, so this repo could publish a doc contradicting its own headers and
+  stay green.
+
 ## [3.2.0] — 2026-07-20
 
 ### Fixed
