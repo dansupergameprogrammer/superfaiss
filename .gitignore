@@ -6,3 +6,5 @@ out/
 *.ilk
 .vs/
 .idea/
+__pycache__/
+*.pyc
