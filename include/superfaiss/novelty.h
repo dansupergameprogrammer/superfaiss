@@ -86,7 +86,7 @@ Status NoveltyScore(
 // Metric::Dot`.
 // `workspace` stages the int8 leg's quantized probe (ReserveXdQuery/XdQ8/XdScale/XdSqSum)
 // -- the same warm, tracked buffer KthNeighborDistance/CalibrateNoveltyBaseline reuse via
-// their own `workspace` params, never a per-call heap allocation (Finding 5,
+// their own `workspace` params, never a per-call heap allocation (Finding 3,
 // cf3f750-v32-core-batch-review.md: this entry used to bypass the library's own
 // AllocationCount() seam via a raw std::vector). The float32 leg does not touch
 // `workspace` (no quantization to stage).

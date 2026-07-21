@@ -438,7 +438,7 @@ Status NoveltyScore         (const float* sortedBaseline, int32_t count,
                               float distance, float* outScore);
 Status NoveltyProbeDistance (const BankView&, const float* paddedProbeQuery,
                               int32_t storedRow, int32_t channel /* -1 = whole-row */,
-                              float* outDistance);
+                              float* outDistance, Workspace&);
 Status KthNeighborDistance  (const BankView&, const float* query, int32_t k,
                               const uint32_t* excludeBits, float* outDistance, Workspace&);
 Status CalibrateNoveltyBaseline(const BankView&, int32_t k, int32_t sampleLimit,
