@@ -150,13 +150,12 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   length is congruent to 4 mod 8 had its trailing 4 elements dropped entirely — a
   length-4 channel scored exactly 0 on AVX2 while SSE/portable/NEON scored it correctly.
   **This changed numeric results for affected widths**: `ResolveRowKernels` wires the
-  AVX2 dispatchers in directly for the segmented and per-channel-cosine scan, so any
+  AVX2 kernels in directly for the segmented and per-channel-cosine scan, so any
   named-channel or segmented query over a sub-8-remainder length (e.g. a length-4
   channel) on AVX2 hardware returned a different, wrong score before this fix — a
   consumer bisecting a score change across 3.1.0 to 3.1.2 should attribute the delta at
   those widths to this fix, not to 3.1.0's `Relabel`. Whole-row scans were unaffected
-  (`DotF32`/`L2F32` route non-multiple-of-8 `paddedDims` to the SSE path, and
-  `paddedDims` is always a multiple of 8 for banks large enough to matter). The 4-element
+  (`DotF32`/`L2F32` route non-multiple-of-8 `paddedDims` to the SSE path). The 4-element
   remainder is now added to both the intrinsics and their scalar mirrors, bit-identically.
 - CI now requires the AVX2 path on the Linux job (previously accepted SSE or AVX2), so a
   runner without AVX2 hardware cannot silently skip the new sub-8 remainder coverage;
