@@ -3056,19 +3056,29 @@ static void TestScratchBanks()
 		BankView snap;
 		Hit hits[10];
 		int32_t n = 0;
-		for (int32_t r = 1; r < cap; ++r)
 		{
-			CHECK(bank.Append(rows.data() + static_cast<size_t>(r) * dims, dims, &idx)
-				== Status::Ok);
-			if ((r & 3) == 0)
+			// S1/S2/S3 (coverage audit §6.4): raw-new instrument, not seam-only —
+			// the strongest existing cell in shape (a full append/remove/
+			// snapshot/query cycle to capacity) and previously blind to a raw
+			// heap allocation beside the seam.
+			ScopedRawNewTracking rawTracking;
+			for (int32_t r = 1; r < cap; ++r)
 			{
-				CHECK(bank.Remove(r) == Status::Ok);
+				CHECK(bank.Append(rows.data() + static_cast<size_t>(r) * dims, dims, &idx)
+					== Status::Ok);
+				if ((r & 3) == 0)
+				{
+					CHECK(bank.Remove(r) == Status::Ok);
+				}
+				CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
+				QueryParams params;
+				params.k = 10;
+				params.excludeBits = tombs.data();
+				CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
 			}
-			CHECK(bank.Snapshot(&snap, tombs.data()) == Status::Ok);
-			QueryParams params;
-			params.k = 10;
-			params.excludeBits = tombs.data();
-			CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+			CHECK_MSG(rawTracking.Count() == 0,
+				"scratch Append/Remove/Snapshot/Query allocated %llu time(s) outside the seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
 		}
 		CHECK_MSG(AllocationCount() == allocsBefore,
 			"scratch steady state allocated: %llu -> %llu",
@@ -4957,20 +4967,34 @@ static void TestScratchRecall()
 		ScratchRecallReport rj;
 		CHECK(nr.MeasureScratchRecall(ws, &rj, seed) == Status::InvalidArgument);
 
-		// R8.1 zero steady-state allocation: warm one measure, then flat.
-		ScratchBank b;
-		Rng rng(0x8A11ull);
-		CHECK(b.Create(256, dims, Metric::Dot, Quantization::Int8, true) == Status::Ok);
-		FillSeeded(b, 200, dims, rng);
-		ScratchRecallReport warm;
-		CHECK(b.MeasureScratchRecall(ws, &warm, seed) == Status::Ok);
-		const uint64_t before = AllocationCount();
-		for (int32_t i = 0; i < 8; ++i)
+		// S9 (coverage audit §6.4, upgrading this cell): zero steady-state
+		// allocation, on both Dot and Cosine, raw-new instrument plus the
+		// missing GrowthCount() assertion. Warm one measure, then flat across
+		// 8 sweeps.
+		for (Metric recallMetric : {Metric::Dot, Metric::Cosine})
 		{
-			ScratchRecallReport r;
-			CHECK(b.MeasureScratchRecall(ws, &r, seed) == Status::Ok);
+			ScratchBank b;
+			Rng rng(0x8A11ull);
+			CHECK(b.Create(256, dims, recallMetric, Quantization::Int8, true) == Status::Ok);
+			FillSeeded(b, 200, dims, rng);
+			ScratchRecallReport warm;
+			CHECK(b.MeasureScratchRecall(ws, &warm, seed) == Status::Ok);
+			const uint64_t before = AllocationCount();
+			const uint64_t growthBefore = ws.GrowthCount();
+			{
+				ScopedRawNewTracking rawTracking;
+				for (int32_t i = 0; i < 8; ++i)
+				{
+					ScratchRecallReport r;
+					CHECK(b.MeasureScratchRecall(ws, &r, seed) == Status::Ok);
+				}
+				CHECK_MSG(rawTracking.Count() == 0,
+					"MeasureScratchRecall allocated %llu time(s) outside the Workspace seam",
+					static_cast<unsigned long long>(rawTracking.Count()));
+			}
+			CHECK_MSG(AllocationCount() == before, "warm MeasureScratchRecall allocated");
+			CHECK(ws.GrowthCount() == growthBefore);
 		}
-		CHECK_MSG(AllocationCount() == before, "warm MeasureScratchRecall allocated");
 
 		// R8.3 determinism-given-history: identical history -> identical recall bits.
 		ScratchBank b1;
@@ -10156,6 +10180,232 @@ static void TestScratchChannelPerChannelRecall()
 	}
 }
 
+// S5 (coverage audit §6.4): ScratchBank::Save had no allocation cell of any
+// kind. Warm one prior Save through the same archive callbacks, then flat
+// across further saves -- the caller owns the medium, the bank must stage
+// nothing on the heap.
+static void TestAllocFlatScratchSave()
+{
+	Rng rng(0x5A4E);
+	const int32_t dims = 32, count = 40;
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	// Reused across the loop and warmed to its full size first: the archive's
+	// own std::vector<uint8_t> would otherwise grow (and allocate) INSIDE the
+	// tracked window, which would measure the test fixture, not the bank.
+	// clear() retains capacity, so a post-warm Save into the same buffer never
+	// touches the fixture's own allocator.
+	MemArchive out;
+	CHECK(bank.Save(out.Writer()) == Status::Ok); // warm (sizes the buffer)
+	out.bytes.clear();
+	CHECK(bank.Save(out.Writer()) == Status::Ok); // warm again, into the sized buffer
+	out.bytes.clear();
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			out.bytes.clear();
+			CHECK(bank.Save(out.Writer()) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScratchBank::Save allocated %llu time(s) outside the Workspace seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"ScratchBank::Save's seam-tracked allocations grew: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+}
+
+// S6 (coverage audit §6.4): ScratchBank::Freeze (base overload) had no
+// allocation cell. Warm one prior Freeze into the same caller buffers, then
+// flat; drive with and without outIndexMap, and with the recall re-measure
+// legs on a retention bank.
+static void TestAllocFlatScratchFreeze()
+{
+	Rng rng(0x5A4F);
+	const int32_t dims = 32, count = 48;
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Dot, Quantization::Int8, /*retainFloats=*/true) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	const int32_t live = bank.FreezeLiveCount();
+	const int32_t pd = PaddedDims(dims, Quantization::Int8);
+	AlignedBuf rows(static_cast<size_t>(live) * pd * ElementSize(Quantization::Int8));
+	std::vector<float> scales(static_cast<size_t>(live));
+	std::vector<int32_t> indexMap(static_cast<size_t>(count));
+	Workspace ws;
+	ScratchRecallReport report;
+
+	CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data()) == Status::Ok); // warm, with map
+	CHECK(bank.Freeze(rows.ptr, scales.data(), nullptr) == Status::Ok);         // warm, without map
+	CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data(), &report, &ws) == Status::Ok); // warm, recall leg
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data()) == Status::Ok);
+			CHECK(bank.Freeze(rows.ptr, scales.data(), nullptr) == Status::Ok);
+			CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data(), &report, &ws) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScratchBank::Freeze allocated %llu time(s) outside the Workspace seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"ScratchBank::Freeze's seam-tracked allocations grew: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// S7 (coverage audit §6.4): ScratchBank::Freeze (channel-aware overload) had
+// no allocation cell. Same construction as S6, on a Cosine channel bank.
+static void TestAllocFlatScratchFreezeChannelAware()
+{
+	Rng rng(0x5A50);
+	const int32_t dims = 32, count = 48;
+	const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	const int32_t live = bank.FreezeLiveCount();
+	const int32_t pd = PaddedDims(dims, Quantization::Int8);
+	AlignedBuf rows(static_cast<size_t>(live) * pd * ElementSize(Quantization::Int8));
+	std::vector<float> scales(static_cast<size_t>(live));
+	std::vector<int32_t> indexMap(static_cast<size_t>(count));
+	std::vector<float> invNorms(static_cast<size_t>(live) * 2);
+
+	CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data(), invNorms.data()) == Status::Ok); // warm
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(bank.Freeze(rows.ptr, scales.data(), indexMap.data(), invNorms.data()) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScratchBank::Freeze (channel-aware) allocated %llu time(s) outside the Workspace seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"ScratchBank::Freeze (channel-aware) seam-tracked allocations grew: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+}
+
+// S8 (coverage audit §6.4): ScratchBank::FreezeWithRecall had no allocation
+// cell. Retention-enabled Cosine channel bank, workspace warm for the
+// internal k.
+static void TestAllocFlatScratchFreezeWithRecall()
+{
+	Rng rng(0x5A51);
+	const int32_t dims = 32, count = 48;
+	const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+	const uint64_t seed = ScratchBank::kDefaultRecallSeed;
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	const int32_t live = bank.FreezeLiveCount();
+	const int32_t pd = PaddedDims(dims, Quantization::Int8);
+	AlignedBuf rows(static_cast<size_t>(live) * pd * ElementSize(Quantization::Int8));
+	std::vector<float> scales(static_cast<size_t>(live));
+	std::vector<int32_t> indexMap(static_cast<size_t>(count));
+	std::vector<float> invNorms(static_cast<size_t>(live) * 2);
+	ScratchRecallReport reports[2];
+	Workspace ws;
+
+	CHECK(bank.FreezeWithRecall(rows.ptr, scales.data(), indexMap.data(), invNorms.data(),
+			reports, 2, ws, seed) == Status::Ok); // warm
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(bank.FreezeWithRecall(rows.ptr, scales.data(), indexMap.data(), invNorms.data(),
+					reports, 2, ws, seed) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScratchBank::FreezeWithRecall allocated %llu time(s) outside the Workspace seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"ScratchBank::FreezeWithRecall seam-tracked allocations grew: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// S10 (coverage audit §6.4): ScratchBank::MeasureScratchRecallPerChannel had
+// no allocation cell of any kind. Retention Cosine channel bank, workspace
+// warm, ≥1 prior call.
+static void TestAllocFlatScratchMeasureScratchRecallPerChannel()
+{
+	Rng rng(0x5A52);
+	const int32_t dims = 32, count = 200;
+	const ChannelInfo channels[2] = {{0, 16}, {16, 16}};
+	const uint64_t seed = ScratchBank::kDefaultRecallSeed;
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+
+	Workspace ws;
+	ScratchRecallReport reports[2];
+	CHECK(bank.MeasureScratchRecallPerChannel(ws, reports, 2, seed) == Status::Ok); // warm
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(bank.MeasureScratchRecallPerChannel(ws, reports, 2, seed) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"MeasureScratchRecallPerChannel allocated %llu time(s) outside the Workspace seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"MeasureScratchRecallPerChannel seam-tracked allocations grew: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
 // ---------------------------------------------------------------------------
 // T-V3 (slot 4) -- Tier-2 channel-scoped analytics (SuperFAISS_V2_Plan.md
 // section 23.5; section 23.9 slot-4 gate; section 23.8 dims 3/4/6/8/10) plus
@@ -12462,8 +12712,18 @@ static void TestRelabelWarmLifetimeSequence()
 		appendN(10);
 		CHECK(bank.Grow(48) == Status::Ok);
 
+		// S4 (coverage audit §6.4): raw-new count is 0 ALWAYS (all allocation
+		// must route through the seam), and the seam delta is exactly the
+		// documented 0-or-1.
 		const uint64_t before1 = AllocationCount();
-		CHECK(bank.Relabel(t2, 2) == Status::Ok);
+		uint64_t raw1 = 0;
+		{
+			ScopedRawNewTracking rawTracking;
+			CHECK(bank.Relabel(t2, 2) == Status::Ok);
+			raw1 = rawTracking.Count();
+		}
+		CHECK_MSG(raw1 == 0, "warm relabel #1 (metric=%d): allocated %llu time(s) outside the seam",
+			static_cast<int>(metric), static_cast<unsigned long long>(raw1));
 		const uint64_t delta1 = AllocationCount() - before1;
 		const uint64_t expected1 = metric == Metric::Cosine ? 1u : 0u;
 		CHECK_MSG(delta1 == expected1,
@@ -12476,7 +12736,14 @@ static void TestRelabelWarmLifetimeSequence()
 		appendN(10);
 
 		const uint64_t before2 = AllocationCount();
-		CHECK(bank.Relabel(t3, 3) == Status::Ok);
+		uint64_t raw2 = 0;
+		{
+			ScopedRawNewTracking rawTracking;
+			CHECK(bank.Relabel(t3, 3) == Status::Ok);
+			raw2 = rawTracking.Count();
+		}
+		CHECK_MSG(raw2 == 0, "warm relabel #2 (metric=%d): allocated %llu time(s) outside the seam",
+			static_cast<int>(metric), static_cast<unsigned long long>(raw2));
 		const uint64_t delta2 = AllocationCount() - before2;
 		const uint64_t expected2 = metric == Metric::Cosine ? 1u : 0u;
 		CHECK_MSG(delta2 == expected2,
@@ -12485,6 +12752,31 @@ static void TestRelabelWarmLifetimeSequence()
 			static_cast<unsigned long long>(delta2));
 		CHECK_MSG(bank.GetChannelCount() == 3, "warm relabel #2 (metric=%d): table did not update",
 			static_cast<int>(metric));
+
+		// S4 rejection leg (coverage audit §6.4, dimension 2/5): a malformed
+		// table (overlapping ranges) is InvalidArgument with raw 0 and seam
+		// delta 0 -- reject-over-degrade must not leak an allocation.
+		{
+			const ChannelInfo badTable[2] = {{0, 32}, {16, 32}}; // overlapping
+			const uint64_t beforeReject = AllocationCount();
+			uint64_t rawReject = 0;
+			Status rejectStatus = Status::Ok;
+			{
+				ScopedRawNewTracking rawTracking;
+				rejectStatus = bank.Relabel(badTable, 2);
+				rawReject = rawTracking.Count();
+			}
+			CHECK_MSG(rejectStatus == Status::InvalidArgument,
+				"malformed relabel table (metric=%d) must reject", static_cast<int>(metric));
+			CHECK_MSG(rawReject == 0,
+				"rejected relabel (metric=%d) allocated %llu time(s) outside the seam",
+				static_cast<int>(metric), static_cast<unsigned long long>(rawReject));
+			CHECK_MSG(AllocationCount() == beforeReject,
+				"rejected relabel (metric=%d) must not touch the seam either", static_cast<int>(metric));
+			CHECK_MSG(bank.GetChannelCount() == 3,
+				"rejected relabel (metric=%d) must leave the table exactly as before",
+				static_cast<int>(metric));
+		}
 
 		CHECK(bank.Remove(0) == Status::Ok);
 
@@ -12566,7 +12858,16 @@ static void TestRelabelWarmPromoteDemoteToggle()
 	CHECK_MSG(bank.GetChannelCount() == 0, "toggle: demote did not clear the region");
 
 	const uint64_t before = AllocationCount();
-	CHECK(bank.Relabel(table, 2) == Status::Ok);
+	uint64_t rawPromote2 = 0;
+	{
+		// S4 (coverage audit §6.4): raw-new count is 0 even on the re-promote
+		// leg, which is the specific reuse edge this cell exists to guard.
+		ScopedRawNewTracking rawTracking;
+		CHECK(bank.Relabel(table, 2) == Status::Ok);
+		rawPromote2 = rawTracking.Count();
+	}
+	CHECK_MSG(rawPromote2 == 0, "toggle: promote #2 allocated %llu time(s) outside the seam",
+		static_cast<unsigned long long>(rawPromote2));
 	const uint64_t delta = AllocationCount() - before;
 	CHECK_MSG(delta == 1u, "toggle: promote #2 should cost exactly one seam allocation, got %llu",
 		static_cast<unsigned long long>(delta));
@@ -17310,6 +17611,11 @@ int main()
 	TestScratchChannelDegenerateAndRuntimeRejections();
 	TestScratchChannelComposition();
 	TestScratchChannelLifetimeShapeContracts();
+	TestAllocFlatScratchSave();
+	TestAllocFlatScratchFreeze();
+	TestAllocFlatScratchFreezeChannelAware();
+	TestAllocFlatScratchFreezeWithRecall();
+	TestAllocFlatScratchMeasureScratchRecallPerChannel();
 	TestScratchChannelFreeze();
 	TestScratchChannelPersistenceRoundTrip();
 	TestScratchChannelPersistenceVersioning();
