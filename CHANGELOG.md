@@ -9,6 +9,27 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.2.2] — 2026-07-21
+
+### Added
+- **`PeekScratchArchive`** — reads a serialized scratch archive's header and channel
+  table out of a byte span and reports its geometry plus `archiveBytes`, exactly the
+  number of bytes a `Load` consumes, without allocating or reading the payload. It runs
+  the same header validation `Load` does (the two now share one validator, so they cannot
+  drift). A host that appends its own trailer after the archive can therefore locate and
+  validate that trailer *before* committing the load, rather than discovering a broken
+  trailer with the rows already replaced.
+
+### Fixed
+- **`ScratchBank::Create` and `Grow` performed signed size arithmetic before bounding
+  their geometry.** `ArenaBytes` multiplies capacity by dims in signed `int64`; both
+  entry points accepted any positive `int32` pair, so a large valid-typed request
+  overflowed the arena computation — undefined behavior rather than a refused
+  allocation. Both now apply the format's own ceilings (`kMaxBankRows` rows,
+  `kMaxCrossDeviceDims` dims) before any size is computed, returning `InvalidArgument`.
+  The archive loader already applied these caps; direct construction did not, and
+  `Grow` bounded its request only against the current capacity.
+
 ## [3.2.1] — 2026-07-21
 
 ### Fixed

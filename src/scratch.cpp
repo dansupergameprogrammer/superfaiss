@@ -125,8 +125,10 @@ namespace
 	constexpr uint8_t kScratchFlagChannels = 0x02;  // reserved[0] bit 1
 	// Archive geometry ceiling (review M2): the largest row capacity a load will
 	// entertain. With paddedDims capped at kMaxCrossDeviceDims, every ArenaBytes
-	// term stays below 2^49 — far from int64 overflow.
-	constexpr int32_t kMaxScratchArchiveRows = 1 << 28;
+	// term stays below 2^49 — far from int64 overflow. The same ceiling Create and
+	// Grow apply to a directly-supplied capacity: one number, so a geometry an
+	// archive cannot carry is also one the constructor refuses to build.
+	constexpr int32_t kMaxScratchArchiveRows = kMaxBankRows;
 
 	struct ScratchHeader
 	{
@@ -141,7 +143,151 @@ namespace
 		uint8_t reserved[6] = {};
 	};
 	static_assert(sizeof(ScratchHeader) == 32, "scratch header layout is the format");
+
+	// The header rules, shared by Load and PeekScratchArchive so the two can never
+	// disagree about what a valid archive header is — one validator, one truth. Pure on
+	// the header bytes: it allocates nothing and reads no payload.
+	Status ValidateScratchHeader(
+		const ScratchHeader& header, bool* outHasChannels, bool* outRetain)
+	{
+		// Accepts {1, 2, 3}; version 0 or anything newer is the standing old-reader/new-data
+		// hard-reject (a future v4 archive rejects here). Legacy 1/2 encode retention as the
+		// version integer; version 3 makes the flags byte authoritative.
+		if (header.magic != kScratchMagic ||
+			header.version < 1u || header.version > kScratchVersionChannels)
+		{
+			return Status::BadFormat;
+		}
+		// Version 3: retention and channel presence come from the reserved[0] flags byte, and
+		// bits 2-7 are reserved — masked off, tolerated (never rejected, never mis-read as
+		// retention or channels; forward tolerance by design). Legacy 1/2 read retention from
+		// the version integer, exactly as shipped, and carry no channel table.
+		const uint8_t flags = header.reserved[kScratchFlagsByteIndex];
+		const bool hasChannels = header.version == kScratchVersionChannels &&
+			(flags & kScratchFlagChannels) != 0;
+		const bool wantRetain = header.version == kScratchVersionChannels
+			? (flags & kScratchFlagRetention) != 0
+			: header.version == kScratchVersionRetain;
+		// Version 3 is emitted ONLY for a channel-carrying bank (channels trigger the presence-
+		// flags format; a retention-only bank stays legacy v2). A v3 blob without the channels
+		// flag is therefore something the writer never produces — reject it as corrupt rather
+		// than adopt it as a plain bank. This also catches a legacy blob whose version integer
+		// was hand-bumped to 3 (its reserved bytes are zero, so the channels flag is clear).
+		if (header.version == kScratchVersionChannels && !hasChannels)
+		{
+			return Status::BadFormat;
+		}
+		const bool metricOk = header.metric <= static_cast<uint8_t>(Metric::L2);
+		const bool quantOk = header.quant <= static_cast<uint8_t>(Quantization::Int8);
+		if (!metricOk || !quantOk || header.capacity <= 0 || header.dims <= 0 ||
+			header.count < 0 || header.count > header.capacity ||
+			header.paddedDims !=
+				PaddedDims(header.dims, static_cast<Quantization>(header.quant)))
+		{
+			return Status::BadFormat;
+		}
+		// The archive is an untrusted medium (review M2, the T-062 idiom): bound the
+		// geometry BEFORE any byte-size arithmetic — the arena math multiplies the
+		// caller-controlled capacity and dims, and an unbounded pair is signed int64
+		// overflow (UB), not merely a failed allocation. paddedDims is capped at the
+		// widest bank the library proves (kMaxCrossDeviceDims); capacity at 2^28 rows
+		// keeps every ArenaBytes term below 2^49. Absurd geometry is a format defect —
+		// a hard BadFormat, never an allocator outcome.
+		if (header.paddedDims > kMaxCrossDeviceDims ||
+			header.capacity > kMaxScratchArchiveRows)
+		{
+			return Status::BadFormat;
+		}
+		*outHasChannels = hasChannels;
+		*outRetain = wantRetain;
+		return Status::Ok;
+	}
 } // namespace
+
+Status PeekScratchArchive(const void* data, int64_t bytes, ScratchArchiveInfo* outInfo)
+{
+	if (data == nullptr || outInfo == nullptr || bytes < 0)
+	{
+		return Status::InvalidArgument;
+	}
+	*outInfo = ScratchArchiveInfo{};
+	if (bytes < static_cast<int64_t>(sizeof(ScratchHeader)))
+	{
+		return Status::BadFormat;
+	}
+	const uint8_t* cursor = static_cast<const uint8_t*>(data);
+	ScratchHeader header;
+	std::memcpy(&header, cursor, sizeof(header));
+	bool hasChannels = false;
+	bool retain = false;
+	const Status headerStatus = ValidateScratchHeader(header, &hasChannels, &retain);
+	if (headerStatus != Status::Ok)
+	{
+		return headerStatus;
+	}
+	int64_t consumed = static_cast<int64_t>(sizeof(ScratchHeader));
+
+	// The channel table, written immediately after the header on a v3 archive. Its COUNT is
+	// bounded here because it sizes the read below; the ranges themselves are validated where
+	// they are adopted (the channel Create inside Load), so a peek and a load agree on what a
+	// well-formed archive is without duplicating the geometry rules.
+	if (hasChannels)
+	{
+		if (bytes - consumed < static_cast<int64_t>(sizeof(int32_t)))
+		{
+			return Status::BadFormat;
+		}
+		int32_t channelCount = 0;
+		std::memcpy(&channelCount, cursor + consumed, sizeof(channelCount));
+		consumed += static_cast<int64_t>(sizeof(channelCount));
+		if (channelCount <= 0 || channelCount > kMaxChannels)
+		{
+			return Status::BadFormat;
+		}
+		const int64_t tableBytes =
+			static_cast<int64_t>(channelCount) * static_cast<int64_t>(sizeof(ChannelInfo));
+		if (bytes - consumed < tableBytes)
+		{
+			return Status::BadFormat;
+		}
+		std::memcpy(outInfo->channels, cursor + consumed, static_cast<size_t>(tableBytes));
+		consumed += tableBytes;
+		outInfo->channelCount = channelCount;
+	}
+
+	// The payload's byte length, in the order Save writes it. Every term is bounded by the
+	// header caps checked above, so the int64 arithmetic cannot overflow.
+	const Quantization quant = static_cast<Quantization>(header.quant);
+	consumed += static_cast<int64_t>(header.count) * header.paddedDims * ElementSize(quant);
+	if (quant == Quantization::Int8)
+	{
+		consumed += static_cast<int64_t>(header.count) * static_cast<int64_t>(sizeof(float));
+	}
+	consumed += static_cast<int64_t>(ScratchBank::TombstoneWords(header.count)) *
+		static_cast<int64_t>(sizeof(uint32_t));
+	if (retain)
+	{
+		consumed += static_cast<int64_t>(header.count) * header.dims *
+			static_cast<int64_t>(sizeof(float));
+	}
+	// A span that does not cover the archive it declares is truncated, which is a format
+	// defect. A span that is LONGER is not: whatever follows belongs to the caller (a host
+	// trailer), and reporting archiveBytes is precisely how the caller finds it.
+	if (bytes < consumed)
+	{
+		return Status::BadFormat;
+	}
+
+	outInfo->capacity = header.capacity;
+	outInfo->count = header.count;
+	outInfo->dims = header.dims;
+	outInfo->paddedDims = header.paddedDims;
+	outInfo->metric = static_cast<Metric>(header.metric);
+	outInfo->quant = quant;
+	outInfo->retainFloats = retain;
+	outInfo->archiveBytes = consumed;
+	return Status::Ok;
+}
 
 ScratchBank::~ScratchBank()
 {
@@ -245,6 +391,15 @@ Status ScratchBank::Create(
 	{
 		return Status::InvalidArgument;
 	}
+	// Geometry ceilings BEFORE any size arithmetic (the Load idiom, now on the public
+	// construction path): ArenaBytes multiplies capacity by dims in signed int64, and an
+	// uncapped int32 pair overflows it — undefined behavior, not a failed allocation. The
+	// caps are the format's own (kMaxBankRows rows, kMaxCrossDeviceDims dims), so a bank
+	// this refuses to build is one no archive could have carried either.
+	if (capacity > kMaxScratchArchiveRows || dims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
 
 	const int32_t paddedDims = PaddedDims(dims, quant);
 	const int64_t bytes = ArenaBytes(capacity, dims, paddedDims, quant, retainFloats, 0);
@@ -292,6 +447,12 @@ Status ScratchBank::Create(
 		return Status::InvalidArgument;
 	}
 	if (quant != Quantization::Float32 && quant != Quantization::Int8)
+	{
+		return Status::InvalidArgument;
+	}
+	// The same geometry ceilings the retention overload applies, for the same reason:
+	// bound capacity and dims before ArenaBytes multiplies them.
+	if (capacity > kMaxScratchArchiveRows || dims > kMaxCrossDeviceDims)
 	{
 		return Status::InvalidArgument;
 	}
@@ -595,8 +756,11 @@ Status ScratchBank::Grow(int32_t newCapacity)
 		return Status::InvalidArgument;
 	}
 	WriterGuard guard(WriterBusy_);
-	if (newCapacity <= Capacity_)
+	if (newCapacity <= Capacity_ || newCapacity > kMaxScratchArchiveRows)
 	{
+		// The row ceiling applies to a grown capacity exactly as it does to a created
+		// one: ArenaBytes below multiplies newCapacity by the row stride in signed
+		// int64, so an uncapped request is overflow, not an allocation failure.
 		return Status::InvalidArgument;
 	}
 	const int32_t subNormPerRow = (Metric_ == Metric::Cosine && ChannelCount_ > 0)
@@ -1110,53 +1274,15 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	{
 		return Status::BadFormat;
 	}
-	// Accepts {1, 2, 3}; version 0 or anything newer is the standing old-reader/new-data
-	// hard-reject (a future v4 archive rejects here). Legacy 1/2 encode retention as the
-	// version integer; version 3 makes the flags byte authoritative.
-	if (header.magic != kScratchMagic ||
-		header.version < 1u || header.version > kScratchVersionChannels)
+	// Version acceptance, the presence-flags byte, and the geometry ceilings all live in
+	// the shared header validator PeekScratchArchive runs, so a peek and a load can never
+	// disagree about which archives are well-formed.
+	bool hasChannels = false;
+	bool wantRetain = false;
+	const Status headerStatus = ValidateScratchHeader(header, &hasChannels, &wantRetain);
+	if (headerStatus != Status::Ok)
 	{
-		return Status::BadFormat;
-	}
-	// Version 3: retention and channel presence come from the reserved[0] flags byte, and
-	// bits 2-7 are reserved — masked off, tolerated (never rejected, never mis-read as
-	// retention or channels; forward tolerance by design). Legacy 1/2 read retention from
-	// the version integer, exactly as shipped, and carry no channel table.
-	const uint8_t flags = header.reserved[kScratchFlagsByteIndex];
-	const bool hasChannels = header.version == kScratchVersionChannels &&
-		(flags & kScratchFlagChannels) != 0;
-	const bool wantRetain = header.version == kScratchVersionChannels
-		? (flags & kScratchFlagRetention) != 0
-		: header.version == kScratchVersionRetain;
-	// Version 3 is emitted ONLY for a channel-carrying bank (channels trigger the presence-
-	// flags format; a retention-only bank stays legacy v2). A v3 blob without the channels
-	// flag is therefore something the writer never produces — reject it as corrupt rather
-	// than adopt it as a plain bank. This also catches a legacy blob whose version integer
-	// was hand-bumped to 3 (its reserved bytes are zero, so the channels flag is clear).
-	if (header.version == kScratchVersionChannels && !hasChannels)
-	{
-		return Status::BadFormat;
-	}
-	const bool metricOk = header.metric <= static_cast<uint8_t>(Metric::L2);
-	const bool quantOk = header.quant <= static_cast<uint8_t>(Quantization::Int8);
-	if (!metricOk || !quantOk || header.capacity <= 0 || header.dims <= 0 ||
-		header.count < 0 || header.count > header.capacity ||
-		header.paddedDims !=
-			PaddedDims(header.dims, static_cast<Quantization>(header.quant)))
-	{
-		return Status::BadFormat;
-	}
-	// The archive is an untrusted medium (review M2, the T-062 idiom): bound the
-	// geometry BEFORE any byte-size arithmetic — the arena math multiplies the
-	// caller-controlled capacity and dims, and an unbounded pair is signed int64
-	// overflow (UB), not merely a failed allocation. paddedDims is capped at the
-	// widest bank the library proves (kMaxCrossDeviceDims); capacity at 2^28 rows
-	// keeps every ArenaBytes term below 2^49. Absurd geometry is a format defect —
-	// a hard BadFormat, never an allocator outcome.
-	if (header.paddedDims > kMaxCrossDeviceDims ||
-		header.capacity > kMaxScratchArchiveRows)
-	{
-		return Status::BadFormat;
+		return headerStatus;
 	}
 
 	// The channel table (v3), read here — before the arena is created — so the channel

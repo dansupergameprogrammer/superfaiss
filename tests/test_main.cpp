@@ -2722,6 +2722,234 @@ namespace
 	};
 } // namespace
 
+// The public construction paths bound their geometry BEFORE the arena size arithmetic
+// runs on it. ArenaBytes multiplies capacity by dims in signed int64, so an uncapped
+// int32 pair is overflow — undefined behavior, not a refused allocation. The archive
+// loader already applied these ceilings; Create and Grow did not.
+static void TestScratchGeometryCeilings()
+{
+	// Over-cap capacity: an argument defect, and nothing is allocated — the bank stays
+	// uncreated, so a subsequent valid Create on the same object still succeeds.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(kMaxBankRows + 1, 64, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+		CHECK(bank.Create(16, 64, Metric::Dot, Quantization::Float32) == Status::Ok);
+	}
+	// Over-cap dims, on the retention overload.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(16, kMaxCrossDeviceDims + 1, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+	}
+	// The channel overload carries its own preamble, so it needs its own proof. A fresh
+	// bank per case: on a shared object the second call would be refused for being
+	// already-created, and the cap would read proven while never having run.
+	{
+		const ChannelInfo channels[1] = {{0, 16}};
+		ScratchBank overRows;
+		CHECK(overRows.Create(kMaxBankRows + 1, 64, Metric::Cosine, Quantization::Float32,
+				  channels, 1) == Status::InvalidArgument);
+		CHECK(!overRows.IsCreated());
+		ScratchBank overDims;
+		CHECK(overDims.Create(16, kMaxCrossDeviceDims + 1, Metric::Cosine,
+				  Quantization::Float32, channels, 1) == Status::InvalidArgument);
+		CHECK(!overDims.IsCreated());
+	}
+	// The pair that overflows the arena arithmetic outright. Rejected on geometry, so the
+	// multiply never runs on it.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(INT32_MAX, INT32_MAX, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+	}
+	// Grow takes the same ceiling, and a refused Grow leaves the bank exactly as it was.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(16, 64, Metric::Dot, Quantization::Float32) == Status::Ok);
+		CHECK(bank.Grow(kMaxBankRows + 1) == Status::InvalidArgument);
+		CHECK(bank.Grow(INT32_MAX) == Status::InvalidArgument);
+		CHECK(bank.Capacity() == 16);
+		CHECK(bank.Grow(32) == Status::Ok);
+		CHECK(bank.Capacity() == 32);
+	}
+}
+
+// PeekScratchArchive reports a serialized archive's geometry and — the reason it exists —
+// the exact byte length a Load consumes, so a host that appends its own trailer can find
+// and validate that trailer BEFORE committing the load.
+static void TestPeekScratchArchive()
+{
+	Rng rng(0x9E5A11ull);
+	const int32_t dims = 64;
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+
+	struct Shape
+	{
+		const char* name;
+		bool hasChannels;
+		bool retain;
+		Quantization quant;
+		Metric metric;
+	};
+	const Shape shapes[] = {
+		{"legacy f32 dot", false, false, Quantization::Float32, Metric::Dot},
+		{"legacy int8 cosine", false, false, Quantization::Int8, Metric::Cosine},
+		{"retention int8 cosine", false, true, Quantization::Int8, Metric::Cosine},
+		{"channels f32 cosine", true, false, Quantization::Float32, Metric::Cosine},
+		{"channels+retention int8 cosine", true, true, Quantization::Int8, Metric::Cosine},
+		{"channels int8 dot", true, false, Quantization::Int8, Metric::Dot},
+	};
+	for (const Shape& shape : shapes)
+	{
+		ScratchBank bank;
+		const Status created = shape.hasChannels
+			? bank.Create(32, dims, shape.metric, shape.quant, channels, 2, shape.retain)
+			: bank.Create(32, dims, shape.metric, shape.quant, shape.retain);
+		CHECK_MSG(created == Status::Ok, "%s: create failed (%d)", shape.name,
+			static_cast<int>(created));
+		if (created != Status::Ok)
+		{
+			continue;
+		}
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 20; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		CHECK(bank.Remove(4) == Status::Ok); // tombstone words are part of the length
+
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+
+		ScratchArchiveInfo info;
+		const Status peeked = PeekScratchArchive(
+			archive.bytes.data(), static_cast<int64_t>(archive.bytes.size()), &info);
+		CHECK_MSG(peeked == Status::Ok, "%s: peek failed (%d)", shape.name,
+			static_cast<int>(peeked));
+		if (peeked != Status::Ok)
+		{
+			continue;
+		}
+		CHECK_MSG(info.archiveBytes == static_cast<int64_t>(archive.bytes.size()),
+			"%s: archiveBytes %lld, blob %lld", shape.name,
+			static_cast<long long>(info.archiveBytes),
+			static_cast<long long>(archive.bytes.size()));
+		CHECK(info.count == bank.Count());
+		CHECK(info.capacity == bank.Capacity());
+		CHECK(info.dims == dims);
+		CHECK(info.paddedDims == bank.GetPaddedDims());
+		CHECK(info.metric == shape.metric);
+		CHECK(info.quant == shape.quant);
+		CHECK_MSG(info.retainFloats == shape.retain, "%s: retention flag lost", shape.name);
+		CHECK_MSG(info.channelCount == (shape.hasChannels ? 2 : 0),
+			"%s: channelCount %d", shape.name, info.channelCount);
+		for (int32_t c = 0; c < info.channelCount; ++c)
+		{
+			CHECK(info.channels[c].offset == channels[c].offset &&
+				info.channels[c].length == channels[c].length);
+		}
+
+		// A span that does not cover the archive it declares is truncated — a format
+		// defect, never a short read to paper over.
+		ScratchArchiveInfo truncated;
+		CHECK(PeekScratchArchive(archive.bytes.data(),
+				  static_cast<int64_t>(archive.bytes.size()) - 1, &truncated) ==
+			Status::BadFormat);
+		CHECK(PeekScratchArchive(archive.bytes.data(), 8, &truncated) == Status::BadFormat);
+		CHECK(PeekScratchArchive(archive.bytes.data(), 0, &truncated) == Status::BadFormat);
+
+		// Trailing bytes belong to the caller: the peek succeeds and points at them.
+		std::vector<uint8_t> withTrailer = archive.bytes;
+		withTrailer.push_back(0xABu);
+		withTrailer.push_back(0xCDu);
+		ScratchArchiveInfo trailed;
+		CHECK(PeekScratchArchive(withTrailer.data(),
+				  static_cast<int64_t>(withTrailer.size()), &trailed) == Status::Ok);
+		CHECK_MSG(trailed.archiveBytes == static_cast<int64_t>(archive.bytes.size()),
+			"%s: trailer moved the reported archive length", shape.name);
+	}
+
+	// The header rules are the loader's own: whatever a peek rejects, a Load rejects.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(8, 32, Metric::Dot, Quantization::Float32) == Status::Ok);
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+
+		std::vector<uint8_t> badMagic = archive.bytes;
+		badMagic[0] = static_cast<uint8_t>(badMagic[0] ^ 0xFFu);
+		std::vector<uint8_t> badVersion = archive.bytes;
+		badVersion[4] = 4u; // a future version: the standing old-reader/new-data reject
+		std::vector<uint8_t> zeroVersion = archive.bytes;
+		zeroVersion[4] = 0u;
+		std::vector<uint8_t> forgedV3 = archive.bytes;
+		forgedV3[4] = 3u; // v3 without the channels flag is a shape the writer never emits
+
+		const std::vector<uint8_t>* bad[] = {&badMagic, &badVersion, &zeroVersion, &forgedV3};
+		for (const std::vector<uint8_t>* blob : bad)
+		{
+			ScratchArchiveInfo info;
+			CHECK(PeekScratchArchive(blob->data(), static_cast<int64_t>(blob->size()), &info) ==
+				Status::BadFormat);
+			MemArchive corrupt;
+			corrupt.bytes = *blob;
+			ScratchBank target;
+			CHECK(target.Load(corrupt.Reader()) == Status::BadFormat);
+		}
+
+		ScratchArchiveInfo info;
+		CHECK(PeekScratchArchive(nullptr, 32, &info) == Status::InvalidArgument);
+		CHECK(PeekScratchArchive(archive.bytes.data(),
+				  static_cast<int64_t>(archive.bytes.size()), nullptr) ==
+			Status::InvalidArgument);
+	}
+
+	// The header claims the peek allocates nothing — proven, not asserted. Everything the
+	// tracked scope touches is built before it opens.
+	{
+		const ChannelInfo table[2] = {{0, 32}, {32, 32}};
+		ScratchBank bank;
+		CHECK(bank.Create(32, dims, Metric::Cosine, Quantization::Int8, table, 2,
+				  /*retainFloats=*/true) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 12; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+		const uint8_t* blob = archive.bytes.data();
+		const int64_t blobBytes = static_cast<int64_t>(archive.bytes.size());
+		ScratchArchiveInfo info;
+		CHECK(PeekScratchArchive(blob, blobBytes, &info) == Status::Ok); // warm
+
+		const uint64_t allocsBefore = AllocationCount();
+		{
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 20; ++i)
+			{
+				CHECK(PeekScratchArchive(blob, blobBytes, &info) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"PeekScratchArchive allocated %llu time(s) outside the seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
+		}
+		CHECK(AllocationCount() == allocsBefore);
+	}
+}
+
 static void TestScratchBanks()
 {
 	Rng rng(0x5C247C4Bull);
@@ -17864,6 +18092,7 @@ namespace
 		{"scratch.h", "ScratchBank::GetChannels", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
 		{"scratch.h", "ScratchBank::RecallReportStale", AllocBinding::Trivial,
 			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "PeekScratchArchive", AllocBinding::Binds, "TestPeekScratchArchive", 1},
 
 		// --- topk.h (6 entry points, all Trivial) ---
 		{"topk.h", "Better", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
@@ -17899,7 +18128,7 @@ namespace
 		{"alloc.h", 26}, {"analytics.h", 10}, {"bake.h", 5}, {"compose.h", 4},
 		{"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
 		{"matching.h", 1}, {"novelty.h", 4}, {"pca.h", 2}, {"query.h", 5},
-		{"scratch.h", 40}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
+		{"scratch.h", 41}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
 		{"validate.h", 5}, {"version.h", 0},
 	};
 
@@ -19393,6 +19622,11 @@ int main()
 	TestS1FlatAllocationNoveltyProbeDistance();
 	TestS1FlatAllocationKthNeighborDistanceProbe();
 	TestS1FlatAllocationMutualNearestMatches();
+
+	// V3.2.2: public-path geometry ceilings, and the archive peek the host trailer
+	// validation is built on.
+	TestScratchGeometryCeilings();
+	TestPeekScratchArchive();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every
 	// cell it references above has already executed at least once.

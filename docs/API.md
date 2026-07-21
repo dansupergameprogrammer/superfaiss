@@ -605,6 +605,13 @@ struct ScratchRecallReport {     // v2.3
                                  //   mathematically valid, statistically uninformative
 };
 struct ScratchArchive { bool(*write)(void*, const void*, size_t); bool(*read)(void*, void*, size_t); void* user; };
+struct ScratchArchiveInfo {      // v3.2.2
+    int32_t capacity, count, dims, paddedDims;
+    Metric metric; Quantization quant; bool retainFloats;
+    int32_t channelCount; ChannelInfo channels[kMaxChannels];  // 0 / unused for single-space
+    int64_t archiveBytes;        // exactly what a Load consumes
+};
+Status PeekScratchArchive(const void* data, int64_t bytes, ScratchArchiveInfo* outInfo); // v3.2.2
 ```
 
 A snapshot IS a `BankView` — every query entry point works on it unchanged.
@@ -619,6 +626,26 @@ returning the old→new map so consumers remap stored handles. Zero steady-state
 allocation: everything lives in the arena from `Create` (retention included —
 `ArenaBytes` simply grows). Archive format: [FORMAT.md](FORMAT.md) section 3;
 concurrency guarantees: [DETERMINISM.md](DETERMINISM.md) section 2b.
+
+**Geometry ceilings (v3.2.2):** every `Create` overload and `Grow` bound
+`capacity` at `kMaxBankRows` and `dims` at `kMaxCrossDeviceDims` *before* the
+arena size is computed, returning `InvalidArgument` above either. The arena math
+multiplies capacity by dims in signed `int64`, so an unbounded `int32` pair is
+overflow rather than a refused allocation. These are the immutable format's own
+caps, already applied by the archive loader — a geometry `Create` refuses is one
+no archive could have carried.
+
+**Peeking an archive (v3.2.2):** `PeekScratchArchive` reads a serialized
+archive's header (and channel table) out of a contiguous byte span and reports
+its geometry plus `archiveBytes` — exactly the number of bytes a `Load` will
+consume — without allocating, reading the payload, or touching a bank. It
+applies the same header rules `Load` does, so whatever a peek rejects a load
+rejects, and a span shorter than the archive it declares is `BadFormat`; a
+*longer* span is not, because whatever follows belongs to the caller. That is
+the point: a host appending its own trailer after the archive (channel names,
+say) uses `archiveBytes` to find and validate that trailer *before* committing
+the load, instead of discovering a broken trailer with the rows already
+replaced. Reading the header twice is free; unwinding a load is not.
 
 **Recall audit (v2.3):** the import-time recall-honesty pattern, extended to the
 mutable half. `Create(..., retainFloats = true)` — opt-in, never the default —
