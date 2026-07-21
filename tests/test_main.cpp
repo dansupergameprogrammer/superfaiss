@@ -18595,10 +18595,17 @@ static void TestAllocFlatKernels()
 		detail::L2F32Scalar(row0F32, qf32.F32(), f32Bank.view.paddedDims);
 		detail::DotI8Scalar(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
 		detail::L2I8Scalar(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		// The *Avx2 scalar mirrors exist only on x86: they are the reference
+		// halves of the AVX2 paths and are compiled out entirely on ARM, so an
+		// unguarded reference here fails to LINK on macos-arm64 rather than
+		// failing a test. Same guard every other AVX2 reference in this suite
+		// uses.
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
 		detail::DotF32ScalarAvx2(row0F32, qf32.F32(), f32Bank.view.paddedDims);
 		detail::L2F32ScalarAvx2(row0F32, qf32.F32(), f32Bank.view.paddedDims);
 		detail::DotI8ScalarAvx2(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
 		detail::L2I8ScalarAvx2(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+#endif
 		detail::DotF32(row0F32, qf32.F32(), f32Bank.view.paddedDims);
 		detail::L2F32(row0F32, qf32.F32(), f32Bank.view.paddedDims);
 		detail::DotI8(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
