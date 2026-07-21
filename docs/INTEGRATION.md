@@ -131,10 +131,10 @@ lock-free snapshot readers, exclusive `Grow`/`Freeze`/`Load` (§3, and DETERMINI
 
 A flat scan is a memory stream: cost ≈ bank bytes ÷ bandwidth, until SIMD makes it
 compute-bound. Practical desktop numbers (AVX2, one core): int8 scans at roughly
-10 GB/s-equivalent — a 4 MB bank (40k × 100d int8) in ~0.5 ms serial; chunk-parallel
-across a task graph, ~0.13 ms wall; batched, ~0.06 ms per query. int8 is the default
-for a reason: it is a 4× bandwidth cut, i.e. roughly a 4× speed and memory win, for
-~1% recall loss.
+6 GB/s-equivalent (4 MB ÷ 0.65 ms) — a 4 MB bank (40k × 100d int8) in ~0.65 ms serial;
+chunk-parallel across a task graph, ~0.13 ms wall; batched, ~0.06 ms per query. int8 is
+the default for a reason: it is a 4× bandwidth cut, i.e. roughly a 4× speed and memory
+win, for ~1% recall loss.
 
 Batching amortizes *memory traffic and per-call overhead*, not compute — on
 compute-bound hardware the per-query gain over parallel singles is modest (~2×), but a

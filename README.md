@@ -79,7 +79,10 @@ Any C++17 compiler, no dependencies. `build.bat` (MSVC), or CMake:
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests
 ```
-(MSVC multi-config: `build/Release/superfaiss_tests.exe`; or use `build.bat`.)
+(MSVC multi-config: `build/Release/superfaiss_tests.exe`; or use `build.bat`.) The same
+build also produces `superfaiss_bench` (`build/superfaiss_bench`, or
+`build/Release/superfaiss_bench.exe` on MSVC multi-config; `build.bat` builds and runs
+both) — the single-thread benchmark the "Measured" table below is reproduced from.
 
 SIMD (SSE4.1 / AVX2+FMA / NEON, scalar fallback) is selected automatically; every
 path has a scalar mirror with the identical accumulation structure, and the test
@@ -190,9 +193,10 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   `capacity × channelCount × 4` bytes, ~3.0 MB at 100k rows / 8 channels (12.5% of the int8 row
   payload beside it), added on promote and freed on demote; Dot/L2 banks relabel by a table swap
   alone, no arena work. [API.md](docs/API.md).
-- **Bank-inspection primitives (v3.2).** Three header-only Tier-1 modules for asking "what does
+- **Bank-inspection primitives (v3.2).** Four header-only Tier-1 modules for asking "what does
   this bank actually look like," not just "what's nearest" — pure functions over a caller-held
-  `BankView`, no new bank state, no persistence surface. `graph.h`: a mutual k-NN neighbor graph
+  `BankView`, no new bank state, no persistence surface. `inspector_common.h`: the shared
+  row-to-query decode helper the other three build on. `graph.h`: a mutual k-NN neighbor graph
   (`BuildKnnNeighbors`), a symmetric-agreement filter (`MutualFilter`), byte-identical duplicate
   grouping (`BuildDuplicateGroups`), and deterministic connected components over the result — the
   clustering substrate behind "does this bank have natural clusters, or one undifferentiated
@@ -204,7 +208,7 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   already in the bank, or a near-duplicate." `matching.h`: sampled-A-verified-against-full-banks
   mutual nearest-neighbor correspondence with CSLS margins (`MutualNearestMatches`) — "which rows
   in bank A correspond to rows in bank B," e.g. a player's saved memory bank against the shipped
-  reference bank. All three are PER-DEVICE deterministic (fixed sample, fixed order, pinned
+  reference bank. All four are PER-DEVICE deterministic (fixed sample, fixed order, pinned
   tie-breaks) — no cross-device claim, unlike the query-path primitives above. Caller-owned
   `Workspace` scratch throughout, zero steady-state allocation once warm, same as everything else
   in this library. These are the primitives the UE plugin's Bank Inspector tool is built on
@@ -255,8 +259,9 @@ you are embedding this library anywhere, it is the worked example.
 | Batched (64 queries), host-parallelized | ~0.06 ms | host-parallelized across cores | engine-side harness (the UE plugin's bench) |
 
 Single-core batching amortizes memory traffic and per-call overhead, not compute — the
-~8x gap between the serial row and the parallel rows above is parallelism across cores,
-not a property of batching by itself. The two single-threaded rows are measured directly
+5.0x gap (chunk-parallel) and 10.8x gap (batched, host-parallelized) between the serial
+row and the parallel rows above is parallelism across cores, not a property of batching
+by itself. The two single-threaded rows are measured directly
 by `tests/bench_main.cpp` in this repo (`bench.Run(40000, 100, Quantization::Int8, 64)`);
 the two host-parallelized rows are measured by the plugin's own multi-threaded harness,
 since threading is the host's job, not this library's (see

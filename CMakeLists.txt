@@ -47,5 +47,13 @@ else()
 	target_compile_options(superfaiss_tests PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 
+add_executable(superfaiss_bench tests/bench_main.cpp)
+target_link_libraries(superfaiss_bench PRIVATE superfaiss Threads::Threads)
+if(MSVC)
+	target_compile_options(superfaiss_bench PRIVATE /W4 /fp:precise)
+else()
+	target_compile_options(superfaiss_bench PRIVATE -Wall -Wextra -ffp-contract=off)
+endif()
+
 enable_testing()
 add_test(NAME superfaiss_tests COMMAND superfaiss_tests)

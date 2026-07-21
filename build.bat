@@ -9,8 +9,15 @@ if not exist %VSDEVCMD% (
 call %VSDEVCMD% -arch=x64 -no_logo
 pushd %~dp0
 if not exist out mkdir out
+set SOURCES=src\kernels.cpp src\kernels_avx2.cpp src\alloc.cpp src\validate.cpp src\bake.cpp src\query.cpp src\compose.cpp src\analytics.cpp src\pca.cpp src\scratch.cpp src\graph.cpp src\novelty.cpp src\matching.cpp
 cl /nologo /std:c++17 /O2 /W4 /fp:precise /EHsc /Iinclude ^
-	src\kernels.cpp src\kernels_avx2.cpp src\alloc.cpp src\validate.cpp src\bake.cpp src\query.cpp src\compose.cpp src\analytics.cpp src\pca.cpp src\scratch.cpp src\graph.cpp src\novelty.cpp src\matching.cpp ^
+	%SOURCES% ^
 	tests\test_main.cpp /Fo:out\ /Fe:out\superfaiss_tests.exe
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /W4 /fp:precise /EHsc /Iinclude ^
+	%SOURCES% ^
+	tests\bench_main.cpp /Fo:out\ /Fe:out\superfaiss_bench.exe
+if errorlevel 1 exit /b 1
 out\superfaiss_tests.exe
+if errorlevel 1 exit /b 1
+out\superfaiss_bench.exe
