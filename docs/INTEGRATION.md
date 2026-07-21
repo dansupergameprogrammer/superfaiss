@@ -42,8 +42,10 @@ if your platform has a C++17 toolchain, the library compiles.
   let your tests assert zero steady-state allocation — a warm pool never allocates.
 - **Scratch banks (v2.0) are the one owning type.** `ScratchBank` allocates its
   fixed-capacity arena once through the same `Allocator` seam and never again
-  (append/remove/snapshot/query are allocation-free; `Grow` is an explicit,
-  caller-initiated reallocation). Persistence goes through the caller-owned
+  (append/remove/snapshot/query are allocation-free; `Grow` and `Relabel` are the
+  explicit, caller-initiated exceptions — `Grow` a reallocation, `Relabel` a
+  possible arena resize on a Cosine bank whose channel count or promote/demote
+  state changes). Persistence goes through the caller-owned
   `ScratchArchive` seam — your save system provides the read/write callbacks, the
   bank owns the format. The v2.3 float-retention posture sizes into the same
   single arena — budget `4 × dims` extra bytes per row when you opt in (~4.9× an
