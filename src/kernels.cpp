@@ -57,7 +57,7 @@ namespace detail
 #endif
 	}
 
-	// Lazy magic-static: immune to cross-TU static-init ordering (Poirot O2).
+	// Lazy magic-static: immune to cross-TU static-init ordering.
 	static bool IsAvx2()
 	{
 		static const bool v = DetectAvx2Fma();
@@ -1759,7 +1759,7 @@ void ScoreChunkFusedXd(
 	}
 
 	// Per-member per-range query self-sums, built ONCE per chunk call instead of
-	// once per row (Poirot R-6: the sums are row-invariant integers; recomputing
+	// once per row (the sums are row-invariant integers; recomputing
 	// them per row was O(rows x members x dims) of redundant work on the L2
 	// segmented-intersect path). Kernels stay allocation-free: stack tables up to
 	// kFusedSqTableMembers members, per-row recompute (bit-identical - the sums

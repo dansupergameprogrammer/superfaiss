@@ -1,25 +1,21 @@
-// SuperFAISS V3.2 — Bank Inspector I, module M3 (matching.h): sampled-A-verified-against-
-// full-banks mutual matching + CSLS margins backing the Inspector's Correspondence view
-// (plan section 25.4, RE-MECHANIZED D-V32-16). Post-processing over exact query output;
-// touches no kernel, quantization, or format.
+// Bank Inspector — module M3 (matching.h): sampled-A-verified-against-full-banks mutual
+// matching + CSLS margins backing the Inspector's Correspondence view. Post-processing
+// over exact query output; touches no kernel, quantization, or format.
 //
 // The heavy pass: pass 1 batches all sampleViewA.count queries against fullViewB in one
-// bank scan (the chunk-outermost amortization — Poirot's M1 S3 lesson, applied here from
-// the outset); pass 2 batches only the DISTINCT candidate B rows pass 1 surfaced against
-// fullViewA (no third pass — both r-terms and the margin compute entirely from these two
-// retrievals, T4-S2). sampleViewA/fullViewB/fullViewA may differ in quantization (E-D1-3),
-// so their paddedDims can differ at equal logical dims — every cross-bank query decode
-// below calls the shared DequantizeRowAsQuery with an explicit targetPaddedDims, never
-// assumes the source's own paddedDims (S4 close, Claude/Poirot/524b373-matching-m3-
-// review.md — this module no longer carries a private decode duplicate).
+// bank scan (the chunk-outermost amortization used consistently across this module); pass
+// 2 batches only the DISTINCT candidate B rows pass 1 surfaced against fullViewA (no third
+// pass — both r-terms and the margin compute entirely from these two retrievals).
+// sampleViewA/fullViewB/fullViewA may differ in quantization, so their paddedDims can
+// differ at equal logical dims — every cross-bank query decode below calls the shared
+// DequantizeRowAsQuery with an explicit targetPaddedDims, never assumes the source's own
+// paddedDims (this module carries no private decode duplicate).
 //
-// S1 CLOSED (2026-07-19, Claude/Poirot/524b373-matching-m3-review.md O1 — "ripe for the
-// all-three close"): both passes' outHits/outCounts route through Workspace's
-// ReserveBatchOutput (slot 0 / slot 1, since pass 1's and pass 2's results must stay alive
-// simultaneously for the assembly loop below), not a per-call std::vector — the same fix
-// applied to graph.h/novelty.h in this same change. (The 2026-07-19 heap-corruption crash
-// that separately stalled this module was root-caused to a caller-array overrun in one
-// test cell, not to this file — casebook b4e139e-m3-heap-corruption-root-cause.md.)
+// Both passes' outHits/outCounts route through Workspace's ReserveBatchOutput (slot 0 /
+// slot 1, since pass 1's and pass 2's results must stay alive simultaneously for the
+// assembly loop below), not a per-call std::vector — the same convention applied to
+// graph.h/novelty.h. (An earlier heap-corruption crash that separately stalled this module
+// was root-caused to a caller-array overrun in one test cell, not to this file.)
 
 #include "superfaiss/matching.h"
 
@@ -46,7 +42,7 @@ int32_t CountNonExcluded(const BankView& bank, const uint32_t* excludeBits)
 	return n;
 }
 
-// Sim(metric, score) = -RankDistance(metric, score) (D-V32-20): L2's raw score is
+// Sim(metric, score) = -RankDistance(metric, score): L2's raw score is
 // lower-is-better and is negated; Cosine/Dot's raw score is already similarity-directioned
 // (Sim(Dot, score) = score, identity — CSLS's own Sim is defined for all three metrics,
 // unlike RankDistance which excludes Dot).
@@ -123,7 +119,7 @@ Status MutualNearestMatches(
 	// Collect the DISTINCT candidate B rows pass 1 surfaced (top-1 of each sample row's
 	// retrieval) — the dedup the contract's own "no third pass" text implies: multiple
 	// sample rows can share the same forward candidate, and it is back-verified once.
-	// Two workspace-tracked index-scratch slots (S1 close): slot 0 holds candidateOfSample
+	// Two workspace-tracked index-scratch slots: slot 0 holds candidateOfSample
 	// (one entry per sample row, read throughout the assembly loop below); slot 1 holds a
 	// working copy that gets sorted/uniqued down to the distinct set in place, tracked by
 	// distinctCount rather than a container resize.

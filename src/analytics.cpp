@@ -458,7 +458,7 @@ Status NNDivergenceChannel(
 	// Unlike the whole-vector NNDivergence (which routes through QueryXdBatch), the channel
 	// path scores each nearest in place, so it needs only the source-lift buffer
 	// (queryScratch) — the Hit/count/Workspace scratch the public signature carries for
-	// parity with the whole-vector twin is unused here and not required non-null (Poirot #2).
+	// parity with the whole-vector twin is unused here and not required non-null.
 	if (outValue == nullptr || queryScratch == nullptr ||
 		!IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
 		source.paddedDims != target.paddedDims)

@@ -1,8 +1,8 @@
-// SuperFAISS V3.2 — Bank Inspector I, module M1 (graph.h): the mutual k-NN graph +
-// connected components backing the Inspector's Structure view (plan section 25.4).
+// Bank Inspector — module M1 (graph.h): the mutual k-NN graph + connected components
+// backing the Inspector's Structure view.
 //
 // Post-processing over exact query output: BuildKnnNeighbors rides the existing Query
-// path (metric-agnostic, best-first, ties ascending index — V32-G5); everything else is
+// path (metric-agnostic, best-first, ties ascending index); everything else is
 // pure integer/byte logic. Determinism tier PER-DEVICE (fixed order, pinned ties,
 // component ids canonicalized to the smallest member index). No kernel, quantization, or
 // format is touched.
@@ -77,7 +77,7 @@ Status BuildKnnNeighbors(
 	// internalK <= count is always a valid query k.
 	const int32_t internalK = excludeSelf ? k + 1 : k;
 
-	// The batch query path (V32-G5/§25.4): the chunk loop runs OUTERMOST across all `count`
+	// The batch query path: the chunk loop runs OUTERMOST across all `count`
 	// queries in one bank pass, amortizing the memory traffic a per-row Query() loop would
 	// re-pay `count` times. Tracked, warm-reusable scratch for the packed query buffer
 	// (Workspace's own "zero allocation on warm reuse" contract); QueryBatch manages its own
@@ -105,7 +105,7 @@ Status BuildKnnNeighbors(
 	// HeapStorage slots are QueryBatch's OWN internal per-sub-batch scratch, reused and
 	// overwritten across sub-batches — not a place a caller can safely park its persistent
 	// output. `ReserveBatchOutput` is workspace's OWN dedicated, growth-tracked block for
-	// exactly this (S1 close — no per-call std::vector, no un-seamed heap traffic).
+	// exactly this — no per-call std::vector, no un-seamed heap traffic.
 	if (!workspace.ReserveBatchOutput(internalK, count))
 	{
 		return Status::OutOfMemory;
@@ -280,7 +280,7 @@ Status ConnectedComponents(
 	};
 
 	// Construction edges FIRST: identical content is one component by definition, seeded
-	// before any discovered geometry (D-V32-28).
+	// before any discovered geometry.
 	if (duplicateGroups != nullptr)
 	{
 		for (int32_t r = 0; r < count; ++r)

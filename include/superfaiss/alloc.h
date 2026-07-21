@@ -81,8 +81,7 @@ public:
 	// Number of times Reserve() actually grew the buffer. Flat across warm queries.
 	uint64_t GrowthCount() const { return GrowthCount_; }
 
-	// Caller-owned batch QUERY-OUTPUT scratch (V3.2 S1 close: Claude/Poirot/afabc08-graph-h-
-	// m1-review.md, 15a0668-s1s2s3-fix-verify.md, 524b373-matching-m3-review.md). DISTINCT
+	// Caller-owned batch QUERY-OUTPUT scratch. DISTINCT
 	// from HeapStorage() above: Query/QueryBatch use HeapStorage() as THEIR OWN internal
 	// per-sub-batch scan scratch via their own Reserve() calls, resized and overwritten
 	// mid-call — a caller cannot safely park its own persistent QueryBatch outHits/outCounts

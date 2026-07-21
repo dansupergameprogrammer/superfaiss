@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstring>
 
-#include "superfaiss/kernels.h"   // detail::FloatBitsToDouble (DAZ-safe scale decode, Poirot #1)
+#include "superfaiss/kernels.h"   // detail::FloatBitsToDouble (DAZ-safe scale decode)
 
 namespace superfaiss
 {
@@ -160,7 +160,7 @@ Status ComputeChannelInverseNorms(const BankView& bank, float* outInvNorms)
 				const int8_t* row = static_cast<const int8_t*>(bank.rows) +
 					static_cast<int64_t>(r) * bank.paddedDims;
 				// Decode the scale the DAZ-safe way the scoring epilogue uses
-				// (compose.cpp:204), not a plain widening (Poirot #1): a plain
+				// (compose.cpp:204), not a plain widening: a plain
 				// (double)scale can see a subnormal scale flushed to 0 under one
 				// thread's DAZ state and preserved under another's, making the derived
 				// int8 Cosine sub-norm machine-dependent against the bank's cross-device

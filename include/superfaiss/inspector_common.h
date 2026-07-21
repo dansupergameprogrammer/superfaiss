@@ -2,12 +2,11 @@
 
 #include "types.h"
 
-// SuperFAISS V3.2 — Bank Inspector I: the row->query conversion shared across every
-// Tier-1 core module (plan section 25.4, temper S1 — "a named, shared step, not an
-// improvisation"). `Query`/`QueryBatch` take a float query, not a stored row; an int8
-// row is per-row-scaled bytes, not a valid query argument on its own. This is the
-// core-side sibling of the plugin's `MakeCentroidQuery({row})` (V32-G10) — a dim-7 cell
-// pins the equivalence: a row probed via this helper returns the same hits as the
+// Bank Inspector — the row->query conversion shared across every Tier-1 core module: one
+// named, shared step rather than a private duplicate in each caller. `Query`/`QueryBatch`
+// take a float query, not a stored row; an int8 row is per-row-scaled bytes, not a valid
+// query argument on its own. This is the core-side sibling of the plugin's
+// `MakeCentroidQuery({row})` — a row probed via this helper returns the same hits as the
 // widget's single-row centroid path.
 //
 // Header-only (dependency-free, no new translation unit): the body is a single
@@ -23,13 +22,12 @@ namespace superfaiss
 // `targetPaddedDims` defaults to `bank.paddedDims` — the common case, where a module
 // queries the SAME bank it decoded the row from, and every real byte plus the source's
 // own zero-padding lanes copy straight through. matching.h's mutual-match crosses two
-// banks that may differ in quantization (E-D1-3), so it decodes a `source` row for a
-// DIFFERENT `target` bank's `paddedDims` — passed explicitly there. The tail
+// banks that may differ in quantization, so it decodes a `source` row for a DIFFERENT
+// `target` bank's `paddedDims` — passed explicitly there. The tail
 // `[dims, targetPaddedDims)` is always written as zero (never copied from the source's own
-// storage), so the target's own pad lanes are correct regardless of `targetPaddedDims`
-// (S4, plan Sec.25.4 temper S1 — "one shared helper, three callers," closing the private
-// `DequantizeRowForTarget` duplicate this generalization replaces;
-// Claude/Poirot/524b373-matching-m3-review.md).
+// storage), so the target's own pad lanes are correct regardless of `targetPaddedDims` —
+// one shared helper, three callers, replacing what used to be a private
+// `DequantizeRowForTarget` duplicate.
 inline void DequantizeRowAsQuery(
 	const BankView& bank, int32_t row, float* outFloatQuery, int32_t targetPaddedDims = -1)
 {

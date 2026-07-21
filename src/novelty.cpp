@@ -1,10 +1,10 @@
-// SuperFAISS V3.2 — Bank Inspector I, module M2 (novelty.h): the k-th-nearest-neighbour
+// Bank Inspector — module M2 (novelty.h): the k-th-nearest-neighbour
 // distance probe + baseline calibration + the limb-1 exact-distance primitive backing
-// the Inspector's Novelty view (plan section 25.4). Post-processing over exact query
+// the Inspector's Novelty view. Post-processing over exact query
 // output; touches no kernel, quantization, or format.
 //
-// NoveltyProbeDistance (F-M2-1 / D-V32-50): int8 whole-row delegates to the PUBLIC
-// ScoreXdPair (analytics.h), which wraps the exact strike-13/14/19 ground-truth
+// NoveltyProbeDistance: int8 whole-row delegates to the PUBLIC
+// ScoreXdPair (analytics.h), which wraps the exact ground-truth
 // arithmetic (XdPairScore -> XdL2/XdCosineDistance) — byte-identical by construction,
 // not by parallel reasoning. float32 and channel legs have no public single-pair exact
 // distance to delegate to, so this file reproduces the SAME fixed-order-double epilogue
@@ -170,7 +170,7 @@ Status NoveltyProbeDistance(
 		// aScaleD/bScaleD stay 1.0 — float32 carries no quantization scale.
 	}
 
-	// Channel Cosine only (D-V32-43, strike 12): a zero-energy slice on EITHER side is
+	// Channel Cosine only: a zero-energy slice on EITHER side is
 	// directionless, never a false distance-0 match. Whole-row Cosine needs no such guard
 	// — a zero-norm whole row/query is rejected upstream by construction (bake-time for a
 	// stored row, query validation for the probe), so this branch is unreachable there.
@@ -249,8 +249,7 @@ Status CalibrateNoveltyBaseline(
 	const int32_t internalK = k + 1;
 	const int32_t count = bank.count;
 
-	// The batch query path (matching graph.h's BuildKnnNeighbors — Poirot casebook
-	// afabc08-graph-h-m1-review.md, S1/S2/S3): the chunk loop runs OUTERMOST across all
+	// The batch query path (matching graph.h's BuildKnnNeighbors): the chunk loop runs OUTERMOST across all
 	// `count` queries in one bank pass. Tracked, warm-reusable query scratch; QueryBatch
 	// manages its own internal top-k scratch via `workspace` (never given segments here,
 	// so it never touches this region).

@@ -60,21 +60,19 @@ static int GFailures = 0;
 	} while (0)
 
 // ---------------------------------------------------------------------------
-// Raw heap-allocation counter (V3.2 S1 test support, Curie 2026-07-19).
+// Raw heap-allocation counter (test support for the zero-steady-state-allocation guard).
 //
 // AllocationCount() (superfaiss/alloc.h) only sees traffic through the
 // SuperFAISS allocator seam (Workspace::Reserve*, via detail::SeamAlloc) —
 // a std::vector's default allocator calls ::operator new directly and is
 // invisible to it. A per-call std::vector<Hit>/std::vector<int32_t> output
-// buffer inside a core query path is exactly the S1 violation standing
-// against graph.h/novelty.h/matching.h (Claude/Poirot/afabc08-graph-h-m1-
-// review.md, Claude/Poirot/15a0668-s1s2s3-fix-verify.md, Claude/Poirot/
-// 524b373-matching-m3-review.md): "the accounting instrument is blind to
+// buffer inside a core query path is exactly the kind of violation that
+// standing seam would miss: "the accounting instrument is blind to
 // the one allocation that violates it." An AllocationCount()-only assertion
 // around such a call would report flat whether or not the violation is
-// present, so it cannot serve as the S1 oracle by itself — it would be a
-// cell that looks swept but proves nothing (Curie's own "a test targets its
-// cell and fails for its reason" discipline).
+// present, so it cannot serve as the oracle by itself — it would be a
+// cell that looks swept but proves nothing (a test must target its
+// cell and fail for its own reason).
 //
 // A scoped, thread-local override of the global ::operator new/delete
 // closes that blind spot for these tests only. The thread-local flag is OFF
@@ -1117,7 +1115,7 @@ static void TestSimdEqualsScalar()
 // Parts A and B are RED pre-fix, GREEN post-fix. Part A is a unit check on the mirror
 // against a double reference (tolerance); Part B is the production feature oracle over
 // the public Query() API (tolerance) and the core twin of the plugin slot-5 Cell-1
-// named-channel query. Part C (Poirot C-1) adds the missing BIT-EXACT determinism
+// named-channel query. Part C adds the missing BIT-EXACT determinism
 // guard: intrinsic DotF32Avx2/L2F32Avx2 == their scalar mirrors, exact float bits, at
 // the sub-8 tail lengths. The intrinsics are not in the public header (only the scalar
 // mirrors are), so — like src/kernels.cpp does — this TU forward-declares them; they
@@ -1196,7 +1194,7 @@ static void TestAvx2Sub8RemainderF32()
 	}
 #endif // SUPERFAISS_TEST_X86_INTRINSICS (Part A)
 
-	// --- Part C (Poirot C-1): the AVX2 intrinsic equals its scalar mirror BIT-EXACTLY at
+	// --- Part C: the AVX2 intrinsic equals its scalar mirror BIT-EXACTLY at
 	// the sub-8 tail. This is the path's determinism contract (DotF32Avx2 == its scalar
 	// mirror, and L2 likewise) and was unguarded here: TestSimdEqualsScalar reaches the
 	// intrinsic only via the DotF32/DotF32Mirror dispatchers, which route non-multiple-
@@ -1346,7 +1344,7 @@ static void TestAvx2Sub8RemainderF32()
 
 // ---------------------------------------------------------------------------
 // T12 — MergeTopK: per-chunk scans merged externally are bit-identical to a single
-// Query over the same bank (the parallel-driver contract; Poirot M1).
+// Query over the same bank (the parallel-driver contract).
 
 static void TestMergeTopK()
 {
@@ -1430,7 +1428,7 @@ static void TestMergeTopK()
 }
 
 // ---------------------------------------------------------------------------
-// T13 — ValidateBankData rejection matrix (Poirot S2).
+// T13 — ValidateBankData rejection matrix.
 
 static void TestValidateBankData()
 {
@@ -6217,7 +6215,7 @@ static void TestPoolRecallAndContracts()
 		XdQuery zero{zq.I8(), 0.0, 0};
 		CHECK(QueryXd(cbank.view, zero, p, ws, hits, &n) == Status::ZeroNormQuery);
 
-		// --- Adversarial payloads (review S2/M1, Japp S-2): no field of a
+		// --- Adversarial payloads: no field of a
 		// caller-provided XdQuery may make scores or rankings ill-defined or
 		// silently wrong. The contract is a FINITE non-negative scale and a
 		// self-dot that IS the image's — anything else is InvalidArgument, single
@@ -6455,7 +6453,7 @@ static void TestWorkspaceReuseAcrossShapes()
 
 
 // ---------------------------------------------------------------------------
-// T26 — trust-boundary validation (Poirot R-2): a loaded payload must satisfy
+// T26 — trust-boundary validation: a loaded payload must satisfy
 // the bake's own laws. Tampered content that the old validation admitted -
 // non-unit Cosine rows, zero-norm Cosine rows, int8 -128 lanes (outside the
 // bake clamp; the CrossDevice overflow proof depends on it) - is BadFormat,
@@ -6541,7 +6539,7 @@ static void TestTrustBoundaryValidation()
 // ===================================================================================
 // T-XDC — CrossDevice composition feature oracles (Test Design SS6A, amendment A9/A10).
 //
-// J-1 (Japp feature-oracle re-audit): the composed cross-device surface (per-row bias
+// The composed cross-device surface (per-row bias
 // dense+sparse, segments, intersect) was proven only by the golden battery hash + batch
 // == singles — consistency oracles. A wrong-but-deterministic composition epilogue
 // passes them. These suites add the missing FEATURE ORACLES:
@@ -6552,9 +6550,9 @@ static void TestTrustBoundaryValidation()
 //          of the SAME composition over the dequantized rows. The neighbour-recovery
 //          honesty number; reported here (red-uncalibrated per SS4 until a calibration
 //          event pins its floor), not asserted.
-// Forge temper 2026-07-11: W1 (bias is the double-domain floored add), W3 (segments —
-// exact-match channel rule, bit-decode, segment order, single floor), S2 (sparse bias
-// tested at k<count to exercise the k+P re-selection).
+// Cases covered: bias is the double-domain floored add; segments — exact-match channel
+// rule, bit-decode, segment order, single floor; sparse bias tested at k<count to
+// exercise the k+P re-selection.
 namespace xdc
 {
 	// --- primitives recoded from DETERMINISM.md SS2c (independent of kernels.cpp) ---
@@ -8087,22 +8085,20 @@ static void TestAnalyticsScratchSnapshot()
 }
 
 // ---------------------------------------------------------------------------
-// T-V3 -- V3.0 channel-capable scratch banks, Slot 2 (SuperFAISS_V2_Plan.md
-// section 23.4 Tier 1 core: channel table at Create, append-time per-channel
-// Cosine sub-norms, Snapshot carries the table). Authored red-first by Curie
-// from section 23.8 (the Coverage Model) and
-// Claude/Curie/SuperFAISS_V3_Test_Design.md. Slot 2 does not cover
-// channel-aware Freeze or archive persistence (section 23.9 slot 3) or Tier 2
+// T-V3 -- V3.0 channel-capable scratch banks, Slot 2 (Tier 1 core: channel table at
+// Create, append-time per-channel Cosine sub-norms, Snapshot carries the table).
+// Authored red-first from the Coverage Model. Slot 2 does not cover
+// channel-aware Freeze or archive persistence (slot 3) or Tier 2
 // channel-scoped analytics (slot 4) -- those suites land with their slots.
 //
-// SCAFFOLD (Curie, not the feature): ScratchBank's channel-table Create
+// SCAFFOLD (test infrastructure, not the feature): ScratchBank's channel-table Create
 // overload is declared in scratch.h but stubbed in scratch.cpp to
 // unconditionally return Status::OutOfMemory -- a status no cell below
 // expects -- so every test in this section compiles, links, and fails at a
 // specific runtime assertion for the one true reason ("channel-capable Create
-// is not implemented"), never on a compile error. Hastings replaces the stub
-// body with the real channel-table validation + sub-norm-arena construction
-// (section 23.4); the scaffold comment in scratch.cpp goes with it.
+// is not implemented"), never on a compile error. The stub is later replaced
+// with the real channel-table validation + sub-norm-arena construction;
+// the scaffold comment in scratch.cpp goes with it.
 
 namespace
 {
@@ -8129,7 +8125,7 @@ namespace
 		}
 	}
 
-	// Slot-2 CAL bands (Curie, proposed; pin at first calibration per the
+	// Slot-2 CAL bands (proposed; pin at first calibration per the
 	// T-V2.5-3 convention): the FEAT tolerance for a per-channel score against
 	// the independent double brute-force reference, relative to the
 	// reference magnitude. Float32 has no quantization noise (residual is
@@ -8479,7 +8475,7 @@ static void TestScratchChannelAppendSubNorms()
 // T-V3-4 -- Snapshot carries the channel table; a channel query over the
 // scratch snapshot bit-equals the SAME query over a baked twin (section
 // 23.7.1, the crux consistency check -- kept alongside T-V3-5's feature
-// oracle per Japp's note that equality oracles never stand alone for an
+// oracle (equality oracles never stand alone for an
 // achievement claim). Also: raw-segment and whole-vector regression (dim 7 --
 // "raw segments already worked; named channels are the addition", "no
 // whole-vector path changed").
@@ -8572,9 +8568,8 @@ static void TestScratchChannelSnapshotBakedTwin()
 // T-V3-5 -- FEAT: the scratch per-channel query vs an independent double
 // brute-force top-k over the DEQUANTIZED snapshot rows, computed from the
 // per-channel-cosine/dot/L2 DEFINITION, not from bake.cpp's own steps.
-// Executes on the mutable path (a scratch channel bank), closing Japp's S-1
-// (the FEAT anchor path) and covering N-1 (the metric matrix: Dot, Cosine, L2
-// each proven per channel).
+// Executes on the mutable path (a scratch channel bank): the FEAT anchor path
+// covering the metric matrix (Dot, Cosine, L2 each proven per channel).
 static void TestScratchChannelFeatureOracle()
 {
 	Rng rng(0xFEA7ull);
@@ -8650,7 +8645,7 @@ static void TestScratchChannelFeatureOracle()
 					 // SUB-VECTOR norm of the (whole-row-unit-normalized) row,
 					 // never the whole-row norm (the exact D-V2-1 contract
 					 // point a wrong-but-deterministic implementation could
-					 // get backwards, per Japp S-1/G-1).
+					 // get backwards).
 				{
 					double dot = 0.0, subNorm = 0.0;
 					for (int32_t j = ch.offset; j < ch.offset + ch.length && j < dims; ++j)
@@ -8770,8 +8765,7 @@ static void TestScratchChannelDegenerateAndRuntimeRejections()
 // T-V3-7 -- composition reachable at slot 2 (dim 8): channel query x
 // {scratch-snapshot tombstone exclusion, generic excludeBits, CrossDevice
 // int8, batch, decomposition, intersection (G-2), metric override (G-2)},
-// and channel query x per-row bias, both dense and sparse forms (Forge W2,
-// N-3).
+// and channel query x per-row bias, both dense and sparse forms.
 static void TestScratchChannelComposition()
 {
 	Rng rng(0xC0F5171Full);
@@ -9042,7 +9036,7 @@ static void TestScratchChannelComposition()
 		}
 	}
 
-	// 7) Channel query x per-row bias (Forge W2, N-3): both the dense
+	// 7) Channel query x per-row bias: both the dense
 	// (count-length view) and sparse ((index,bias) pairs) forms compose --
 	// the composed score is unbiased-channel-score + bias, bitwise, for
 	// every returned hit.
@@ -9360,15 +9354,14 @@ static void TestScratchChannelLifetimeShapeContracts()
 }
 
 // ---------------------------------------------------------------------------
-// T-V3 (slot 3) -- channel-aware Freeze + persistence (SuperFAISS_V2_Plan.md
-// section 23.9 slot 3; section 23.4 channel-aware Freeze; section 23.6 archive
-// presence-flags; section 23.7.1 the Freeze crux; section 23.8 dim 9 round-trip
-// + dim 10 frozen-path FEAT). Authored red-first by Curie, on top of the green
-// slot-2 base (channel Create/Append/Snapshot/Grow). Reuses the slot-2
+// T-V3 (slot 3) -- channel-aware Freeze + persistence: the Freeze crux, archive
+// presence-flags, and dim 9 round-trip + dim 10 frozen-path FEAT. Authored
+// red-first, on top of the green slot-2 base (channel Create/Append/Snapshot/Grow).
+// Reuses the slot-2
 // helpers ScratchChannelFixture / MakeChannelScratchBank / RefNormalizeRow /
 // kChannelFeatRelTol* and the MemArchive seam from TestScratchBanks.
 //
-// SCAFFOLD (Curie, not the feature):
+// SCAFFOLD (test infrastructure, not the feature):
 //   - The channel-aware Freeze overload (Freeze(rows, scales, map, subNorms, ...))
 //     is declared in scratch.h and stubbed in scratch.cpp to return BadAlignment
 //     -- a status no slot-3 cell expects -- so every Freeze cell fails at a
@@ -9378,20 +9371,20 @@ static void TestScratchChannelLifetimeShapeContracts()
 //     shipped format carries no channel table, so a channel bank saved and loaded
 //     comes back single-space (channelCount 0), failing every channel-survival
 //     assertion for the one true reason (persistence does not carry channels yet).
-// Hastings replaces the Freeze stub and extends Save/Load with the section 23.6
+// The Freeze stub is later replaced and Save/Load extended with the
 // presence-flags scheme.
 
 namespace
 {
-	// The scratch archive header's flags-byte offset ASSUMPTION (section 23.6 says a
+	// The scratch archive header's flags-byte offset ASSUMPTION (the format spec says a
 	// "presence-flags byte in reserved[6]" but does not pin WHICH of the six reserved
-	// bytes, nor the byte position of the retention/channels bits -- routed to Vitruvius
-	// as finding C-3 in Claude/Curie/SuperFAISS_V3_Test_Design.md section 11). The header
+	// bytes, nor the byte position of the retention/channels bits -- an open design
+	// question at authoring time). The header
 	// is {magic u32, version u32, capacity i32, count i32, dims i32, paddedDims i32,
 	// metric u8, quant u8, reserved[6]} = 32 bytes; reserved[0] is at byte offset 26. The
 	// forward-tolerance cell (T-V3-Persist-3) pokes a reserved-range bit at this offset;
 	// if slot 3 places the flags byte elsewhere in reserved[6], that cell must move with
-	// it (the finding forces the offset to be pinned).
+	// it (the offset must be pinned, not assumed).
 	constexpr size_t kScratchHeaderFlagsByteOffset = 26;
 
 	// Dequantize one row of a frozen/loaded int8 BankView into doubles (scale * int8),
@@ -9466,7 +9459,7 @@ namespace
 } // namespace
 
 // T-V3-Freeze -- channel-aware Freeze -> a channel-carrying graduated bank (dim 9
-// + section 23.7.1 equality + dim 10 FEAT, closing the FROZEN half of Japp S-1).
+// + equality + dim 10 FEAT, closing the frozen half of the coverage cell).
 static void TestScratchChannelFreeze()
 {
 	Rng rng(0xF3EE2Eull);
@@ -9627,7 +9620,7 @@ static void TestScratchChannelFreeze()
 			CHECK(fHits[i].score == snapHits[i].score);
 		}
 
-		// FEAT (Japp S-1, frozen half): the frozen bank's per-channel query top-k is
+		// FEAT (frozen half): the frozen bank's per-channel query top-k is
 		// within the CAL band of the independent double brute-force over the DEQUANTIZED
 		// frozen rows -- the graduation end-state is feature-oracle'd, not carried by the
 		// equality oracle alone.
@@ -9718,8 +9711,8 @@ static void TestScratchChannelFreeze()
 	}
 }
 
-// T-V3-Persist-1 -- the presence-flags round-trip (Forge S1) + re-derived-on-Load
-// (Forge W3) + the channels+retention combination (dim 9's named combination).
+// T-V3-Persist-1 -- the presence-flags round-trip + re-derived-on-Load
+// + the channels+retention combination (dim 9's named combination).
 static void TestScratchChannelPersistenceRoundTrip()
 {
 	Rng rng(0x9E2C7AA1ull);
@@ -9840,7 +9833,7 @@ static void TestScratchChannelPersistenceRoundTrip()
 	}
 
 	// (b) channels-ONLY round-trip (channels on, retention off): the flags byte must
-	// carry channels WITHOUT retention (Japp G-3 channels-only cell).
+	// carry channels WITHOUT retention (the channels-only cell).
 	{
 		const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
 		ScratchBank bank;
@@ -9872,7 +9865,7 @@ static void TestScratchChannelPersistenceRoundTrip()
 	}
 }
 
-// T-V3-Persist-2 -- writer version-selection (Japp G-3) + backward-read + old-reader
+// T-V3-Persist-2 -- writer version-selection + backward-read + old-reader
 // hard-reject + reject-over-degrade.
 static void TestScratchChannelPersistenceVersioning()
 {
@@ -10010,11 +10003,11 @@ static void TestScratchChannelPersistenceVersioning()
 	}
 }
 
-// T-V3-Persist-3 -- reserved flag-bit forward tolerance (Japp G-3). A v3 reader
+// T-V3-Persist-3 -- reserved flag-bit forward tolerance. A v3 reader
 // encountering an unknown reserved bit in the flags byte tolerates it -- it does not
 // reject the archive and does not mis-read the bit as channels or retention. Poked at
-// the assumed flags-byte offset (see kScratchHeaderFlagsByteOffset; finding C-3 routes
-// the exact offset to Vitruvius). Red today: persistence does not carry channels, so the
+// the assumed flags-byte offset (see kScratchHeaderFlagsByteOffset). Red today:
+// persistence does not carry channels, so the
 // channels+retention state does not survive regardless of the reserved bit.
 static void TestScratchChannelPersistenceReservedBit()
 {
@@ -10603,21 +10596,20 @@ static void TestAllocFlatWorkspaceReserveIndexScratch()
 }
 
 // ---------------------------------------------------------------------------
-// T-V3 (slot 4) -- Tier-2 channel-scoped analytics (SuperFAISS_V2_Plan.md
-// section 23.5; section 23.9 slot-4 gate; section 23.8 dims 3/4/6/8/10) plus
-// the two D-V3-8 concurrency storms. Authored red-first by Curie on the green
+// T-V3 (slot 4) -- Tier-2 channel-scoped analytics (dims 3/4/6/8/10) plus
+// two concurrency storms. Authored red-first on the green
 // slot-3 base. Reuses the slot-2/3 helpers (MakeChannelScratchBank,
 // ScratchChannelFixture) and the analytics/forced-path conventions of the
 // shipped V2.5 suite.
 //
-// SCAFFOLD (Curie, not the feature): the four channel-scoped operators
+// SCAFFOLD (test infrastructure, not the feature): the four channel-scoped operators
 // (CentroidDistance/MeanNN/MaxNN/Spread ...Channel) are declared in analytics.h
 // and stubbed in analytics.cpp to return Status::BadAlignment -- a status no
 // slot-4 cell expects -- so every REF/FEAT/composition/determinism/rejection
 // cell fails at a specific runtime assertion for the one true reason. Storm (a)
 // (channel-query-only) needs no scaffold: it exercises the already-green slot-2
-// channel query, so it goes GREEN immediately (a coverage patch owed by D-V3-8).
-// Hastings implements the real section-23.5 operators.
+// channel query, so it goes GREEN immediately (a coverage patch owed separately).
+// The stub is later replaced with the real operators.
 
 namespace
 {
@@ -10746,7 +10738,7 @@ namespace
 		return best;
 	}
 
-	// Slot-4 FEAT CAL bands (Curie, proposed; pin at first calibration): loose enough to
+	// Slot-4 FEAT CAL bands (proposed; pin at first calibration): loose enough to
 	// absorb int8 row quantization AND centroid re-quantization (the T-V2.5-3 band shape).
 	double ChannelFeatTol(double ref)
 	{
@@ -11522,9 +11514,9 @@ static void TestChannelScopedAnalyticsRejections()
 	}
 }
 
-// T-V3-A5 (D-V3-8 (a)) -- channel-query-only storm: a reader RE-SNAPSHOTS in the loop,
+// T-V3-A5 -- channel-query-only concurrency storm: a reader RE-SNAPSHOTS in the loop,
 // repeatedly observing freshly-published rows while a writer appends (within the pre-sized
-// arena, no Grow) and removes. The forcing invariant (Japp P-1): for every fresh snapshot,
+// arena, no Grow) and removes. The forcing invariant: for every fresh snapshot,
 // the arena's per-channel sub-norms bit-equal a fresh ComputeChannelInverseNorms over that
 // snapshot's own published rows -- i.e. a row NEVER appears in a snapshot without its
 // sub-norm. This directly exercises the append-time sub-norm-write-BEFORE-PublishedCount_
@@ -11625,9 +11617,9 @@ static void TestChannelQueryOnlyStorm()
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
 
-// T-V3-A6 (D-V3-8 (b)) -- full storm: a reader RE-SNAPSHOTS in the loop and runs a
+// T-V3-A6 -- full concurrency storm: a reader RE-SNAPSHOTS in the loop and runs a
 // channel-SCOPED REDUCTION over each fresh snapshot, concurrent with a writer's
-// append/remove. Two forcing checks (Japp P-1): (1) the arena sub-norms bit-equal a fresh
+// append/remove. Two forcing checks: (1) the arena sub-norms bit-equal a fresh
 // recompute over each snapshot's published rows (the ordering invariant, as in T-V3-A5);
 // and (2) the live reduction (which reads the arena's stored sub-norms) equals a serial
 // TWIN reduction over the SAME snapshot rows with FRESHLY-recomputed sub-norms -- so a
@@ -11720,7 +11712,7 @@ static void TestChannelScopedReductionStorm()
 }
 
 
-// T-V3-Persist-4 (Japp P-2, dims 2/9) -- Load re-validates the serialized channel table:
+// T-V3-Persist-4 (dims 2/9) -- Load re-validates the serialized channel table:
 // a malformed channelCount or a malformed ChannelInfo geometry in the blob -> BadFormat,
 // and the target bank is left unchanged (reject-over-degrade). The scratch archive layout
 // (v3): a 32-byte header {..., reserved[6] at offset 26}, then int32 channelCount at offset
@@ -11817,7 +11809,7 @@ static void TestScratchChannelLoadRejectsMalformedTable()
 	CHECK(targetChannelCount() == 2);
 }
 
-// T-V3-Persist-5 (Japp P-3, dim 9) -- the writer's version-selection, asserted directly on
+// T-V3-Persist-5 (dim 9) -- the writer's version-selection, asserted directly on
 // the serialized version integer (little-endian u32 at byte 4) and the flags byte
 // (reserved[0] at byte 26): a feature-less bank emits version 1; a retention-only bank emits
 // version 2; a channel bank emits version 3 with the channels flag set (bit 1), the
@@ -11899,7 +11891,7 @@ static void TestScratchChannelSaveVersionSelection()
 }
 
 // ===========================================================================
-// v3.0.1 red suite (Curie): two P1 correctness bugs + three coverage holes.
+// v3.0.1 red suite: two P1 correctness bugs + three coverage holes.
 //   [P1-B1] TestChannelNNZeroEnergyFloor           -- RED (floors, not rejects)
 //   [P1-B2] TestScratchChannelPerChannelRecallZeroEnergy -- RED (skips, not aborts)
 //   [hole]  TestChannelAnalyticsCrossDeviceGolden  -- GREEN (pins cross-device channel golden)
@@ -12511,7 +12503,7 @@ static void TestPerChannelRecallOracle()
 }
 
 // [hole] Version/header coherence. version.h must declare v3.0.0 for the v3.0 release. RED now
-// (it reads 2/5/0); Hastings bumps it. Kept as a standalone assertion so the release-version
+// (it reads 2/5/0); the header is bumped separately. Kept as a standalone assertion so the release-version
 // truth has a test, not just a header edit.
 static void TestVersionHeaderCoherence()
 {
@@ -12524,12 +12516,11 @@ static void TestVersionHeaderCoherence()
 }
 
 // ===========================================================================
-// V3.1 red suite (Curie, 2026-07-13): the Relabel operation (plan section 24).
-// Realizes the section 24.8 Coverage Model against the no-op stub at
+// V3.1 red suite: the Relabel operation.
+// Realizes the Coverage Model against the no-op stub at
 // scratch.cpp:657-662 (returns Ok without mutating) -- every test below fails for
 // its cell's reason: a rejection test sees Ok where it expects InvalidArgument/
 // OutOfMemory; a mutation test sees the OLD table where it expects the new one.
-// Test design: Claude/Curie/superfaiss-v3.1-test-design-2026-07-13.md.
 // Reuses the V3.0 channel-test helpers (ScratchChannelFixture, MakeChannelScratchBank,
 // MemArchive, RefNormalizeRow, DequantizeRow, FeatRefHit, ChannelCosineBruteForce,
 // kChannelFeatRelTolF32/I8, kScratchHeaderFlagsByteOffset, an::Hash) from the
@@ -13071,7 +13062,7 @@ static void TestRelabelWarmPromoteDemoteToggle()
 	checkChannelQuery("toggle: promote #2 (re-bind)");
 }
 
-// T-V3.1-Aliasing (Forge W2, dim 3) -- a Dot/L2 relabel is a by-value member write, aliased
+// T-V3.1-Aliasing (dim 3) -- a Dot/L2 relabel is a by-value member write, aliased
 // into every live BankView. A BankView taken BEFORE a Dot/L2 relabel observes the NEW table
 // through that alias once the exclusive drain completes -- proving the drain actually ran.
 static void TestRelabelHeldViewAliasing()
@@ -13105,7 +13096,7 @@ static void TestRelabelHeldViewAliasing()
 
 		CHECK(bank.Relabel(newTable, 2) == Status::Ok);
 
-		// Forge W2: the Dot/L2 by-value member write to Channels_ IS observable through the
+		// The Dot/L2 by-value member write to Channels_ IS observable through the
 		// held view's aliased channels pointer -- so a view taken before a relabel must join
 		// the Grow/Load invalidation set. The aliased channels[0] reflecting the new {0,24}
 		// boundary proves the member write landed and the exclusive drain ran.
@@ -13390,7 +13381,7 @@ static void TestRelabelExtremesMatrix()
 					// near-1 factor. This is inherent channel-cosine semantics (a V3.0 property,
 					// verified independent of Relabel), not a relabel defect. The Cosine whole-row
 					// end-state is already FEAT-covered above; only Dot/L2 get the bit-identity
-					// INV. (Routed to Vitruvius: S24.8 dim-4 "must match the whole-vector path
+					// INV. (The coverage cell's "must match the whole-vector path
 					// bit-for-bit" should read "for Dot/L2; FEAT-equivalent for Cosine".)
 					if (metric != Metric::Cosine && targetCount == 1 && ch.offset == 0 &&
 						ch.length == snap.paddedDims)
@@ -13470,7 +13461,7 @@ static void TestRelabelAllZeroNormChannel()
 	}
 }
 
-// T-V3.1-Parity (dim 6, the crux; Loki S1 scoping) -- after Relabel(T_new),
+// T-V3.1-Parity (dim 6, the crux) -- after Relabel(T_new),
 // ChannelInvNorms_ over the LIVE-ROW PREFIX [0, count) x newChannelCount bit-equals a fresh
 // Create(T_new)+Append of the SAME rows in the SAME order at the SAME starting capacity.
 // Scoped to the live prefix, never a full-arena memcmp: a Grow-then-Relabel bank outsizes a
@@ -13565,7 +13556,7 @@ static void TestRelabelParityVsFreshCreate()
 	}
 }
 
-// T-V3.1-ParityTautology (Forge N1/N2) -- the near-tautological determinism check: the
+// T-V3.1-ParityTautology -- the near-tautological determinism check: the
 // relabel-derived sub-norms bit-equal ComputeChannelInverseNorms over the current rows
 // under the new table.
 static void TestRelabelParityEqualsComputeChannelInverseNorms()
@@ -14590,7 +14581,7 @@ static void TestRelabelPersistenceValueRoundTrip()
 		"per-channel recall must survive the round-trip of a relabeled bank");
 }
 
-// T-V3.1-PersistByteIdentical (dim 9b, Forge W1) -- a relabeled bank's archive is
+// T-V3.1-PersistByteIdentical (dim 9b) -- a relabeled bank's archive is
 // byte-identical to a fresh bank's under the same table and rows, PRECONDITIONS pinned:
 // same capacity, count, append order, retention.
 static void TestRelabelArchiveByteIdenticalToFresh()
@@ -14633,7 +14624,7 @@ static void TestRelabelArchiveByteIdenticalToFresh()
 		freshArchive.bytes.size());
 	CHECK_MSG(relArchive.bytes == freshArchive.bytes,
 		"a relabeled bank's archive must be byte-identical to a fresh bank's under the same "
-		"table and rows (same capacity/count/append-order/retention, Forge W1)");
+		"table and rows (same capacity/count/append-order/retention)");
 }
 
 // T-V3.1-PersistDemoteLegacy (dim 9c) -- a demote-to-single-space relabeled bank writes the
@@ -14993,24 +14984,22 @@ static void TestRelabelDemoteFeat()
 }
 
 // ===========================================================================
-// V3.2 red suite (Curie, 2026-07-18): Bank Inspector I — module M1 graph.h
-// (plan section 25, Coverage Model section 25.9). Realizes the M1 cells against
+// V3.2 red suite: Bank Inspector I — module M1 graph.h
+// (Coverage Model). Realizes the M1 cells against
 // the RED SCAFFOLD stub at src/graph.cpp (every body returns Ok and writes
-// nothing — the proven V3.1 no-op-stub pattern), so every cell below fails for
+// nothing — the same no-op-stub pattern used for V3.1), so every cell below fails for
 // its cell's reason: a FEAT/exactness cell reads its poison-initialized output
 // buffer where it expects the constructed component structure; a dim-2 rejection
 // cell sees Ok where it expects InvalidArgument.
-// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
 //
-// Oracle discipline (the D-V32 strike loop, "build don't reason"):
+// Oracle discipline ("build, don't reason"):
 //  * the neighbor/edge REF is a double-precision brute force over the DEQUANTIZED
 //    rows the kernel actually scores (GBank::refRows), same total order as the
 //    library (score, then ascending index);
-//  * the duplicate-union / multi-block-separation / fringe geometries are the
-//    EXECUTED construction_check.cpp fixtures (Claude/Loki/strike8, 10/10 true
+//  * the duplicate-union / multi-block-separation / fringe geometries are
+//    EXECUTED construction_check.cpp fixtures (10/10 true
 //    counts) ported verbatim — well-separated so float-vs-double ranking cannot
-//    disagree; the component-count oracle is the construction, not intuition
-//    (the D-V32-25 corollary);
+//    disagree; the component-count oracle is the construction, not intuition;
 //  * the Structure FEAT ground truth is CONSTRUCTED (planted blobs/isolates/
 //    duplicate blocks), never a re-run of the implementation — a wrong-but-
 //    deterministic grapher fails it (dimension 10).
@@ -15336,9 +15325,8 @@ static void TestM1DuplicateGroupingByteConfirm()
 
 // M1 / dim 6 (edges exact) + dim 7 (per-metric generality, G-3) — the built neighbor
 // list, mutual flags, and component ids equal the double-precision brute force, for Dot,
-// Cosine, and L2, int8 and float32. Two mechanism-true, TIE-FREE fixtures (F-M1-3, the
-// D-V32-25 corollary: a degenerate/near-duplicate oracle value must be TRACED from the
-// mechanism, never intuited):
+// Cosine, and L2, int8 and float32. Two mechanism-true, TIE-FREE fixtures (a degenerate/
+// near-duplicate oracle value must be TRACED from the mechanism, never intuited):
 //   Leg 1 (distinct-distance arc) proves neighbor RANKING on distinct, gap-separated
 //     distances — points on a circular arc with strictly-INCREASING angular gaps, so
 //     every pairwise distance is distinct in all three metrics and no float-vs-double
@@ -15420,7 +15408,7 @@ static void TestM1EdgesExactAcrossMetrics()
 }
 
 // M1 / dim 4 + dim 7 + dim 10 (identical => one component; multi-block separation) —
-// the EXECUTED construction_check.cpp geometries ported verbatim (strike 7/8, 10/10 true
+// the EXECUTED construction_check.cpp geometries ported verbatim (10/10 true
 // counts): an exact-duplicate block of m>k+1 collapses to ONE component; D well-separated
 // duplicate blocks yield exactly D components (construction edges never fabricate cross-
 // block edges); interleaved index order changes nothing.
@@ -15430,7 +15418,7 @@ static void TestM1DuplicateUnionConstructionCounts()
 		std::vector<float> v(8, 0.0f); v[0] = 100.0f * (bl + 1); v[1] = 7.0f * bl; return v;
 	};
 	const int32_t dims = 8;
-	// strike 7: one identical block of 10, k=2 (m > k+1) -> 1 component.
+	// Fixture 1: one identical block of 10, k=2 (m > k+1) -> 1 component.
 	{
 		std::vector<float> src;
 		for (int32_t i = 0; i < 10; ++i) { auto c = sep(0); src.insert(src.end(), c.begin(), c.end()); }
@@ -15440,7 +15428,7 @@ static void TestM1DuplicateUnionConstructionCounts()
 		CHECK_MSG(ComponentCount(ids) == 1, "identical block m=10,k=2 -> 1 component (construction union), got %d",
 			ComponentCount(ids));
 	}
-	// strike 8: D in {2,3,5} well-separated duplicate blocks x8, k=4 -> D components,
+	// Fixture 2: D in {2,3,5} well-separated duplicate blocks x8, k=4 -> D components,
 	// contiguous AND interleaved index order.
 	for (int32_t D : {2, 3, 5})
 	{
@@ -15489,7 +15477,7 @@ static void TestM1DuplicateUnionConstructionCounts()
 // M1 / dim 4 + dim 10 (traced fringe oracle) — the construction_check.cpp fringe pair
 // (m=k connects, m=k+1 saturates): an outside neighbour of an m>k block stays unconnected
 // because its partner's top-k is saturated by group-mates; when m<=k the edge forms. The
-// oracle is COMPUTED from the mechanism, never intuited (D-V32-25 corollary).
+// oracle is COMPUTED from the mechanism, never intuited.
 static void TestM1FringeBoundary()
 {
 	auto sep = [](int32_t bl) {
@@ -15665,16 +15653,16 @@ static void TestM1StructureFeat()
 }
 
 // ===========================================================================
-// V3.2 red suite (Curie) — module M2 novelty.h. NoveltyScore only (its contract
-// is fully pinned by §25.4 and is independent of F-M2-1); the probe, baseline,
-// and two-limb verdict land after the F-M2-1 exact-distance-entry decision.
+// V3.2 red suite — module M2 novelty.h. NoveltyScore only (its contract
+// is fully pinned and is independent of the exact-distance entry); the probe, baseline,
+// and two-limb verdict land after that entry is decided.
 // RED SCAFFOLD: src/novelty.cpp returns Ok and writes nothing.
 // ===========================================================================
 
 // M2 / dim 2 + dim 6 + dim 10 — NoveltyScore is the empirical-CDF rank: the fraction of
 // the sorted baseline STRICTLY LESS THAN the probe distance (ties resolve to the lowest
-// rank), normalized to [0,1]. Oracle is hand-computed from the definition (strike-9's
-// executed NoveltyScore); rejection on count<1 / null buffers.
+// rank), normalized to [0,1]. Oracle is hand-computed from the definition (an
+// independently executed NoveltyScore); rejection on count<1 / null buffers.
 static void TestM2NoveltyScore()
 {
 	// Rejection (dim 2): count < 1 and null buffers -> InvalidArgument, no write.
@@ -15720,19 +15708,18 @@ static void TestM2NoveltyScore()
 }
 
 // ===========================================================================
-// V3.2 red suite (Curie) continued — M2 novelty.h: NoveltyProbeDistance (F-M2-1 /
-// D-V32-50, Dan's call, option A), KthNeighborDistance, CalibrateNoveltyBaseline, and the
-// two-limb tri-state verdict FEAT (D-V32-31/47, the crux). RED SCAFFOLD: the three new
+// V3.2 red suite continued — M2 novelty.h: NoveltyProbeDistance,
+// KthNeighborDistance, CalibrateNoveltyBaseline, and the
+// two-limb tri-state verdict FEAT (the crux). RED SCAFFOLD: the three new
 // novelty.cpp bodies return Ok and write nothing.
-// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
 //
-// Oracle discipline (the D-V32 strike loop, "build don't reason"), applied per F-M2-1's
-// mandate: NoveltyProbeDistance's oracle (M2OracleProbeDistance) reproduces the SAME
+// Oracle discipline ("build, don't reason"): NoveltyProbeDistance's oracle
+// (M2OracleProbeDistance) reproduces the SAME
 // per-(metric,scope,quant) dispatch the entry's contract pins, built from REAL shipped
 // kernel primitives (QuantizeQueryXd, detail::DotI8I8, detail::FloatBitsToDouble) that are
 // proven elsewhere and are never the entry under test — oracle == entry by execution, one
-// verified number rather than two hopefully-agreeing ones (the strike-14 discipline). The
-// strike 10/11/12/13/14 constructed geometries are ported verbatim as fixtures.
+// verified number rather than two hopefully-agreeing ones. Several
+// constructed geometries are ported verbatim as fixtures.
 // ===========================================================================
 
 namespace
@@ -15755,7 +15742,7 @@ namespace
 		float distance;
 	};
 
-	// Independent oracle for NoveltyProbeDistance (F-M2-1/D-V32-47/48/50): the SAME
+	// Independent oracle for NoveltyProbeDistance: the SAME
 	// per-(metric,scope,quant) dispatch novelty.h's contract pins, built from real shipped
 	// kernel primitives — never calls NoveltyProbeDistance itself. `channel == -1` is
 	// whole-row.
@@ -15906,7 +15893,7 @@ namespace
 	// Brute-force k-th-NN RankDistance of `query` against `b`, excluding the rows listed in
 	// `excludeRows`. L2 -> the k-th smallest squared distance (already a RankDistance);
 	// Cosine -> 1 - the k-th LARGEST cosine similarity (RankDistance applied AFTER ranking
-	// by similarity — D-V32-19's pinned order). Never called on a Dot bank (verdict-domain
+	// by similarity — the pinned order). Never called on a Dot bank (verdict-domain
 	// only).
 	float M2BruteKthRankDistance(const GBank& b, const float* query, int32_t k,
 		const std::vector<int32_t>& excludeRows)
@@ -15928,13 +15915,13 @@ namespace
 	}
 }
 
-// M2 / dim 2 + dim 4 + dim 6 + dim 7 (F-M2-1, D-V32-47/48/50) — NoveltyProbeDistance is
+// M2 / dim 2 + dim 4 + dim 6 + dim 7 — NoveltyProbeDistance is
 // limb 1's exact-distance entry: the metric's OWN distance function between a probe and
 // one stored row, dispatched per (metric, scope, quant). Oracle: M2OracleProbeDistance.
 static void TestM2NoveltyProbeDistance()
 {
 	Rng rng(0x4E5031);
-	// Finding 5 (Poirot cf3f750-v32-core-batch-review.md): NoveltyProbeDistance now takes
+	// NoveltyProbeDistance now takes
 	// a Workspace, matching its three sibling M2 entries (KthNeighborDistance,
 	// CalibrateNoveltyBaseline take one already) -- one warm workspace serves every call
 	// in this function.
@@ -15969,7 +15956,7 @@ static void TestM2NoveltyProbeDistance()
 	}
 
 	// --- Channel-table trust boundaries: channel out of [-1, channelCount). Grid-aligned
-	// (F-M2-3: the int8 channel grid is 16 elements -- an off-grid channel table is
+	// (the int8 channel grid is 16 elements -- an off-grid channel table is
 	// unrealizable on any bank that passed real validation, and detail::DotI8I8's SIMD
 	// paths assume 16-alignment with no scalar remainder tail). ---
 	{
@@ -15989,14 +15976,14 @@ static void TestM2NoveltyProbeDistance()
 	// (unconditional -- both read the SAME real QuantizeQueryXd/DotI8I8 primitives, so this
 	// holds regardless of whether the round trip below reproduces byte-identical codes); a
 	// distinct row -> entry == oracle; oracle == entry on random pairs. Cosine additionally
-	// asserts EXACTLY 0 (D-V32-47: parallel int8 codes give cross^2 == aSq*bSq exactly, and
+	// asserts EXACTLY 0 (parallel int8 codes give cross^2 == aSq*bSq exactly, and
 	// sqrt of a perfect square is exact under IEEE correctly-rounded sqrt -- proven, and
 	// confirmed by execution here). L2 does NOT get the same absolute assertion: dequantizing
 	// row 2 through a float32 probe and re-quantizing is not guaranteed to reproduce
 	// byte-identical codes (the dequantized value itself is a float32 rounding of a double),
 	// and even where the codes ARE identical, L2's EXPANDED form (a^2+b^2-2ab) is prone to
 	// double-precision cancellation residue -- the disclosed, standing "L2 expanded-form
-	// rounding" item (D-V32-48), confirmed here too (a tiny nonzero residual on an otherwise
+	// rounding" item, confirmed here too (a tiny nonzero residual on an otherwise
 	// exact case, not a defect). L2 uses a tight epsilon that absorbs double-precision
 	// rounding noise but nothing larger. ---
 	for (Metric metric : {Metric::Cosine, Metric::L2})
@@ -16014,13 +16001,13 @@ static void TestM2NoveltyProbeDistance()
 			{
 				CHECK_MSG(out == 0.0f,
 					"int8 whole-row Cosine: a re-quantized duplicate probe must score exactly "
-					"0 (D-V32-47's parallel-code exactness), got %.9g", static_cast<double>(out));
+					"0 (parallel-code exactness), got %.9g", static_cast<double>(out));
 			}
 			else
 			{
 				CHECK_MSG(std::fabs(out) < 1e-8f,
 					"int8 whole-row L2: a re-quantized duplicate probe must score near-zero "
-					"(D-V32-48's disclosed expanded-form rounding residue, not exact-0), "
+					"(the disclosed expanded-form rounding residue, not exact-0), "
 					"got %.9g", static_cast<double>(out));
 			}
 			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), 2, -1);
@@ -16054,8 +16041,8 @@ static void TestM2NoveltyProbeDistance()
 	}
 
 	// --- Whole-row Cosine, int8: a SCALAR MULTIPLE of a stored row is a true cosine
-	// duplicate (distance exactly 0) even though it stores byte-DIFFERENT — the strike-14
-	// completeness leg (D-V32-46/47): kills any regression to a byte-identity limb 1. ---
+	// duplicate (distance exactly 0) even though it stores byte-DIFFERENT — the
+	// completeness leg: kills any regression to a byte-identity limb 1. ---
 	{
 		const int32_t dims = 32, count = 1;
 		std::vector<float> rowSrc(static_cast<size_t>(dims));
@@ -16127,17 +16114,17 @@ static void TestM2NoveltyProbeDistance()
 		}
 	}
 
-	// --- Channel-scoped Cosine, int8: strike 10's exact-direction twin verdicts a true
-	// scoped duplicate (distance 0); a different-direction pair does not. Grid-aligned
-	// (F-M2-3): dims=32, channel0=[0,16)/channel1=[16,32), the strike's channel-0 direction
+	// --- Channel-scoped Cosine, int8: an exact-direction twin fixture verdicts a true
+	// scoped duplicate (distance 0); a different-direction pair does not. Grid-aligned:
+	// dims=32, channel0=[0,16)/channel1=[16,32), the fixture's channel-0 direction
 	// at index 0 and its whole-row-norm-affecting remainder moved to index 16 (channel 1) —
-	// the same relationship strike 10's 6-dim geometry had (a value OUTSIDE the scoped
+	// the same relationship a smaller 6-dim geometry had (a value OUTSIDE the scoped
 	// channel that changes the whole-row norm without entering the channel-0 slice). ---
 	{
 		const int32_t dims = 32;
 		std::vector<float> rowA(static_cast<size_t>(dims), 0.0f);
 		rowA[0] = 1.0f;  // channel-0 direction (1,0,0,...)
-		rowA[16] = 3.0f; // channel-1 value -- affects whole-row norm only, mirrors strike 10
+		rowA[16] = 3.0f; // channel-1 value -- affects whole-row norm only, mirrors the fixture above
 		std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
 		GChannelBank b(rowA, 1, dims, Quantization::Int8, Metric::Cosine, ch);
 
@@ -16148,7 +16135,7 @@ static void TestM2NoveltyProbeDistance()
 			float out = -999.0f;
 			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 0.0f,
-				"channel-scoped Cosine int8: exact-direction slice twin (strike 10) must "
+				"channel-scoped Cosine int8: exact-direction slice twin must "
 				"score exactly 0, got %.9g", static_cast<double>(out));
 		}
 		{
@@ -16163,12 +16150,12 @@ static void TestM2NoveltyProbeDistance()
 		}
 	}
 
-	// --- Channel-scoped L2, int8: strike 11's twin — kernel channel-L2 distance exactly
-	// 0.0 for two rows with a DIFFERENT stored (bytes, scale) key. Grid-aligned (F-M2-3):
-	// dims=32, channel0=[0,16)/channel1=[16,32); the strike's channel-0 payload
+	// --- Channel-scoped L2, int8: a twin fixture — kernel channel-L2 distance exactly
+	// 0.0 for two rows with a DIFFERENT stored (bytes, scale) key. Grid-aligned:
+	// dims=32, channel0=[0,16)/channel1=[16,32); the fixture's channel-0 payload
 	// (100/127,50/127,0) sits at indices [0,3), and the scale-driving remainder (2.0 vs
 	// 1.0) moves to index 16 (channel 1) -- the per-row whole-row maxAbs/scale and every
-	// quantized byte in channel 0 come out bit-identical to strike 11's own numbers, since
+	// quantized byte in channel 0 come out bit-identical to the reference numbers, since
 	// the extra zero lanes contribute nothing to either the scale or the channel-0 sums. ---
 	{
 		const int32_t dims = 32;
@@ -16188,15 +16175,15 @@ static void TestM2NoveltyProbeDistance()
 		// Near-zero, not exact-0: the pair is exact by hand-verified RATIONAL arithmetic
 		// (12500/127^2 + 12500/127^2 - 25000/127^2 == 0 exactly, since 2/127 and 1/127 are
 		// each other's cross-consistent scale), but the EXPANDED-FORM double computation
-		// (a^2+b^2-2ab) carries the disclosed, standing L2 rounding residue (D-V32-48) —
+		// (a^2+b^2-2ab) carries the disclosed, standing L2 rounding residue —
 		// confirmed here (a residual at double-epsilon scale, not a defect).
 		CHECK_MSG(std::fabs(out) < 1e-8f,
-			"channel-scoped L2 int8: strike 11's dequant-identical/byte-different twin must "
-			"score near-zero (D-V32-48's disclosed expanded-form rounding residue, not "
+			"channel-scoped L2 int8: the dequant-identical/byte-different twin fixture must "
+			"score near-zero (the disclosed expanded-form rounding residue, not "
 			"exact-0), got %.9g", static_cast<double>(out));
 	}
 
-	// --- Channel-scoped Cosine zero-energy guard, BOTH sides (D-V32-43, strike 12): a
+	// --- Channel-scoped Cosine zero-energy guard, BOTH sides: a
 	// zero-energy slice on the STORED row, or on the PROBE, must reject with ZeroNormQuery
 	// — never silently floor to a false distance-0 duplicate. ---
 	{
@@ -16218,7 +16205,7 @@ static void TestM2NoveltyProbeDistance()
 			float out = -999.0f;
 			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out, ws);
 			CHECK_MSG(s == Status::ZeroNormQuery,
-				"channel Cosine zero-energy STORED row (strike 12) must reject ZeroNormQuery, "
+				"channel Cosine zero-energy STORED row must reject ZeroNormQuery, "
 				"got status=%d distance=%.9g", static_cast<int>(s), static_cast<double>(out));
 			CHECK(out == -999.0f);
 		}
@@ -16333,7 +16320,7 @@ static void TestM2NoveltyProbeDistance()
 	}
 }
 
-// M2 / dim 2 + dim 5 + dim 6 (D-V32-19/22) — KthNeighborDistance: the k-th-NN distance
+// M2 / dim 2 + dim 5 + dim 6 — KthNeighborDistance: the k-th-NN distance
 // against the FULL view, converted to RankDistance before ranking (L2 -> score; Cosine ->
 // 1 - score); Dot excluded from the verdict domain. Oracle: M2BruteKthRankDistance.
 static void TestM2KthNeighborDistance()
@@ -16341,7 +16328,7 @@ static void TestM2KthNeighborDistance()
 	Rng rng(0x4B7448);
 
 	// --- Trust boundaries (dim 2): k<1, k too large, null buffers, Dot -> InvalidArgument,
-	// no write. F-M2-4: KthNeighborDistance is explicitly NOT self-widening (unlike
+	// no write. KthNeighborDistance is explicitly NOT self-widening (unlike
 	// BuildKnnNeighbors' excludeSelf), so k == the number of non-excluded rows is a VALID
 	// call (the distance to the single farthest row) -- the rejection boundary is k >
 	// available, not k >= available. Confirmed against the header's own literal wording. ---
@@ -16374,7 +16361,7 @@ static void TestM2KthNeighborDistance()
 		BankView dotView = b.view;
 		dotView.metric = Metric::Dot;
 		CHECK_MSG(KthNeighborDistance(dotView, query.data(), 1, nullptr, &out, ws) == Status::InvalidArgument,
-			"a Dot bank must reject -- RankDistance is undefined there (D-V32-22)");
+			"a Dot bank must reject -- RankDistance is undefined there");
 		CHECK(out == -999.0f);
 	}
 
@@ -16462,8 +16449,8 @@ static void TestM2KthNeighborDistance()
 // RankDistance distribution over the view it is handed (which the caller already sampled
 // to sampleLimit — this function does not re-stride, per its header contract), each row
 // self-excluded, output sorted ascending. In-cap correctness only (bank.count <=
-// sampleLimit): the over-cap striding algorithm is a separate contract question, routed as
-// F-M2-2 (see the test-design artifact).
+// sampleLimit): the over-cap striding algorithm is a separate contract question, not
+// covered here.
 static void TestM2CalibrateNoveltyBaseline()
 {
 	Rng rng(0x2C0FEE);
@@ -16568,7 +16555,7 @@ namespace
 {
 	enum class M2Verdict { Duplicate, Novel, Familiar, Unavailable, Error };
 
-	// The two-limb tri-state verdict driver (D-V32-31/47), composed from the four M2
+	// The two-limb tri-state verdict driver, composed from the four M2
 	// primitives UNDER TEST — not a hand transcription of the mechanism. Limb 1 fires first
 	// (NoveltyProbeDistance against every live row at exact distance 0 — override, CDF
 	// never consulted); else limb 2 (KthNeighborDistance + CalibrateNoveltyBaseline +
@@ -16624,8 +16611,8 @@ namespace
 	}
 }
 
-// M2 / dim 10 (the crux) — the two-limb tri-state Novelty FEAT (D-V32-31/47), composed
-// from the four M2 primitives under test via M2ComputeVerdict. The strike-9 discrimination
+// M2 / dim 10 (the crux) — the two-limb tri-state Novelty FEAT, composed
+// from the four M2 primitives under test via M2ComputeVerdict. The discrimination
 // geometry (dup-of-isolate, third-copy, dup-of-dense, fresh-isolate, fresh-familiar), the
 // Cosine magnitude-invariance cell, the Dot verdict-unavailable cell, and a known-CDF FEAT
 // with hand-computed expected scores in RankDistance space.
@@ -16683,13 +16670,12 @@ static void TestM2TwoLimbVerdictFeat()
 			c.name, M2VerdictName(got), M2VerdictName(c.expect));
 	}
 
-	// --- Cosine magnitude-invariance at the VERDICT level (the sixth fracture's lesson,
-	// re-affirmed for the whole two-limb pipeline): int8 keeps the FULL guarantee (D-V32-47:
-	// exact-integer cross/self-dot sums make a scalar multiple an exact duplicate at any
-	// scale); float32 does not, per F-M2-5/D-V32-51 (provisional, pending Dan): even
+	// --- Cosine magnitude-invariance at the VERDICT level, re-affirmed for the whole
+	// two-limb pipeline: int8 keeps the FULL guarantee (exact-integer cross/self-dot sums
+	// make a scalar multiple an exact duplicate at any scale); float32 does not: even
 	// constructing `c * row` is itself a rounded float32 multiplication, so the probe is not
 	// bit-exactly parallel to the row before NoveltyProbeDistance ever sees it. The float32
-	// leg therefore asserts the HONEST outcome per F-M2-5's disclosure, not the int8-only
+	// leg therefore asserts the HONEST outcome per the disclosed limit, not the int8-only
 	// exact-zero-at-any-scale claim: c=1.0 (byte-identical) is still an exact duplicate;
 	// c != 1.0 must NOT falsely verdict duplicate, and lands familiar (a dense cluster
 	// neighbour, never novel) rather than silently wrong. ---
@@ -16729,7 +16715,7 @@ static void TestM2TwoLimbVerdictFeat()
 				"Cosine float32 whole-row, c=1.0 (byte-identical): must verdict duplicate, "
 				"got %s", M2VerdictName(got));
 		}
-		// F-M2-6 (executed finding, 2026-07-19): only the NEGATIVE claim is asserted here.
+		// Only the NEGATIVE claim is asserted here.
 		// c=0.1 was hand-tried as the positive "must land familiar" claim and produced
 		// `novel` instead -- root-caused to KthNeighborDistance riding the standard Query()
 		// Cosine path, a documented PLAIN DOT PRODUCT (types.h: "Cosine banks store
@@ -16740,16 +16726,16 @@ static void TestM2TwoLimbVerdictFeat()
 		// near-duplicate as novel. NoveltyProbeDistance (limb 1) is unaffected -- its
 		// formula explicitly cancels scale -- but limb 2's OWN magnitude sensitivity for
 		// probes limb 1 does NOT catch (true duplicates it does catch, unconditionally) is a
-		// real, newly-observed property, not covered by any ratified decision, and not
-		// something this suite invents an outcome for. Routed as its own finding (see the
-		// test-design artifact) rather than asserted here as if it were specified.
+		// real, newly-observed property, not covered by any decision made when this
+		// entry was specified, and not something this suite invents an outcome for. Recorded
+		// as its own finding rather than asserted here as if it were specified.
 		for (float c : {0.1f, 3.0f, 25.0f, 1000.0f})
 		{
 			std::vector<float> probe(unitRow.size());
 			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * unitRow[i];
 			const M2Verdict got = M2ComputeVerdict(fb.view, probe.data(), novK, -1, lambda, fws);
 			CHECK_MSG(got != M2Verdict::Duplicate,
-				"Cosine float32 whole-row, c=%.4g: F-M2-5's disclosed limit means this must "
+				"Cosine float32 whole-row, c=%.4g: the disclosed limit means this must "
 				"NOT claim an exactness float32 arithmetic can't deliver, got %s",
 				static_cast<double>(c), M2VerdictName(got));
 		}
@@ -16814,13 +16800,13 @@ static void TestM2TwoLimbVerdictFeat()
 }
 
 // ===========================================================================
-// V3.2 red suite (Curie) — M3 matching.h: MutualNearestMatches (plan 25.4, RE-MECHANIZED
-// D-V32-16), the sampled-A-verified-against-full-banks mutual matcher + CSLS margins that
+// V3.2 red suite — M3 matching.h: MutualNearestMatches, the sampled-A-verified-against-
+// full-banks mutual matcher + CSLS margins that
 // back the Correspondence view. RED SCAFFOLD: matching.cpp's body returns Ok and writes
-// nothing. Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+// nothing.
 //
-// Oracle discipline (the D-V32 strike loop, "build don't reason"): the mutual-match +
-// CSLS oracle (M3RefMatch) is an independent recode of the plan's pinned two-pass
+// Oracle discipline ("build, don't reason"): the mutual-match +
+// CSLS oracle (M3RefMatch) is an independent recode of the pinned two-pass
 // mechanism, built over the SAME double-precision brute-force machinery M1's REF already
 // established (RefHit/RefBetter — ties ascending index, the library's own convention) —
 // never calls MutualNearestMatches itself. The Correspondence FEAT's ground truth is a
@@ -16830,7 +16816,7 @@ static void TestM2TwoLimbVerdictFeat()
 
 namespace
 {
-	// Sim(metric, score) = -RankDistance(metric, score) (D-V32-20): L2's raw score is
+	// Sim(metric, score) = -RankDistance(metric, score): L2's raw score is
 	// lower-is-better and is negated; Cosine/Dot's raw score is already
 	// similarity-directioned (an additive constant shift is immaterial here — it cancels
 	// exactly in the 2*sim - r_B - r_A combination, so plain `score` is used directly).
@@ -16888,8 +16874,8 @@ namespace
 		double margin;
 	};
 
-	// Independent oracle for one sampled A row's MutualNearestMatches outcome
-	// (D-V32-16/20): pass 1 (top-matchK of `queryA` in fullB — candidate = top-1, r_B =
+	// Independent oracle for one sampled A row's MutualNearestMatches outcome:
+	// pass 1 (top-matchK of `queryA` in fullB — candidate = top-1, r_B =
 	// mean Sim of the top-matchK), the mutual back-verification (pass 2's top-1 in fullA
 	// must equal `nativeSourceIndexA`), and the CSLS margin from the two retrievals — no
 	// third pass, matching the contract.
@@ -17057,7 +17043,7 @@ static void TestM3MutualNearestMatchesCorrectness()
 	}
 }
 
-// M3 / dim 10 (the crux) — the Correspondence FEAT (D-V32-16/17): bank B is a PERMUTATION
+// M3 / dim 10 (the crux) — the Correspondence FEAT: bank B is a PERMUTATION
 // of bank A's landmarks (+ noise rows on each side), sized ABOVE a small sample cap so
 // striding engages. Every checked landmark's true partner is recovered (kernel-true both
 // directions), noise rows report unmatched, zero spurious matches — the deleted design's
@@ -17340,7 +17326,7 @@ static void TestM3CslsDirectionPerMetric()
 		// The sample view carries exactly the sampled rows: sampleSourceIndices and
 		// outPairs are sized by contract to sampleViewA.count, so passing the full
 		// 6-row view here with 2-entry arrays overruns both (the M3 heap-corruption
-		// root cause — Poirot, Claude/Poirot/b4e139e-m3-heap-corruption-root-cause.md).
+		// root cause, fixed separately).
 		std::vector<float> sampleSrc(aSrc.begin(), aSrc.begin() + 2 * dims);
 		GBank sampleA(sampleSrc, 2, dims, Quantization::Float32, metric);
 		Workspace ws; ws.Reserve(matchK, 1);
@@ -17459,25 +17445,21 @@ static void TestM3RepeatDeterminism()
 }
 
 // ===========================================================================
-// V3.2 — S4/S1 contract-cleanliness fixes (Curie, 2026-07-19): two Poirot
-// findings standing across all three Tier-1 core modules (graph.h/novelty.h/
-// matching.h), closed together per plan Sec.25.4. Casebooks:
-// Claude/Poirot/afabc08-graph-h-m1-review.md (S1 named, S2 — the decode
-// duplicate — closed by 15a0668), Claude/Poirot/15a0668-s1s2s3-fix-verify.md
-// (S1 relocated into the batch output buffers, not closed), Claude/Poirot/
-// 524b373-matching-m3-review.md (S4 — matching.cpp forked a second decode
-// body; S1 O1 — confirmed standing, ripe for "all three modules together").
-// Test design: Claude/Curie/superfaiss-v3.2-s4-s1-shared-helper-workspace-
-// tracking-test-design-2026-07-19.md.
+// V3.2 — S4/S1 contract-cleanliness fixes: two review findings
+// standing across all three Tier-1 core modules (graph.h/novelty.h/
+// matching.h), closed together. Findings: a decode
+// duplicate (closed for graph.h/novelty.h, then found forked again in
+// matching.h — S4); and per-call output buffers that should route through
+// tracked workspace storage instead (S1).
 // ===========================================================================
 
 namespace
 {
 	// Reads a source file's full text for a structural (symbol-presence)
 	// assertion. Used only by the S4 shared-decode-helper pin below — this
-	// project's established grep/structural-oracle convention (the Bank
-	// Inspector I slot-3 concurrency-grep cell, D-V32-53) applied to the core
-	// module tree. Returns empty on a read failure rather than throwing, so a
+	// project's established grep/structural-oracle convention (the same
+	// approach used for the Bank Inspector's own concurrency-grep coverage
+	// cell) applied to the core module tree. Returns empty on a read failure rather than throwing, so a
 	// bad path fails the CHECK loudly instead of silently reporting green.
 	std::string ReadWholeSourceFile(const char* path)
 	{
@@ -17492,16 +17474,16 @@ namespace
 	}
 }
 
-// S4 (matching.h, standing since afabc08's M1 S2) — the row->query decode is a
-// NAMED, SHARED step across all three Tier-1 core modules (plan Sec.25.4 temper
-// S1): "All three modules therefore share one helper, DequantizeRowAsQuery(bank,
-// row, outFloatQuery)." graph.h/novelty.h were routed through it by 15a0668;
-// matching.cpp instead forked a second body, DequantizeRowForTarget (Poirot
-// 524b373-matching-m3-review.md S4) — correct today, but "nothing forces [it]
-// to agree tomorrow" once the shared helper and matching.h's cross-quantization
-// decode drift apart from a common origin. This structural pin realizes the M1
-// review's own O2 note ("the dim-7 equivalence cell ... has no shared symbol to
-// pin against"): the shared helper's declared contract must widen to a
+// S4 (matching.h) — the row->query decode is a
+// NAMED, SHARED step across all three Tier-1 core modules: "All three modules
+// therefore share one helper, DequantizeRowAsQuery(bank,
+// row, outFloatQuery)." graph.h/novelty.h were routed through it first;
+// matching.cpp instead forked a second body, DequantizeRowForTarget —
+// correct today, but nothing forces it
+// to agree tomorrow once the shared helper and matching.h's cross-quantization
+// decode drift apart from a common origin. This structural pin realizes the
+// note that "the dim-7 equivalence cell ... has no shared symbol to
+// pin against": the shared helper's declared contract must widen to a
 // targetPaddedDims parameter, and matching.cpp must call it — not merely have
 // two independently-written functions that happen to agree today. graph.cpp/
 // novelty.cpp are the already-fixed siblings; their rows are a green regression
@@ -17517,7 +17499,7 @@ static void TestS4SharedRowDecodeHelperAllThreeModules()
 		"the shared helper symbol is missing from inspector_common.h");
 	CHECK_MSG(header.find("targetPaddedDims") != std::string::npos,
 		"DequantizeRowAsQuery's declared contract has no targetPaddedDims parameter yet "
-		"(the S4 generalization — see Claude/Poirot/524b373-matching-m3-review.md)");
+		"(the S4 generalization)");
 
 	struct ModuleExpectation
 	{
@@ -17539,11 +17521,12 @@ static void TestS4SharedRowDecodeHelperAllThreeModules()
 		const bool callsShared = src.find("DequantizeRowAsQuery(") != std::string::npos;
 		CHECK_MSG(callsShared == m.callsSharedHelper,
 			"%s must call the shared DequantizeRowAsQuery helper for row->query decode "
-			"(plan Sec.25.4 temper S1, 'a named, shared step, not an improvisation')", m.path);
+			"('a named, shared step, not an improvisation')", m.path);
 
 		// A private per-row decode duplicate — named DequantizeRow or
 		// DequantizeRowForTarget, the two shapes this exact class has taken
-		// (M1 S2, then M3 S4) — must not exist in any of the three modules.
+		// (once in graph.h/novelty.h, once in matching.h) — must not exist in any of the
+		// three modules.
 		const bool definesPrivate =
 			src.find("void DequantizeRow(") != std::string::npos ||
 			src.find("DequantizeRowForTarget(") != std::string::npos;
@@ -18914,9 +18897,7 @@ static void TestAllocFlatScratchAccessors()
 
 // S1 (graph.h) — BuildKnnNeighbors' per-call std::vector<Hit>/std::vector<int32_t>
 // output buffers heap-allocate via global `new` on every call, untracked by the
-// allocator seam (Poirot afabc08-graph-h-m1-review.md S1; standing per 15a0668-
-// s1s2s3-fix-verify.md and confirmed again by 524b373-matching-m3-review.md O1,
-// "ripe for the all-three close"). Warm the workspace once, then assert zero raw
+// allocator seam. Warm the workspace once, then assert zero raw
 // heap allocations (and a flat seam AllocationCount/GrowthCount) across repeated
 // calls on the same warm workspace. Red until the output buffers route through
 // workspace-tracked storage.
@@ -18978,8 +18959,7 @@ static void TestS1FlatAllocationBuildKnnNeighbors()
 }
 
 // S1 (novelty.h, "baseline calibration" half) — CalibrateNoveltyBaseline shares
-// BuildKnnNeighbors' exact batch-output shape and the exact same defect (Poirot
-// 15a0668-s1s2s3-fix-verify.md S1 names this file:line directly — novelty.cpp's
+// BuildKnnNeighbors' exact batch-output shape and the exact same defect (novelty.cpp's
 // allHits/hitCounts). Same construction as the graph.h cell above.
 //
 // Coverage audit §6.1 (F-5): widened to {Float32, Int8} x {Cosine, L2} (Dot
@@ -19113,11 +19093,10 @@ static void TestS1FlatAllocationNoveltyProbeDistance()
 // internally, and this function passes a std::vector (not HeapStorage) as the
 // output, so nothing consumes the reservation"). No casebook has reviewed this
 // specific call site — found at the bench while authoring the S1 suite above,
-// and included here because it is the same class the campaign exists to close
-// and D-V32-52 already names KthNeighborDistance ("limb 2") as a call path a
-// slot-3 consumer exercises per-probe. Routed to Dan/Poirot as a bench finding
-// in the test-design artifact; not invented coverage — it is §25.4's own
-// zero-allocation contract applied to a call site that happens to share
+// and included here because it is the same class the campaign exists to close:
+// KthNeighborDistance ("limb 2") is a call path a
+// slot-3 consumer exercises per-probe. Not invented coverage — it is the
+// module's own zero-allocation contract applied to a call site that happens to share
 // novelty.cpp with the already-known CalibrateNoveltyBaseline instance.
 // Coverage audit §6.1 (F-5): widened to {Float32, Int8} x {Cosine, L2} x
 // excludeBits in {null, non-null}, each combination its own
@@ -19181,13 +19160,12 @@ static void TestS1FlatAllocationKthNeighborDistanceProbe()
 // (pass1Hits/pass1Counts/pass2Hits/pass2Counts) is an ordinary call-scoped
 // std::vector, explicitly disclosed in the module's own header comment as
 // "KNOWN, ACCEPTED ... kept for consistency until S1 is resolved for all three
-// modules together" (matching.cpp:14-21) — Poirot 524b373-matching-m3-review.md
-// O1 confirms this is now ripe. Repeat-call determinism (TestM3RepeatDeterminism,
+// modules together" (matching.cpp:14-21). Repeat-call determinism (TestM3RepeatDeterminism,
 // above) already establishes distinctCount is stable across identical warm
 // calls, so this is a clean warm/steady-state measurement, mirroring the two
 // cells above.
 // Coverage audit §6.1 (F-5): widened to add the A/B-differing-quantization leg
-// (E-D1-3 — Quantization MAY differ across views as long as Dims and Metric
+// (Quantization MAY differ across views as long as Dims and Metric
 // match), the one that calls DequantizeRowAsQuery with an explicit
 // targetPaddedDims rather than the same-quant decode path the original cell
 // alone exercised.
@@ -19329,16 +19307,15 @@ int main()
 	TestBankAnalytics();
 	TestProjectionReport();
 	TestAnalyticsScratchSnapshot();
-	// v3.0.1 red suite (Curie): two P1 correctness bugs + three coverage holes.
+	// v3.0.1 red suite: two P1 correctness bugs + three coverage holes.
 	TestChannelNNZeroEnergyFloor();
 	TestScratchChannelPerChannelRecallZeroEnergy();
 	TestChannelAnalyticsCrossDeviceGolden();
 	TestPerChannelRecallOracle();
 	TestVersionHeaderCoherence();
 
-	// V3.1 red suite (Curie): the Relabel operation (plan section 24), realizing the
-	// section 24.8 Coverage Model. Test design: Claude/Curie/superfaiss-v3.1-test-design-
-	// 2026-07-13.md.
+	// V3.1 red suite: the Relabel operation, realizing the
+	// Coverage Model.
 	TestRelabelValidationSymmetry();
 	TestRelabelRejectionsStillQueryableUnderOldTable();
 	TestRelabelOomLeavesBankIntact();
@@ -19373,8 +19350,7 @@ int main()
 	TestRelabelPromoteFeat();
 	TestRelabelDemoteFeat();
 
-	// V3.2 red suite (Curie): Bank Inspector I — module M1 graph.h (plan section 25).
-	// Test design: Claude/Curie/superfaiss-v3.2-test-design-2026-07-18.md.
+	// V3.2 red suite: Bank Inspector I — module M1 graph.h.
 	TestM1TrustBoundaries();
 	TestM1DuplicateGroupingByteConfirm();
 	TestM1EdgesExactAcrossMetrics();
@@ -19389,7 +19365,7 @@ int main()
 	TestM2CalibrateNoveltyBaseline();
 	TestM2TwoLimbVerdictFeat();
 
-	// V3.2 red suite (Curie): Bank Inspector I — module M3 matching.h (plan section 25).
+	// V3.2 red suite: Bank Inspector I — module M3 matching.h.
 	TestM3MutualNearestMatchesTrustBoundaries();
 	TestM3MutualNearestMatchesCorrectness();
 	TestM3CorrespondencePermutationFeat();
@@ -19398,9 +19374,7 @@ int main()
 	TestM3ExclusionHonored();
 	TestM3RepeatDeterminism();
 
-	// V3.2 — S4/S1 contract-cleanliness fixes (Curie, 2026-07-19): plan Sec.25.4.
-	// Test design: Claude/Curie/superfaiss-v3.2-s4-s1-shared-helper-workspace-
-	// tracking-test-design-2026-07-19.md.
+	// V3.2 — S4/S1 contract-cleanliness fixes.
 	TestS4SharedRowDecodeHelperAllThreeModules();
 	TestAllocFlatGraphAndNoveltyMisc();
 	TestS1FlatAllocationBuildKnnNeighbors();

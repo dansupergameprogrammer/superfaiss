@@ -7,7 +7,7 @@
 #include <thread>
 
 #include "superfaiss/bake.h"
-#include "superfaiss/kernels.h"   // detail::FloatBitsToDouble (DAZ-safe scale decode, Poirot #1)
+#include "superfaiss/kernels.h"   // detail::FloatBitsToDouble (DAZ-safe scale decode)
 #include "superfaiss/query.h"
 #include "superfaiss/validate.h"
 
@@ -113,7 +113,7 @@ namespace
 	// still writes 1, and this reader accepts both. Version 0 or > 3 is a hard reject.
 	constexpr uint32_t kScratchVersion = 2;
 	constexpr uint32_t kScratchVersionRetain = 2; // retained floats present in the blob
-	// V3.0 (plan section 23.6, Forge S1): retention is encoded AS the version integer
+	// V3.0: retention is encoded AS the version integer
 	// (1=plain, 2=retention), so a linear bump cannot carry channels + retention together.
 	// Version 3 makes the presence-flags byte authoritative instead: a channels-carrying
 	// blob writes version 3 and sets reserved[0] as a flags byte (bit 0 retention, bit 1
@@ -386,7 +386,7 @@ bool ScratchBank::TryPinReader()
 	// load, we see it and back out; otherwise this load precedes the store in S,
 	// so our increment does too, and the exclusive side's pin-count load (after
 	// its store) observes us and keeps waiting. Acquire/release cannot order
-	// this store-buffering pair (Poirot F4).
+	// this store-buffering pair.
 	if (ExclusiveWaiting_.load(std::memory_order_seq_cst))
 	{
 		ReaderPins_.fetch_sub(1, std::memory_order_seq_cst);
@@ -499,7 +499,7 @@ Status ScratchBank::AppendValidated(const float* row, int32_t* outIndex)
 			{
 				const int8_t* qrow =
 					static_cast<const int8_t*>(Rows_) + static_cast<int64_t>(index) * PaddedDims_;
-				// DAZ-safe scale decode (Poirot #1), matching bake.cpp's reference and the
+				// DAZ-safe scale decode, matching bake.cpp's reference and the
 				// scoring epilogue — keeps this recode bit-equal to ComputeChannelInverseNorms.
 				const double scale = detail::FloatBitsToDouble(Scales_[index]);
 				for (int32_t j = channel.offset; j < channel.offset + channel.length; ++j)
@@ -701,9 +701,9 @@ Status ScratchBank::Relabel(const ChannelInfo* newChannels, int32_t newChannelCo
 		? ChannelCount_
 		: 0;
 
-	// Dot/L2 banks carry no sub-norm arena (V3-G2/V31-G2), so a relabel is a validate-and-
+	// Dot/L2 banks carry no sub-norm arena, so a relabel is a validate-and-
 	// swap of the by-value members with no arena touch — it cannot OOM. This runs under the
-	// same exclusive drain as the Cosine path (Forge W2: Snapshot aliases Channels_/
+	// same exclusive drain as the Cosine path (Snapshot aliases Channels_/
 	// ChannelCount_ into every live BankView, so even the member write is observable through
 	// a held view — the host drain, not a lock-free poke, is what makes it safe). A Cosine
 	// bank with no channels on either side (single-space -> single-space) has no sub-norm
@@ -792,7 +792,7 @@ Status ScratchBank::Relabel(const ChannelInfo* newChannels, int32_t newChannelCo
 		// oldArena is freed and the generation advances: it would leave the bank fully
 		// mutated, leak oldArena, and skip the generation bump — the exact torn state
 		// reject-over-degrade exists to make impossible. Assert the invariant rather than
-		// encode an unreachable, contract-violating exit (Poirot M-1; closes O-1).
+		// encode an unreachable, contract-violating exit.
 		assert(subNorm == Status::Ok &&
 			"Relabel: ComputeChannelInverseNorms is total over validated inputs");
 		(void)subNorm;
@@ -1026,7 +1026,7 @@ Status ScratchBank::Save(const ScratchArchive& archive) const
 	WriterGuard guard(WriterBusy_);
 
 	ScratchHeader header;
-	// Writer version-selection (Forge S1 / Japp G-3): channels are what trigger the v3
+	// Writer version-selection: channels are what trigger the v3
 	// presence-flags format. A channel-carrying bank writes version 3 with the flags byte
 	// (retention bit + channels bit) authoritative and appends the channel table; a
 	// channel-LESS bank keeps the legacy encoding — version 2 with retained floats, else
@@ -1055,7 +1055,7 @@ Status ScratchBank::Save(const ScratchArchive& archive) const
 	// The channel table (v3 only), written immediately after the header so Load can size
 	// the arena (which folds in the sub-norm region) before it reads the rows. The
 	// per-channel sub-norm arena itself is NOT serialized — it is re-derived on Load from
-	// {rows, channel table, scales} (Forge W3), which removes a desync surface.
+	// {rows, channel table, scales}, which removes a desync surface.
 	if (hasChannels)
 	{
 		const int32_t channelCount = ChannelCount_;
@@ -1101,7 +1101,7 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 		return Status::InvalidArgument;
 	}
 	// Load's contract is stronger than single-writer (fully exclusive), so the
-	// debug owner guard covers it too (Poirot F3) - a writer overlapping a Load
+	// debug owner guard covers it too - a writer overlapping a Load
 	// asserts in dev builds instead of racing the arena swap silently.
 	WriterGuard guard(WriterBusy_);
 
@@ -1120,7 +1120,7 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	}
 	// Version 3: retention and channel presence come from the reserved[0] flags byte, and
 	// bits 2-7 are reserved — masked off, tolerated (never rejected, never mis-read as
-	// retention or channels; Japp G-3 forward tolerance). Legacy 1/2 read retention from
+	// retention or channels; forward tolerance by design). Legacy 1/2 read retention from
 	// the version integer, exactly as shipped, and carry no channel table.
 	const uint8_t flags = header.reserved[kScratchFlagsByteIndex];
 	const bool hasChannels = header.version == kScratchVersionChannels &&
@@ -1266,7 +1266,7 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 		return content;
 	}
 
-	// Re-derive the per-channel sub-norm arena on Load (Forge W3): recompute it from the
+	// Re-derive the per-channel sub-norm arena on Load: recompute it from the
 	// loaded rows + channel table rather than trust a serialized copy, so a desynced arena
 	// cannot load as authoritative. The channel Create above sized the region into
 	// incoming's arena; ComputeChannelInverseNorms fills it exactly as Append did.

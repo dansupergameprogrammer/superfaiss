@@ -3,8 +3,8 @@
 #include "types.h"
 #include "alloc.h" // Workspace
 
-// SuperFAISS V3.2 — Bank Inspector I, Tier 1 module M1 (plan section 25.4): the
-// mutual k-NN graph + connected components that back the Inspector's Structure view.
+// Bank Inspector — Tier 1 module M1: the mutual k-NN graph + connected components that
+// back the Inspector's Structure view.
 // Post-processing over exact query output; touches no kernel, quantization, or format.
 //
 // Determinism tier: PER-DEVICE. Fixed sample, fixed order, pinned ties (query tie-break
@@ -21,7 +21,7 @@ namespace superfaiss
 {
 
 // For each row of the (sampled) view, its top-k neighbor row indices by the bank's own
-// metric, via the existing batch query path; ties break ascending index (V32-G5). When
+// metric, via the existing batch query path; ties break ascending index. When
 // excludeSelf is true the row itself is dropped from its own list. outNeighbors is
 // count*k int32, row-major (outNeighbors[r*k + j] is row r's j-th nearest, best-first);
 // a slot with no available neighbor is -1. `workspace` warm for k (self-exclusion widens
@@ -45,7 +45,7 @@ Status MutualFilter(
 	const int32_t* neighbors,
 	uint8_t* outMutualFlags);
 
-// Exact-duplicate grouping by CONSTRUCTION (plan 25.4, D-V32-25/28): a hash pass in
+// Exact-duplicate grouping by CONSTRUCTION: a hash pass in
 // ascending row order over the view; equality confirmed by FULL BYTE comparison before
 // any grouping (hash agreement alone never groups). The identity key is the stored row
 // bytes plus the per-row scale where the quantization carries one (int8); float32 is the

@@ -717,7 +717,7 @@ inline constexpr uint64_t kGoldenPoolXdHash = 0x9cf4eeddc1132a03ull;
 // over the committed fixture banks, across the forced-path sweep. Same capture/re-pin
 // discipline as kGoldenXdHash; 0 means 'not yet pinned' (the test prints the value).
 // Re-pinned 2026-07-12: the T-V2.5-8 coverage-close added Cosine and Dot MeanNN/MaxNN to
-// the battery (Japp G1), so the hash moved once with cause.
+// the battery, so the hash moved once with cause.
 inline constexpr uint64_t kGoldenAnalyticsXdHash = 0xcd995d373f06df97ull;
 
 // Pinned cross-device hash over the CHANNEL-scoped analytics battery (T-V3-A-XD-GOLD): the
@@ -732,8 +732,8 @@ inline constexpr uint64_t kGoldenAnalyticsXdHash = 0xcd995d373f06df97ull;
 // as kGoldenAnalyticsXdHash; 0 means 'not yet pinned' (the test prints the value).
 inline constexpr uint64_t kGoldenChannelAnalyticsXdHash = 0x634b7c67d544d074ull;
 
-// Pinned cross-device hash over the V3.1 RELABEL battery (Curie test design,
-// 2026-07-13): the per-channel Cosine sqrt query path over a bank carrying an
+// Pinned cross-device hash over the V3.1 RELABEL battery: the per-channel Cosine sqrt
+// query path over a bank carrying an
 // adversarial tiny-channel-norm member produced by a boundary-move Relabel, across
 // the forced-path sweep. Same capture/re-pin discipline as kGoldenXdHash; 0 means
 // 'not yet pinned' (the test prints the value instead of asserting). Pinned once

@@ -174,7 +174,7 @@ public:
 	// Generation() (a mutation) so a pre-relabel recall report reads stale.
 	Status Relabel(const ChannelInfo* newChannels, int32_t newChannelCount);
 
-	// --- Reader-pin / exclusive-drain protocol (Poirot F4) ---
+	// --- Reader-pin / exclusive-drain protocol ---
 	//
 	// The dispatch gate hosts put in front of Grow/Load (T-044 N4): readers pin
 	// for a query flight; an exclusive operation raises the drain flag (new pins

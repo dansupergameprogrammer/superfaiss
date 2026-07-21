@@ -203,7 +203,7 @@ Status ValidateBankData(const BankView& bank, int32_t* outBadRow)
 	}
 
 	const int32_t pd = bank.paddedDims;
-	// Bake-law tolerances (Poirot R-2 - a loaded payload must satisfy what the
+	// Bake-law tolerances (a loaded payload must satisfy what the
 	// bake actually produces, or the "re-validated on load" claim is hollow):
 	// Cosine rows are unit-norm at bake; float32 stores them exactly (up to
 	// normalization rounding), int8 adds at most scale/2 per element, so the
