@@ -1,0 +1,53 @@
+# Coherence checks — the docs and the code must agree, enforced rather than reviewed.
+#
+# These validate this repository against itself: every signature documented in
+# docs/API.md matches the header that declares it, every public header symbol is
+# documented, and every link a Markdown file makes resolves case-exactly.
+#
+# They live here, not only in the consuming plugin repository, because the files
+# they check live here. A drifted API.md caught only downstream is caught after a
+# release, in someone else's repo, once the tree has been vendored.
+#
+# Pure Python, no build, no engine — these run on a hosted runner in seconds.
+
+name: coherence-checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  doc-signatures:
+    name: Documented signatures match their headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.x'
+      - run: python ci/check_doc_signatures.py --vendored-root .
+
+  reverse-doc-signatures:
+    name: Every public symbol is documented
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.x'
+      - run: python ci/check_reverse_doc_signatures.py --vendored-root .
+
+  asset-references:
+    name: Markdown links resolve case-exactly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.x'
+      - run: python ci/check_asset_references.py --repo-root .
