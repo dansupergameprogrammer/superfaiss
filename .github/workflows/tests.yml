@@ -2,14 +2,65 @@ name: tests
 
 on: [push, pull_request]
 
+# A change that cannot affect the library must not pay for a four-platform C++
+# matrix. The `changes` job below decides that once, and every build job gates
+# its expensive steps on the result.
+#
+# Deliberately NOT `paths-ignore`: these jobs are required status checks, and a
+# check skipped by a path filter never reports at all, so a docs-only PR would
+# wait forever for a verdict that never arrives. Instead every job still runs
+# and still reports — it just finishes in seconds with nothing to do.
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            changed=$(git diff --name-only "$base"...HEAD)
+          else
+            # A push: compare against the previous tip when there is one, and
+            # fall back to "everything changed" for a first push or a force-push
+            # whose before-sha is gone. Failing OPEN (build everything) is the
+            # safe direction for a filter that gates a test suite.
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && git cat-file -e "$before^{commit}" 2>/dev/null; then
+              changed=$(git diff --name-only "$before" HEAD)
+            else
+              changed="src/FORCE"
+            fi
+          fi
+          echo "changed files:"; echo "$changed"
+          if echo "$changed" | grep -qE '^(src/|include/|tests/|tools/|CMakeLists\.txt|build\.bat|\.github/workflows/tests\.yml)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "-> library or build inputs changed: running the full matrix"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "-> no library or build inputs changed: matrix reports green without building"
+          fi
   windows-x64:
+    needs: changes
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: cmake -B build
-      - run: cmake --build build --config Release
-      - shell: pwsh
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake -B build
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake --build build --config Release
+      - if: needs.changes.outputs.code == 'true'
+        shell: pwsh
         run: |
           $out = & build/Release/superfaiss_tests.exe
           Write-Output $out
@@ -22,14 +73,19 @@ jobs:
           if ($text -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
 
   linux-x64:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake --build build
       # Output prints even when the suite fails (a $(...) capture under bash -e
       # dies before its echo, swallowing the FAIL lines).
-      - run: |
+      - if: needs.changes.outputs.code == 'true'
+        run: |
           set +e
           ./build/superfaiss_tests | tee test_output.txt
           status=${PIPESTATUS[0]}
@@ -47,12 +103,17 @@ jobs:
   # is the target: single-writer/lock-free-reader races surface here, not on
   # x86's forgiving memory model (T-044 W5).
   linux-x64-tsan:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-fsanitize=thread"
-      - run: cmake --build build
-      - run: ./build/superfaiss_tests
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake --build build
+      - if: needs.changes.outputs.code == 'true'
+        run: ./build/superfaiss_tests
 
   # GitHub macOS runners are Apple Silicon: this executes the NEON path on real ARM.
   #
@@ -65,19 +126,25 @@ jobs:
   # artifact: a recorded cross-device selection trace a consumer can replay against
   # a live local simulation on a different machine.
   macos-arm64:
+    needs: changes
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build
-      - run: |
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake --build build
+      - if: needs.changes.outputs.code == 'true'
+        run: |
           set +e
           SUPERFAISS_XD_SELECTION_OUT=xd_selection_arm64.txt ./build/superfaiss_tests | tee test_output.txt
           status=${PIPESTATUS[0]}
           grep "simd path: neon" test_output.txt > /dev/null || exit 1
           grep "cross-device hash:" test_output.txt > /dev/null || exit 1
           exit $status
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: crossdevice-selection-arm64
           path: xd_selection_arm64.txt
