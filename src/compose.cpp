@@ -89,7 +89,9 @@ Status MakeCentroid(
 			{
 				const int8_t* r = static_cast<const int8_t*>(bank.rows) +
 					static_cast<int64_t>(row) * bank.paddedDims;
-				const double scale = bank.scales[row];
+				// DAZ-safe scale decode, consistent with the other scale reads in this file
+				// (a subnormal scale decodes the same regardless of the thread's FTZ/DAZ mode).
+				const double scale = detail::FloatBitsToDouble(bank.scales[row]);
 				for (int32_t j = 0; j < width; ++j)
 				{
 					acc[j] += static_cast<double>(r[base + j]) * scale;

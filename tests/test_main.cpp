@@ -2031,7 +2031,7 @@ static void TestPca()
 
 		std::vector<float> mean(static_cast<size_t>(dims));
 		std::vector<float> comps(static_cast<size_t>(2) * dims);
-		std::vector<float> scratch(static_cast<size_t>(dims));
+		std::vector<double> scratch(static_cast<size_t>(dims));
 		CHECK(ComputePrincipalComponents(view, 2, 48, mean.data(), comps.data(),
 			scratch.data()) == Status::Ok);
 
@@ -2066,6 +2066,12 @@ static void TestPca()
 		std::vector<float> coords(static_cast<size_t>(count) * 2);
 		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), 2,
 			coords.data()) == Status::Ok);
+		// componentCount is bounded by dims on BOTH entry points (a count above dims would
+		// index past `components`), the same rejection ComputePrincipalComponents applies.
+		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), dims + 1,
+			coords.data()) == Status::InvalidArgument);
+		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), 0,
+			coords.data()) == Status::InvalidArgument);
 		{
 			const int32_t r = 7;
 			double expect = 0.0;
@@ -2109,7 +2115,7 @@ static void TestPca()
 		view.metric = Metric::Dot;
 		std::vector<float> mean(static_cast<size_t>(d));
 		std::vector<float> comps(static_cast<size_t>(d));
-		std::vector<float> scratch(static_cast<size_t>(d));
+		std::vector<double> scratch(static_cast<size_t>(d));
 		CHECK(ComputePrincipalComponents(view, 1, 16, mean.data(), comps.data(),
 			scratch.data()) == Status::Ok);
 		double norm = 0.0;
@@ -15663,6 +15669,107 @@ static void TestM1TrustBoundaries()
 	}
 }
 
+// A caller-supplied neighbour value is used to index the neighbours array (MutualFilter)
+// and the union-find scratch (ConnectedComponents). Values are validated for the -1
+// "no neighbour" sentinel; a value >= count is a malformed input that must degrade to a
+// dropped edge, never an out-of-bounds read or write. BuildKnnNeighbors always produces
+// in-range values, so this is reachable only through a hand-built neighbour list — the
+// same trust posture the other core entry points hold on the indices they are handed.
+static void TestGraphOutOfRangeNeighbours()
+{
+	Rng rng(0x60B5);
+	const int32_t dims = 8, count = 6, k = 2;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+
+	// A neighbour list holding out-of-range values: count (one past the end), a large
+	// positive, and INT32_MAX, mixed with the -1 sentinel. Every slot is poisoned; none
+	// may be dereferenced as an index.
+	std::vector<int32_t> neighbours(static_cast<size_t>(count) * k);
+	for (int32_t i = 0; i < count; ++i)
+	{
+		neighbours[static_cast<size_t>(i) * k + 0] = count;       // exactly one past the end
+		neighbours[static_cast<size_t>(i) * k + 1] = (i % 2) ? INT32_MAX : -1;
+	}
+
+	std::vector<uint8_t> flags(static_cast<size_t>(count) * k, 0xEE);
+	CHECK(MutualFilter(count, k, neighbours.data(), flags.data()) == Status::Ok);
+	// No out-of-range value can be its own mutual: every flag is 0, and nothing crashed.
+	for (uint8_t f : flags)
+	{
+		CHECK(f == 0);
+	}
+
+	// Force the union-find to CONFRONT the out-of-range neighbour: hand it a flag array
+	// with every slot marked mutual, so ConnectedComponents must act on each neighbour
+	// value, and a duplicate-group table whose every representative is INT32_MAX. With the
+	// < count guard both are dropped and each row is its own component. Without it, find()
+	// indexes parent[] with these values — undefined behaviour. This cell asserts the
+	// GUARDED result holds on poisoned input; it is not a crash reproduction, because an
+	// out-of-bounds access in a non-instrumented build is UB that neither reliably crashes
+	// nor changes this observable, so it cannot serve as the guard's oracle here. The
+	// address-sanitizer job in core CI is where the unguarded access is caught as a fault.
+	std::vector<uint8_t> allMutual(static_cast<size_t>(count) * k, 1);
+	std::vector<int32_t> badGroups(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i)
+	{
+		badGroups[static_cast<size_t>(i)] = INT32_MAX; // every representative wildly out of range
+	}
+	std::vector<int32_t> ids(static_cast<size_t>(count), -999), uf(static_cast<size_t>(count), 0);
+	CHECK(ConnectedComponents(count, k, neighbours.data(), allMutual.data(), badGroups.data(),
+			  ids.data(), uf.data()) == Status::Ok);
+	// Every edge dropped (poisoned neighbours and poisoned groups alike), so each row is
+	// its own component — a defined, in-range result, no corruption, no crash.
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(ids[r] == r);
+	}
+}
+
+// The int8 channel-analytics legs score their sub-range through detail::DotI8I8, whose
+// SIMD paths assume a length on the 16-byte int8 grid and carry no scalar tail. A
+// validated bank's channel table is grid-aligned, so the archive loader rejects an
+// off-grid table before it can be scored (covered elsewhere); this closes the same gap
+// for a HAND-BUILT BankView that never went through validation, so the analytics
+// functions themselves refuse rather than read SIMD-padded slop.
+static void TestChannelAnalyticsOffGridRejected()
+{
+	Rng rng(0x0FF6);
+	const int32_t dims = 32, count = 8; // int8 grid is 16; 8 is deliberately off it
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank b(src, count, dims, Quantization::Int8, Metric::Cosine);
+
+	// A hand-built channel table with an off-grid range (offset 0, length 8) — a table a
+	// validated bank could never carry.
+	const ChannelInfo offGrid[1] = {{0, 8}};
+	BankView view = b.view;
+	view.channels = offGrid;
+	view.channelCount = 1;
+
+	Workspace ws;
+	std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+	std::vector<Hit> hbuf(static_cast<size_t>(count));
+	std::vector<int32_t> nbuf(static_cast<size_t>(count));
+	float out = -1.0f;
+	CHECK(MeanNNCrossDeviceChannel(view, nullptr, view, nullptr, 0, qbuf.data(),
+			  hbuf.data(), nbuf.data(), ws, &out) == Status::InvalidArgument);
+	CHECK(MaxNNCrossDeviceChannel(view, nullptr, view, nullptr, 0, qbuf.data(),
+			  hbuf.data(), nbuf.data(), ws, &out) == Status::InvalidArgument);
+
+	std::vector<int8_t> cA(static_cast<size_t>(view.paddedDims));
+	std::vector<int8_t> cB(static_cast<size_t>(view.paddedDims));
+	const int32_t idx[1] = {0};
+	CHECK(CentroidDistanceCrossDeviceChannel(view, idx, 1, nullptr, nullptr, view, idx, 1,
+			  nullptr, nullptr, Metric::Cosine, 0, cA.data(), cB.data(), &out) ==
+		Status::InvalidArgument);
+
+	std::vector<int8_t> cScratch(static_cast<size_t>(view.paddedDims));
+	CHECK(SpreadCrossDeviceChannel(view, idx, 1, nullptr, Reduce::Mean, 0, cScratch.data(),
+			  &out) == Status::InvalidArgument);
+}
+
 // M1 / dim 2 (byte-confirm) + dim 7 (int8 same-decode-different-scale NOT unioned) —
 // grouping is FULL BYTE equality, not decode equality: a scalar-multiple pair that
 // decodes to the same direction but stores different int8 bytes/scale is a near-
@@ -19089,7 +19196,7 @@ static void TestAllocFlatBakeAndPca()
 	const int32_t componentCount = 2, iterations = 4;
 	std::vector<float> mean(static_cast<size_t>(cosineBank.view.dims));
 	std::vector<float> components(static_cast<size_t>(componentCount) * cosineBank.view.dims);
-	std::vector<float> scratch(static_cast<size_t>(cosineBank.view.dims));
+	std::vector<double> scratch(static_cast<size_t>(cosineBank.view.dims));
 	std::vector<float> coords(static_cast<size_t>(count) * componentCount);
 
 	auto driveOnce = [&]() {
@@ -19737,6 +19844,8 @@ int main()
 
 	// V3.2 red suite: Bank Inspector I — module M1 graph.h.
 	TestM1TrustBoundaries();
+	TestGraphOutOfRangeNeighbours();
+	TestChannelAnalyticsOffGridRejected();
 	TestM1DuplicateGroupingByteConfirm();
 	TestM1EdgesExactAcrossMetrics();
 	TestM1DuplicateUnionConstructionCounts();

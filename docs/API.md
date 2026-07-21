@@ -422,7 +422,7 @@ Determinism per channel: [DETERMINISM.md §2e](DETERMINISM.md).
 ```cpp
 Status ComputePrincipalComponents(const BankView&, int32_t componentCount,
                                   int32_t iterationsPerComponent, float* outMean,
-                                  float* outComponents, float* scratch);
+                                  float* outComponents, double* scratch); // dims doubles
 Status ProjectRowsOntoComponents (const BankView&, const float* mean,
                                   const float* components, int32_t componentCount,
                                   float* outCoords);

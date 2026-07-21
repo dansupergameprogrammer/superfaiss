@@ -238,6 +238,11 @@ Status CalibrateNoveltyBaseline(
 	const BankView& bank, int32_t k, int32_t sampleLimit, float* outSortedDistances, int32_t* outCount,
 	Workspace& workspace)
 {
+	// `sampleLimit` is a CEILING the bank must fit under, not a cap this function samples
+	// down to: `bank.count > sampleLimit` is a defined rejection (the header states this).
+	// A caller wanting a baseline over a subset pre-samples into a smaller BankView and
+	// passes that — which is exactly what the inspector does — rather than expecting this
+	// to draw a sample. Named `sampleLimit` because it bounds the sample the CALLER built.
 	if (bank.metric == Metric::Dot || k < 1 || bank.count < 1 || k >= bank.count || sampleLimit < 1 ||
 		bank.count > sampleLimit || bank.rows == nullptr || outSortedDistances == nullptr || outCount == nullptr)
 	{

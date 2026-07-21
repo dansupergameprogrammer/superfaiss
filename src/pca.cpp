@@ -1,5 +1,7 @@
 #include "superfaiss/pca.h"
 
+#include "superfaiss/kernels.h" // detail::FloatBitsToDouble (DAZ-safe scale decode)
+
 #include <cmath>
 #include <cstdint>
 
@@ -15,7 +17,9 @@ namespace
 		{
 			const int8_t* row = static_cast<const int8_t*>(bank.rows) +
 				static_cast<int64_t>(r) * bank.paddedDims;
-			return static_cast<double>(row[j]) * bank.scales[r];
+			// DAZ-safe scale decode (a subnormal scale decodes identically under FTZ/DAZ),
+			// matching the reductions in analytics.cpp/compose.cpp over the same field.
+			return static_cast<double>(row[j]) * detail::FloatBitsToDouble(bank.scales[r]);
 		}
 		const float* row = static_cast<const float*>(bank.rows) +
 			static_cast<int64_t>(r) * bank.paddedDims;
@@ -29,7 +33,7 @@ Status ComputePrincipalComponents(
 	int32_t iterationsPerComponent,
 	float* outMean,
 	float* outComponents,
-	float* scratch)
+	double* scratch)
 {
 	if (outMean == nullptr || outComponents == nullptr || scratch == nullptr ||
 		componentCount <= 0 || componentCount > bank.dims ||
@@ -80,10 +84,12 @@ Status ComputePrincipalComponents(
 				}
 			}
 
-			// scratch <- Cov * v, serial in row order.
+			// scratch <- Cov * v, serial in row order, accumulated in DOUBLE so the
+			// operator is applied at the same precision as the mean above (a float
+			// accumulator rounds once per row and loses accuracy as count grows).
 			for (int32_t j = 0; j < dims; ++j)
 			{
-				scratch[j] = 0.0f;
+				scratch[j] = 0.0;
 			}
 			for (int32_t r = 0; r < count; ++r)
 			{
@@ -94,15 +100,14 @@ Status ComputePrincipalComponents(
 				}
 				for (int32_t j = 0; j < dims; ++j)
 				{
-					scratch[j] = static_cast<float>(
-						scratch[j] + dot * (RowElem(bank, r, j) - outMean[j]));
+					scratch[j] += dot * (RowElem(bank, r, j) - outMean[j]);
 				}
 			}
 
 			double norm = 0.0;
 			for (int32_t j = 0; j < dims; ++j)
 			{
-				norm += static_cast<double>(scratch[j]) * scratch[j];
+				norm += scratch[j] * scratch[j];
 			}
 			if (norm == 0.0)
 			{
@@ -160,8 +165,12 @@ Status ProjectRowsOntoComponents(
 	float* outCoords)
 {
 	if (mean == nullptr || components == nullptr || outCoords == nullptr ||
-		componentCount <= 0)
+		componentCount <= 0 || componentCount > bank.dims)
 	{
+		// componentCount is bounded by dims exactly as ComputePrincipalComponents bounds
+		// it: `components` holds componentCount rows of `dims` each, and an over-large
+		// count would index past the buffer. The two functions are called in sequence and
+		// must agree on the argument.
 		return Status::InvalidArgument;
 	}
 	const int32_t dims = bank.dims;

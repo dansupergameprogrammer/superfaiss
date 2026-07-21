@@ -168,7 +168,12 @@ Status MutualFilter(int32_t count, int32_t k, const int32_t* neighbors, uint8_t*
 		{
 			const int64_t slot = static_cast<int64_t>(i) * k + t;
 			const int32_t j = neighbors[slot];
-			outMutualFlags[slot] = (j >= 0 && inList(j, i)) ? uint8_t{1} : uint8_t{0};
+			// `j` is a caller-supplied neighbour value and is used to index the
+			// `neighbors` array (inList reads neighbors + j*k). Bound it to [0, count):
+			// -1 is the "no neighbour" sentinel, and any other out-of-range value is a
+			// malformed input that must degrade to "no edge", never an out-of-bounds read.
+			outMutualFlags[slot] =
+				(j >= 0 && j < count && inList(j, i)) ? uint8_t{1} : uint8_t{0};
 		}
 	}
 	return Status::Ok;
@@ -285,9 +290,15 @@ Status ConnectedComponents(
 	{
 		for (int32_t r = 0; r < count; ++r)
 		{
-			if (duplicateGroups[r] != r)
+			// A group representative indexes the union-find scratch through unite/find.
+			// Bound it to [0, count): a well-formed table from BuildDuplicateGroups always
+			// holds an in-range representative, but this entry point takes the table from
+			// the caller, and an out-of-range value must be ignored rather than walked into
+			// the parent array as an out-of-bounds access.
+			const int32_t g = duplicateGroups[r];
+			if (g >= 0 && g < count && g != r)
 			{
-				unite(r, duplicateGroups[r]);
+				unite(r, g);
 			}
 		}
 	}
@@ -302,7 +313,10 @@ Status ConnectedComponents(
 			if (mutualFlags[slot])
 			{
 				const int32_t j = neighbors[slot];
-				if (j >= 0)
+				// unite(i, j) walks parent[j]; bound j to [0, count) so a malformed
+				// neighbour value is a dropped edge, not an out-of-bounds write into the
+				// union-find scratch. -1 is the standing "no neighbour" sentinel.
+				if (j >= 0 && j < count)
 				{
 					unite(i, j);
 				}
