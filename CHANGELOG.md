@@ -21,6 +21,13 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   trailer with the rows already replaced.
 
 ### Fixed
+- **`ScratchBank::Load` now validates the retention region.** A retained row is by
+  construction the post-normalization row the quantizer consumed, so `Load` replays the
+  bake on each retained row and requires it to reproduce the stored row exactly —
+  allocation-free, mirroring the quantizer's own arithmetic. Previously a
+  fabricated-but-finite retained array loaded clean and handed `MeasureScratchRecall` an
+  invented reference to audit against, through the one API whose whole job is an honest
+  number. Non-finite retained values are rejected the same way (`BadFormat`).
 - **Two kernel-selection rules made the segmented scan disagree with the whole-row
   scan.** The float32 dispatchers `DotF32`/`L2F32` use AVX2+FMA only when the length they
   are handed is a multiple of 8; `ResolveRowKernels`, which feeds the segmented scan and

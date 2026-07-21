@@ -144,6 +144,109 @@ namespace
 	};
 	static_assert(sizeof(ScratchHeader) == 32, "scratch header layout is the format");
 
+	// Validates a loaded retention region against the rows it claims to be the reference
+	// for. The retained row is BY CONSTRUCTION the post-normalization row the quantizer
+	// consumed (see AppendValidated), so replaying the bake on it must reproduce the stored
+	// row exactly — same inputs, same deterministic arithmetic, same bytes. That makes the
+	// retention region DERIVED-CHECKED rather than trusted: a fabricated-but-finite array
+	// would otherwise load clean and hand MeasureScratchRecall an invented reference to
+	// audit against, through the one API whose entire job is an honest number.
+	//
+	// Replays the quantizer inline rather than into a scratch buffer, so it needs no
+	// allocation; the arithmetic mirrors QuantizeRowsInt8/PadRowsFloat32 exactly.
+	bool RetainedMatchesRows(const ScratchBank& bank, const float* retained, const void* rows,
+		const float* scales, int32_t count, int32_t dims, int32_t paddedDims, Quantization quant)
+	{
+		(void)bank;
+		for (int32_t r = 0; r < count; ++r)
+		{
+			const float* src = retained + static_cast<int64_t>(r) * dims;
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				if (!std::isfinite(src[i]))
+				{
+					return false;
+				}
+			}
+			if (quant == Quantization::Float32)
+			{
+				const float* dst = static_cast<const float*>(rows) +
+					static_cast<int64_t>(r) * paddedDims;
+				for (int32_t i = 0; i < dims; ++i)
+				{
+					if (dst[i] != src[i])
+					{
+						return false;
+					}
+				}
+				for (int32_t i = dims; i < paddedDims; ++i)
+				{
+					if (dst[i] != 0.0f)
+					{
+						return false;
+					}
+				}
+				continue;
+			}
+
+			const int8_t* dst = static_cast<const int8_t*>(rows) +
+				static_cast<int64_t>(r) * paddedDims;
+			float maxAbs = 0.0f;
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				const float a = std::fabs(src[i]);
+				if (a > maxAbs)
+				{
+					maxAbs = a;
+				}
+			}
+			if (maxAbs == 0.0f)
+			{
+				if (scales[r] != 0.0f)
+				{
+					return false;
+				}
+				for (int32_t i = 0; i < paddedDims; ++i)
+				{
+					if (dst[i] != 0)
+					{
+						return false;
+					}
+				}
+				continue;
+			}
+			if (scales[r] != maxAbs / 127.0f)
+			{
+				return false;
+			}
+			const float inv = 127.0f / maxAbs;
+			for (int32_t i = 0; i < dims; ++i)
+			{
+				float q = std::nearbyint(src[i] * inv);
+				if (q > 127.0f)
+				{
+					q = 127.0f;
+				}
+				if (q < -127.0f)
+				{
+					q = -127.0f;
+				}
+				if (dst[i] != static_cast<int8_t>(q))
+				{
+					return false;
+				}
+			}
+			for (int32_t i = dims; i < paddedDims; ++i)
+			{
+				if (dst[i] != 0)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
 	// The header rules, shared by Load and PeekScratchArchive so the two can never
 	// disagree about what a valid archive header is — one validator, one truth. Pure on
 	// the header bytes: it allocates nothing and reads no payload.
@@ -1390,6 +1493,18 @@ Status ScratchBank::Load(const ScratchArchive& archive, const Allocator& allocat
 	if (content != Status::Ok)
 	{
 		return content;
+	}
+
+	// The retention region is validated too, against the rows just proven good: replaying
+	// the bake on each retained row must reproduce the stored row byte for byte. Without
+	// this the archive's "not trusted" claim held for the rows and not for the audit
+	// reference beside them, so a fabricated retained array loaded clean and
+	// MeasureScratchRecall reported a number derived from it.
+	if (wantRetain && header.count > 0 &&
+		!RetainedMatchesRows(incoming, incoming.Retained_, incoming.Rows_, incoming.Scales_,
+			header.count, header.dims, header.paddedDims, incoming.Quant_))
+	{
+		return Status::BadFormat;
 	}
 
 	// Re-derive the per-channel sub-norm arena on Load: recompute it from the

@@ -2928,6 +2928,72 @@ static void TestEmptyCosineChannelBankValidates()
 	}
 }
 
+// The retention region is part of what "the archive is not trusted" covers. A retained
+// row is by construction the post-normalization row the quantizer consumed, so replaying
+// the bake on it must reproduce the stored row exactly; a fabricated-but-finite retained
+// array would otherwise load clean and hand MeasureScratchRecall an invented reference to
+// audit the quantized rows against — through the one API whose whole job is honest.
+static void TestScratchLoadValidatesRetainedRegion()
+{
+	Rng rng(0x2E7A15ull);
+	const int32_t dims = 32, count = 24;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, Metric::Cosine, quant, /*retainFloats=*/true) ==
+			Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < count; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		MemArchive good;
+		CHECK(bank.Save(good.Writer()) == Status::Ok);
+
+		// The clean blob loads, so the corruptions below fail for their own reason.
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			ScratchBank target;
+			CHECK(target.Load(a.Reader()) == Status::Ok);
+			CHECK(target.RetainsFloats());
+		}
+
+		// The retained region is the LAST thing Save writes, so the trailing
+		// count * dims floats are it. Perturb one value: still finite, still plausible,
+		// but no longer the row the quantizer consumed.
+		const size_t retainedBytes =
+			static_cast<size_t>(count) * dims * sizeof(float);
+		CHECK(good.bytes.size() > retainedBytes);
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			float* retained = reinterpret_cast<float*>(a.bytes.data() +
+				(a.bytes.size() - retainedBytes));
+			retained[0] = retained[0] + 0.25f; // finite, wrong
+			ScratchBank target;
+			CHECK_MSG(target.Load(a.Reader()) == Status::BadFormat,
+				"a fabricated retained row must be rejected (quant %d)",
+				static_cast<int>(quant));
+		}
+		// A non-finite retained value is rejected too.
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			float* retained = reinterpret_cast<float*>(a.bytes.data() +
+				(a.bytes.size() - retainedBytes));
+			retained[3] = std::numeric_limits<float>::quiet_NaN();
+			ScratchBank target;
+			CHECK(target.Load(a.Reader()) == Status::BadFormat);
+		}
+	}
+}
+
 // PeekScratchArchive reports a serialized archive's geometry and — the reason it exists —
 // the exact byte length a Load consumes, so a host that appends its own trailer can find
 // and validate that trailer BEFORE committing the load.
@@ -19880,6 +19946,7 @@ int main()
 	// V3.2.2: public-path geometry ceilings, and the archive peek the host trailer
 	// validation is built on.
 	TestScratchGeometryCeilings();
+	TestScratchLoadValidatesRetainedRegion();
 	TestEmptyCosineChannelBankValidates();
 	TestPeekScratchArchive();
 
