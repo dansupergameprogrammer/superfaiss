@@ -15,6 +15,7 @@
 #include "xd_fixtures.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -328,6 +329,31 @@ static void PadQuery(const std::vector<float>& q, int32_t pd, float* out)
 {
 	std::memset(out, 0, static_cast<size_t>(pd) * sizeof(float));
 	std::memcpy(out, q.data(), q.size() * sizeof(float));
+}
+
+// Bounded-wait for a ScratchBank's published count to advance past `appended` -- the
+// deterministic form of "the writer has published at least one fresh row" that a storm
+// test's reader needs before its measured loop starts. Count() is an atomic acquire load
+// (safe to poll unpinned, from any thread), so this returns as soon as the writer's first
+// successful Append lands under real scheduling instead of on a fixed iteration budget.
+// Bounded by `timeoutMs`: a genuine regression in the append/publish path (the writer never
+// actually advancing the count) still fails the test loudly here, rather than leaving the
+// caller's own liveness assertion to trip only when the reader happens to outrun the writer,
+// or leaving the wait to hang forever.
+static bool WaitForPublishPastCount(const ScratchBank& bank, int32_t appended,
+	int32_t timeoutMs = 5000)
+{
+	const auto deadline =
+		std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+	while (bank.Count() <= appended)
+	{
+		if (std::chrono::steady_clock::now() >= deadline)
+		{
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -12018,6 +12044,16 @@ static void TestChannelQueryOnlyStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended`. An unsynchronized start races the reader's
+	// 300 fast iterations against OS scheduling of the writer thread -- under concurrent
+	// machine load the reader can finish first and the storm never exercises a concurrent
+	// publish at all. Bounded so a genuine append/publish regression fails loudly here
+	// instead of leaving the loop to run vacuously.
+	CHECK_MSG(WaitForPublishPastCount(fx.bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", fx.bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
 	int32_t maxCountSeen = 0;
@@ -12038,7 +12074,11 @@ static void TestChannelQueryOnlyStorm()
 			iter, C);
 
 		// The channel query over the fresh snapshot succeeds with finite scores (a torn /
-		// stale sub-norm would surface here as a non-finite or wrong score).
+		// stale sub-norm would surface here as a non-finite or wrong score). One CHECK per
+		// iteration covering every returned hit -- the hit count `n` itself moves with
+		// scheduling (how far the writer has appended by this iteration), so a per-hit CHECK
+		// would make the suite's total check count scheduling-dependent too. Every score is
+		// still examined; only the number of CHECK calls is now fixed at one per iteration.
 		Workspace ws;
 		Hit hits[10];
 		int32_t n = 0;
@@ -12048,15 +12088,20 @@ static void TestChannelQueryOnlyStorm()
 		params.segmentCount = 1;
 		params.excludeBits = tombs.data();
 		CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		bool allFinite = true;
 		for (int32_t i = 0; i < n; ++i)
 		{
-			CHECK(std::isfinite(hits[i].score));
+			allFinite = allFinite && std::isfinite(hits[i].score);
 		}
+		CHECK_MSG(allFinite, "channel query returned a non-finite score (iter %d, n %d)",
+			iter, n);
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 	// The reader must have observed the count ADVANCE past the initial rows, or the storm
-	// never exercised a concurrent publish (the P-1 defect this rewrite fixes).
+	// never exercised a concurrent publish (the P-1 defect this rewrite fixes). Guaranteed by
+	// the wait above (Count() is monotonically non-decreasing), and kept as a live regression
+	// check against that guarantee rather than deleted.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -12115,6 +12160,14 @@ static void TestChannelScopedReductionStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended` -- see WaitForPublishPastCount. Without it,
+	// the reader's 200 fast iterations can complete before the OS schedules the writer at
+	// all under concurrent load, and the storm never exercises a concurrent publish.
+	CHECK_MSG(WaitForPublishPastCount(fx.bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", fx.bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
 	int32_t maxCountSeen = 0;
@@ -12151,6 +12204,8 @@ static void TestChannelScopedReductionStorm()
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
+	// Guaranteed by the wait above (Count() is monotonically non-decreasing); kept as a live
+	// regression check against that guarantee rather than deleted.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -12952,11 +13007,11 @@ static void TestPerChannelRecallOracle()
 static void TestVersionHeaderCoherence()
 {
 	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
-		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.2, got %d", SUPERFAISS_VERSION_MAJOR);
-	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 2,
-		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.2, got %d", SUPERFAISS_VERSION_MINOR);
-	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 2,
-		"SUPERFAISS_VERSION_PATCH should be 2 for v3.2.2, got %d", SUPERFAISS_VERSION_PATCH);
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MAJOR);
+	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 3,
+		"SUPERFAISS_VERSION_MINOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MINOR);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
+		"SUPERFAISS_VERSION_PATCH should be 0 for v3.3.0, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 // ===========================================================================
@@ -13630,6 +13685,16 @@ static void TestRelabelExclusiveDrainStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended` -- see WaitForPublishPastCount. Without it,
+	// the reader's 300 fast pin/snapshot iterations can complete before the OS schedules the
+	// writer thread at all under concurrent load, and the storm never exercises a concurrent
+	// publish (or, since the writer's very first iteration is a relabel, a concurrent
+	// relabel either).
+	CHECK_MSG(WaitForPublishPastCount(bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	int32_t maxCountSeen = 0;
 	for (int32_t iter = 0; iter < 300; ++iter)
@@ -13657,6 +13722,10 @@ static void TestRelabelExclusiveDrainStorm()
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 
+	// The writer's own iteration order puts a relabel attempt at iter 0, before its first
+	// append attempt at iter 1 -- so the wait above (which requires at least one successful
+	// append) already implies at least one completed relabel by construction, and this check
+	// is deterministic as a consequence rather than independently scheduling-dependent.
 	CHECK_MSG(relabelCount.load(std::memory_order_relaxed) > 0,
 		"relabel storm: the writer never completed a relabel");
 	BankView finalSnap;
@@ -13674,6 +13743,8 @@ static void TestRelabelExclusiveDrainStorm()
 	CHECK_MSG(matchedSomeTarget,
 		"relabel storm: the final channel table never left the fixture's initial (1-channel) "
 		"table -- Relabel never mutated the bank under concurrent load");
+	// Guaranteed by the wait above (Count() is monotonically non-decreasing); kept as a live
+	// regression check against that guarantee rather than deleted.
 	CHECK_MSG(maxCountSeen > appended,
 		"relabel storm: reader never observed a freshly-published row (count stayed at %d)",
 		maxCountSeen);
@@ -19943,7 +20014,7 @@ int main()
 	TestS1FlatAllocationKthNeighborDistanceProbe();
 	TestS1FlatAllocationMutualNearestMatches();
 
-	// V3.2.2: public-path geometry ceilings, and the archive peek the host trailer
+	// V3.3.0: public-path geometry ceilings, and the archive peek the host trailer
 	// validation is built on.
 	TestScratchGeometryCeilings();
 	TestScratchLoadValidatesRetainedRegion();
