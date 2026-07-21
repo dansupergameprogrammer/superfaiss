@@ -18770,7 +18770,11 @@ static void TestAllocFlatHeaderOnlyMath()
 	Rng rng(0x7A08);
 	const int32_t dims = 24, count = 12, k = 4;
 	TestBank bank(rng, count, dims, Quantization::Int8, Metric::L2);
-	float decoded[24];
+	// DequantizeRowAsQuery writes targetPaddedDims floats, NOT dims: the tail
+	// [dims, paddedDims) is zeroed. Sizing this to `dims` overran it by the pad
+	// width -- caught by the Linux stack protector, invisible under MSVC.
+	// Sized from the contract rather than a literal so it cannot drift.
+	float decoded[PaddedDims(24, Quantization::Int8)];
 	Hit heapStorage[4], mergeScratch[4], mergedOut[4];
 	const Hit listA[2] = {{0, 1.0f}, {1, 2.0f}};
 	const Hit listB[2] = {{2, 0.5f}, {3, 3.0f}};
