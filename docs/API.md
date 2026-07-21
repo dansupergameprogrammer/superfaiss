@@ -183,9 +183,12 @@ For hosts that want to fan a single query out across threads:
 
 ```cpp
 void ScoreChunk(const BankView&, const float* paddedQuery, int32_t chunkIndex,
-                const uint32_t* excludeBits, TopK& inout);
+                const uint32_t* excludeBits, TopK& inout,
+                const float* rowBias = nullptr, bool* outNonFiniteBias = nullptr);
 void ScoreChunkPair(const BankView&, const float* qA, const float* qB, int32_t chunkIndex,
-                    const uint32_t* excludeBits, TopK& inoutA, TopK& inoutB);
+                    const uint32_t* excludeBits, TopK& inoutA, TopK& inoutB,
+                    const float* rowBiasA = nullptr, const float* rowBiasB = nullptr,
+                    bool* outNonFiniteBias = nullptr);
 
 class TopK {            // bounded top-k over caller storage
     void    Init(Hit* storage, int32_t k, Metric);
@@ -240,7 +243,9 @@ Status MakeCentroidCrossDevice(const BankView&, const int32_t* rowIndices,
                                                             //   else one positive int per row
                                const uint32_t* excludeBits, // e.g. snapshot tombstones
                                int8_t* outQ8,               // paddedDims bytes, 16-aligned
-                               double* outScale, int64_t* outSqSum);
+                               double* outScale, int64_t* outSqSum,
+                               int32_t offset = 0,          // sub-range start element (V3.0); 0 = whole vector
+                               int32_t length = -1);        // sub-range length; < 0 = bank.dims (whole vector)
 ```
 
 Pure, allocation-free, deterministic (serial double-precision accumulation).
@@ -536,7 +541,7 @@ class ScratchBank {              // single writer, lock-free readers
                   int32_t reportCount, uint64_t seed = kDefaultRecallSeed);          //   recall@k per channel
     Status Save(const ScratchArchive&) const;     // writer-side
     Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE
-    int32_t Count(); int32_t LiveCount(); int32_t Capacity();
+    int32_t Count() const; int32_t LiveCount() const; int32_t Capacity() const;
     static int32_t TombstoneWords(int32_t count);
 
     // v2.3 recall audit:
@@ -648,7 +653,7 @@ uint64_t  AllocationCount();     // process-wide, monotonic; assert flat deltas 
 class Workspace {                // query scratch; single owner, NOT thread-safe
     explicit Workspace(const Allocator&);   // or default
     bool     Reserve(int32_t k, int32_t batchWidth);
-    uint64_t GrowthCount();      // flat once warm
+    uint64_t GrowthCount() const;      // flat once warm
 };
 ```
 
