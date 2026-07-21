@@ -1100,11 +1100,15 @@ static void TestSimdEqualsScalar()
 // Where the defect actually bites (established while authoring this test — the coord's
 // original "length-4 scores 0 on the whole-row path" framing was imprecise):
 //   * The WHOLE-ROW dispatch DotF32()/L2F32() (src/kernels.cpp) selects the AVX2
-//     intrinsic ONLY when paddedDims % 8 == 0 (else DotF32Sse, which handles the tail).
-//     PaddedDims is always a multiple of 8 for f32 banks big enough to matter, so a
-//     length ≡ 4 mod 8 never reaches the intrinsic through that dispatch — the whole-
-//     row path was NOT wrong in production. That is why the correctness check in Part A
-//     runs against the scalar MIRROR directly, not through DotF32().
+//     intrinsic ONLY when the length it is handed is a multiple of 8 (else DotF32Sse,
+//     which handles the tail), so a length ≡ 4 mod 8 never reaches the intrinsic through
+//     that dispatch. That is why the correctness check in Part A runs against the scalar
+//     MIRROR directly, not through DotF32().
+//     (This bullet used to add "PaddedDims is always a multiple of 8 for f32 banks big
+//     enough to matter". That is FALSE — f32 strides are multiples of 4, so dims 20, 36,
+//     52, 100 and 132 all produce odd strides — and the belief is what let the two scan
+//     paths diverge unnoticed at those widths. TestSegmentedEqualsWholeRowAcrossWidths
+//     now sweeps them and compares the two paths to each other.)
 //   * The defect bites the SEGMENTED / per-channel-cosine scan: ResolveRowKernels()
 //     (src/kernels.cpp) wires k.dotF32 = DotF32Avx2 RAW (no % 8 guard), and the non-
 //     foldable per-channel-cosine path (ScoreChunkSegmented) calls it over each
@@ -2130,6 +2134,107 @@ static void TestPca()
 //        unchanged.
 //   B  — repeat determinism, external chunk-fusion merge bit-identity,
 //        validation rejections including the query-side zero-norm segment law.
+
+// The path-equality contract, swept across the widths that can break it.
+//
+// TestSegmentedScan's A1 already asserts "degenerate one-segment query == whole-row
+// scan, bit-identical" — but only at dims 32, where the float32 stride is a multiple of
+// 8. That is precisely where the two paths cannot disagree, because the float32 kernel
+// dispatchers select AVX2 only at `length % 8 == 0` and both paths then choose it. The
+// mechanism was covered; the width was not, and 12/32/64/128/256/768 all miss it.
+//
+// Float32 strides are multiples of 4, so dims 20, 36, 52, 100 and 132 produce strides
+// that are NOT multiples of 8. At those widths a second selection rule anywhere in the
+// scan shows up as a last-ulp disagreement between the two paths — which is what
+// DETERMINISM.md's "no second code path exists to drift" forbids, and what the plugin's
+// "contributions sum EXACTLY to the hit's score" is built on.
+//
+// This is the cross-PATH check. T11's sweep compares each kernel against its own scalar
+// mirror, which stays green while the two paths pick different kernels, because each is
+// individually correct. Comparing a path to a mirror is not comparing a path to a path.
+static void TestSegmentedEqualsWholeRowAcrossWidths()
+{
+	Rng rng(0x9D71A55ull);
+	const int32_t count = 120;
+	const int32_t k = 8;
+	// Chosen so the float32 stride is NOT a multiple of 8 (20, 36, 52, 100, 132) with
+	// multiple-of-8 controls (32, 64) beside them.
+	const int32_t dimsSet[] = {20, 32, 36, 52, 64, 100, 132};
+
+	for (int32_t dims : dimsSet)
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			if (dims % (kAlignment / ElementSize(quant)) != 0)
+			{
+				continue; // not on this quantization's element grid; not a legal segment
+			}
+			for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+			{
+				TestBank bank(rng, count, dims, quant, metric);
+				const int32_t pd = bank.view.paddedDims;
+				AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+				std::vector<float> qv(static_cast<size_t>(dims));
+				for (auto& x : qv)
+				{
+					x = rng.NextFloat();
+				}
+				PadQuery(qv, pd, q.F32());
+
+				QueryParams plain;
+				plain.k = k;
+				Workspace ws1;
+				std::vector<Hit> whole(static_cast<size_t>(k));
+				int32_t wholeCount = 0;
+				CHECK(Query(bank.view, q.F32(), plain, ws1, whole.data(), &wholeCount) ==
+					Status::Ok);
+
+				const QuerySegment degenerate[1] = {{0, pd, 1.0f}};
+				QueryParams seg = plain;
+				seg.segments = degenerate;
+				seg.segmentCount = 1;
+				Workspace ws2;
+				std::vector<Hit> segmented(static_cast<size_t>(k));
+				int32_t segCount = 0;
+				CHECK(Query(bank.view, q.F32(), seg, ws2, segmented.data(), &segCount) ==
+					Status::Ok);
+
+				CHECK_MSG(segCount == wholeCount,
+					"dims=%d pd=%d quant=%d metric=%d: hit counts differ (%d vs %d)",
+					dims, pd, static_cast<int>(quant), static_cast<int>(metric),
+					wholeCount, segCount);
+				for (int32_t i = 0; i < wholeCount && i < segCount; ++i)
+				{
+					CHECK_MSG(segmented[i].index == whole[i].index &&
+							segmented[i].score == whole[i].score,
+						"dims=%d pd=%d quant=%d metric=%d hit %d: whole-row (%d, %.9g) vs "
+						"one-segment (%d, %.9g) — the two scan paths disagree",
+						dims, pd, static_cast<int>(quant), static_cast<int>(metric), i,
+						whole[i].index, static_cast<double>(whole[i].score),
+						segmented[i].index, static_cast<double>(segmented[i].score));
+				}
+
+				// The decomposition surface rides the same kernel table, and its published
+				// claim is that a contribution IS the score. With one whole-row segment
+				// there is exactly one contribution and no summation order to argue about,
+				// so this is the claim stated at its sharpest.
+				if (wholeCount > 0)
+				{
+					float contribution = 0.0f;
+					const float total = DecomposeRowScore(bank.view, q.F32(),
+						whole[0].index, degenerate, 1, &contribution);
+					CHECK_MSG(total == whole[0].score,
+						"dims=%d pd=%d quant=%d metric=%d: decomposed total %.9g != scan "
+						"score %.9g for row %d",
+						dims, pd, static_cast<int>(quant), static_cast<int>(metric),
+						static_cast<double>(total),
+						static_cast<double>(whole[0].score), whole[0].index);
+					CHECK(contribution == total);
+				}
+			}
+		}
+	}
+}
 
 static void TestSegmentedScan()
 {
@@ -19522,6 +19627,7 @@ int main()
 	TestIntersect();
 	TestPca();
 	TestSegmentedScan();
+	TestSegmentedEqualsWholeRowAcrossWidths();
 	TestPerChannelCosine();
 	TestScratchBanks();
 	TestScratchChannelCreateRejections();

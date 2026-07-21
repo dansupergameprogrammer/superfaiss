@@ -21,6 +21,21 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   trailer with the rows already replaced.
 
 ### Fixed
+- **Two kernel-selection rules made the segmented scan disagree with the whole-row
+  scan.** The float32 dispatchers `DotF32`/`L2F32` use AVX2+FMA only when the length they
+  are handed is a multiple of 8; `ResolveRowKernels`, which feeds the segmented scan and
+  `DecomposeRowScore`, wired the AVX2 kernels in directly with no such rule. Float32
+  strides are multiples of 4, so at `paddedDims` 20, 36, 52, 100, 132 and similar the two
+  paths computed the same row with different accumulation widths and disagreed in the
+  last ulp. That falsified two published guarantees — that a degenerate one-segment query
+  equals the whole-row scan, and that decomposition contributions sum bit-exactly to the
+  scan's own score, "no second code path exists to drift". `ResolveRowKernels` now holds
+  the dispatchers, so the rule is applied once, to the length actually in hand — which
+  matters because the segmented scan calls the kernel per scan RANGE, and a bank whose
+  stride is a multiple of 8 can still present a range that is not.
+  **`Exactness::CrossDevice` was never affected** (int8 lengths are always multiples of
+  16), so the cross-machine contract is unchanged, and no pinned golden moves: every one
+  of them sits at a width or quantization where the two paths already agreed.
 - **`ScratchBank::Create` and `Grow` performed signed size arithmetic before bounding
   their geometry.** `ArenaBytes` multiplies capacity by dims in signed `int64`; both
   entry points accepted any positive `int32` pair, so a large valid-typed request
