@@ -134,11 +134,12 @@ Removal is snapshot-consistent: a tombstone is visible to every snapshot taken
 after the `Remove`, and a snapshot, once taken, is immutable — querying it
 twice is bit-identical regardless of concurrent writer activity.
 
-Channels (v3.0) ride the same guarantee: a scratch bank's fixed channel table
+Channels (v3.0) ride the same guarantee: a scratch bank's channel table
 and its per-channel inverse sub-norms — computed per-row-standalone at append
-from the quantized bytes, re-derived identically on `Load` and at `Freeze` —
-make a named-channel query on a snapshot bit-identical to the same query on a
-bank baked from the same live rows.
+from the quantized bytes, re-derived identically on `Load`, at `Freeze`, and
+after a `Relabel` (v3.1) — make a named-channel query on a snapshot
+bit-identical to the same query on a bank baked from the same live rows under
+the table currently in force.
 
 One quiescence caveat (v2.3): `MeasureScratchRecall` sweeps many self-queries
 under a reader pin, not exclusivity, so its number is well-defined — and

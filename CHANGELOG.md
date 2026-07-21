@@ -11,27 +11,37 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
 
 ## [3.2.0] — 2026-07-20
 
+### Fixed
+- **Stale public contracts scrubbed (docs/comments only; no code change).** `docs/API.md`,
+  `docs/DETERMINISM.md`, `docs/FORMAT.md`, and `scratch.h`'s `GetChannelCount()`/`GetChannels()`
+  doc comment still described the v3.0 channel table as fixed for the bank's lifetime — the
+  contract v3.1's `Relabel` repealed. `docs/API.md` and `scratch.h` were missed by the v3.1.2
+  scrub below; `docs/DETERMINISM.md` was never on that list. All four now state the current
+  contract.
+
 ### Added
-- **Bank-inspection primitives (`graph.h`, `novelty.h`, `matching.h`) — Bank Inspector I.**
-  Three header-only Tier-1 modules answering "what does this bank actually look like,"
-  not just "what's nearest": a mutual k-NN neighbor graph + connected components
+- **Bank-inspection primitives (`inspector_common.h`, `graph.h`, `novelty.h`, `matching.h`)
+  — Bank Inspector I.** Four header-only Tier-1 modules answering "what does this bank
+  actually look like," not just "what's nearest": a shared row->query decode helper
+  (`inspector_common.h`); a mutual k-NN neighbor graph + connected components
   (`graph.h` — clustering); a two-limb novelty test, an exact-distance identity check
   plus a statistical rank against a calibrated baseline (`novelty.h` — is this row new or
   a near-duplicate); sampled-A-verified-against-full-banks mutual correspondence with
   CSLS margins (`matching.h` — which rows in bank A correspond to rows in bank B, e.g. a
-  player's saved scratch archive against the shipped reference bank). All three are pure
-  functions over a caller-held `BankView` — no new bank state, no persistence surface,
-  PER-DEVICE deterministic, no cross-device claim. `superfaiss.h`'s umbrella header now
-  includes all three. See `docs/API.md` for the full contract of each.
+  player's saved scratch archive against the shipped reference bank). The three module
+  headers are pure functions over a caller-held `BankView` — no new bank state, no
+  persistence surface, PER-DEVICE deterministic, no cross-device claim. `superfaiss.h`'s
+  umbrella header now includes all four. See `docs/API.md` for the full contract of each.
 
 ## [3.1.2] — 2026-07-18
 
 ### Fixed
 - **Stale public contracts scrubbed (docs/comments only; no code change).** `scratch.h`,
-  `scratch.cpp`, `docs/API.md`, and `docs/INTEGRATION.md` still described the channel table as
-  "fixed for the bank's lifetime" — the v3.0 contract that v3.1's `Relabel` repealed. All four now
-  state the current contract, and `Relabel` is documented in `API.md`/`INTEGRATION.md` (it had
-  landed in the README and this changelog only).
+  `scratch.cpp`, and `docs/INTEGRATION.md` still described the channel table as
+  "fixed for the bank's lifetime" — the v3.0 contract that v3.1's `Relabel` repealed. These three
+  now state the current contract, and `Relabel` is documented in `INTEGRATION.md` (it had
+  landed in the README and this changelog only). `docs/API.md` still carried the stale phrasing
+  after this pass and was corrected in 3.2.0, above.
 - **`version.h` corrected to the released version.** The header (and its coherence check in the
   test suite) still carried 3.0.1 through both 3.1 releases; both now read 3.1.2. Found while
   closing an external review's release-identity finding.

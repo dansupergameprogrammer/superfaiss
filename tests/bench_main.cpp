@@ -721,6 +721,8 @@ int main()
 			: ActiveSimdPath() == SimdPath::AVX2 ? "avx2" : "neon");
 
 	Bench bench;
+	// README "Measured" table workload: 40k vectors x 100 dims, int8.
+	bench.Run(40000, 100, Quantization::Int8, 64);
 	// Typical game bank.
 	bench.Run(10000, 128, Quantization::Int8, 64);
 	// Reference workload (plan §13).

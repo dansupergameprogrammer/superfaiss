@@ -515,7 +515,7 @@ Status NNDivergenceChannel(
 		return Status::InvalidArgument; // empty source
 	}
 	// A zero sub-norm member (source or target) is NOT rejected here: this is a reduction
-	// (a set statistic), and C-5/D-V3-11 floors a degenerate Cosine member to a defined 0
+	// (a set statistic), and a degenerate Cosine member floors to a defined 0
 	// via XdChannelPairScore -- consistent with CentroidDistance/Spread. The query-side
 	// ZeroNormQuery rejection is for a SINGLE per-channel query, not a reduction over a pool
 	// (a valid row can have a whole-row-normalized image with one channel exactly zero).

@@ -62,8 +62,8 @@ jobs:
   # golden in tests/xd_fixtures.h — so all runners agreeing with the pin proves any
   # two runners agree with each other, and a divergent machine fails its own job.
   # This job additionally publishes the full selection recording as a per-commit
-  # artifact: the consumer-facing "ghost from another machine" that SuperMotion's
-  # Station 2 replays against a live local simulation.
+  # artifact: a recorded cross-device selection trace a consumer can replay against
+  # a live local simulation on a different machine.
   macos-arm64:
     runs-on: macos-latest
     steps:

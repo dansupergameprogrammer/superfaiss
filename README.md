@@ -162,8 +162,9 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   result-direction convention (a `Dot` bank returns a similarity, not a distance) and
   the cosine limb's determinism condition are stated in [API.md](docs/API.md) and
   [DETERMINISM.md §2e](docs/DETERMINISM.md).
-- **Channel-capable mutable banks + channel-scoped analytics (v3.0).** A scratch bank can
-  carry a fixed channel partition set at `Create`; named-channel queries and every analytics
+- **Channel-capable mutable banks + channel-scoped analytics (v3.0, mutable v3.1).** A
+  scratch bank can carry a channel partition set at `Create` and mutated in-place on a live
+  bank via `Relabel` (v3.1); named-channel queries and every analytics
   reduction run over one channel's sub-range as readily as the whole row, cross-device
   bit-exact per channel. (For channel-scoped analytics the Cosine limb recomputes the
   sub-range `sqrt` in the int→double domain as its full-precision reference; the per-channel
@@ -196,8 +197,9 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   grouping (`BuildDuplicateGroups`), and deterministic connected components over the result — the
   clustering substrate behind "does this bank have natural clusters, or one undifferentiated
   blob." `novelty.h`: a calibrated baseline (`CalibrateNoveltyBaseline`) plus a two-limb novelty
-  test — an exact-distance identity check (`NoveltyProbeDistance`, true 0.0 on Cosine, a disclosed
-  double-precision epsilon on L2's expanded form) and a statistical rank against the baseline
+  test — an exact-distance identity check (`NoveltyProbeDistance`, true 0.0 on Cosine int8 or a
+  byte-identical float32 row, a disclosed double-precision epsilon on L2's expanded form) and a
+  statistical rank against the baseline
   (`KthNeighborDistance` + `NoveltyScore`) — "is this new content actually different from what's
   already in the bank, or a near-duplicate." `matching.h`: sampled-A-verified-against-full-banks
   mutual nearest-neighbor correspondence with CSLS margins (`MutualNearestMatches`) — "which rows
@@ -245,11 +247,20 @@ you are embedding this library anywhere, it is the worked example.
 
 ## Measured (desktop, AVX2, 40k vectors x 100 dims, int8, exact top-10)
 
-| Path | Per query |
-|---|---|
-| Serial scan, one core | ~0.5 ms |
-| Chunk-parallel (host scheduler over `ScoreChunk` + `MergeTopK`) | ~0.13 ms |
-| Batched (64 queries, one pass, pair kernels) | ~0.06 ms |
+| Path | Per query | Threading | Reproduce |
+|---|---|---|---|
+| Serial scan, one core | ~0.65 ms | single-threaded | `superfaiss_bench.exe` (this repo) |
+| Batched (64 queries, one pass, pair kernels), one core | ~0.56 ms (~1.18x amortization over serial) | single-threaded | `superfaiss_bench.exe` (this repo) |
+| Chunk-parallel (host scheduler over `ScoreChunk` + `MergeTopK`) | ~0.13 ms | host-parallelized across cores | engine-side harness (the UE plugin's bench) |
+| Batched (64 queries), host-parallelized | ~0.06 ms | host-parallelized across cores | engine-side harness (the UE plugin's bench) |
+
+Single-core batching amortizes memory traffic and per-call overhead, not compute — the
+~8x gap between the serial row and the parallel rows above is parallelism across cores,
+not a property of batching by itself. The two single-threaded rows are measured directly
+by `tests/bench_main.cpp` in this repo (`bench.Run(40000, 100, Quantization::Int8, 64)`);
+the two host-parallelized rows are measured by the plugin's own multi-threaded harness,
+since threading is the host's job, not this library's (see
+[INTEGRATION.md §5](docs/INTEGRATION.md)).
 
 Same answers on every path, bit for bit — that equivalence is test-enforced, not
 aspirational.

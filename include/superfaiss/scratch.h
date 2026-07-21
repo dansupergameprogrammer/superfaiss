@@ -104,7 +104,7 @@ public:
 		const Allocator& allocator = DefaultAllocator());
 
 	// Channel-capable overload (V3.0, plan section 23.4): the channel table
-	// becomes a scratch-bank property, set at Create (D-V3-2) and replaceable
+	// becomes a scratch-bank property, set at Create and replaceable
 	// thereafter only by the exclusive Relabel operation (V3.1).
 	// Validated at construction with the same rules ValidateBank applies to a
 	// baked channel table (in-bounds, ascending, non-overlapping, on the
@@ -150,7 +150,7 @@ public:
 	Status Grow(int32_t newCapacity);
 
 	// Mutable channel vocabulary (V3.1, plan section 24.4): atomically replaces the
-	// channel table on a live bank, relaxing V3.0's fixed-at-Create vocabulary (D-V3-2).
+	// channel table on a live bank, relaxing V3.0's fixed-at-Create vocabulary.
 	// The stored rows are never touched — channels are sub-ranges over the same
 	// dims (section 24.3), so a relabel is a vocabulary change, not a row change.
 	//
@@ -292,13 +292,14 @@ public:
 		float* outChannelInvNorms, ScratchRecallReport* outReport = nullptr,
 		Workspace* recallWs = nullptr, uint64_t recallSeed = kDefaultRecallSeed) const;
 
-	// The fixed channel table set at Create (V3.0), or null / 0 for a single-space bank.
+	// The channel table set at Create (V3.0) and mutable in-place thereafter via
+	// Relabel (V3.1), or null / 0 for a single-space bank.
 	// A caller graduating a channel scratch bank attaches these to the frozen BankView.
 	int32_t GetChannelCount() const { return ChannelCount_; }
 	const ChannelInfo* GetChannels() const { return ChannelCount_ > 0 ? Channels_ : nullptr; }
 
 	// Channel-aware Freeze that also re-measures per-channel recall over the compacted
-	// (live) rows at freeze time (V3.0, D-V3-7). As the channel-aware Freeze above, and
+	// (live) rows at freeze time (V3.0). As the channel-aware Freeze above, and
 	// additionally fills outRecallReports[c] (reportCount == GetChannelCount() entries)
 	// with the per-channel recall@k measured over the surviving rows -- a fresh number
 	// for the graduated bank, never a stale one (the §20 freeze-re-measure rule, per
@@ -326,7 +327,7 @@ public:
 	Status MeasureScratchRecall(Workspace& workspace, ScratchRecallReport* outReport,
 		uint64_t seed = kDefaultRecallSeed);
 
-	// Per-channel recall mode (V3.0, D-V3-7): on a retention-enabled Cosine bank that
+	// Per-channel recall mode (V3.0): on a retention-enabled Cosine bank that
 	// carries a channel table, measures recall@k PER CHANNEL over each channel's
 	// sub-range (the channel-scoped self-query vs the double-precision reference
 	// restricted to that channel's elements), filling outReports[c] for c in
@@ -396,7 +397,7 @@ private:
 	Metric Metric_ = Metric::Dot;
 	Quantization Quant_ = Quantization::Float32;
 	bool Retain_ = false;
-	// Channel table (V3.0, D-V3-2; mutable since V3.1): set at Create, replaced
+	// Channel table (V3.0; mutable since V3.1): set at Create, replaced
 	// atomically only by Relabel. Empty
 	// (ChannelCount_ == 0) for a single-space bank. Held by value — small (<= kMaxChannels)
 	// and survives Grow/Load without an arena region of its own; the per-channel inverse

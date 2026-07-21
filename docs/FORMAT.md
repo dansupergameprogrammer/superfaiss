@@ -119,7 +119,7 @@ file, save-game blob, network; the bank owns the format):
 | metric, quant | u8, u8 | enum values; 6 reserved bytes follow |
 | flags | u8 | **`reserved[0]` (header offset 26), v3.0:** bit 0 = retention present, bit 1 = channels present; bits 2–7 reserved and tolerated. Authoritative when `version` is 3 |
 | channelCount | i32 | **flag bit 1 only:** entries in the channel table that follows |
-| channel table | ChannelInfo[channelCount] | **flag bit 1 only:** the fixed channel partition (`offset` + `length` per entry) |
+| channel table | ChannelInfo[channelCount] | **flag bit 1 only:** the channel partition as currently configured (`offset` + `length` per entry) — mutable in-place via `Relabel` (v3.1), reflected at the next `Save` |
 | rows | payload | `count x paddedDims` elements, baked layout (section 2) |
 | scales | f32[count] | int8 banks only |
 | tombstones | u32[ceil(count/32)] | bit set = removed row |

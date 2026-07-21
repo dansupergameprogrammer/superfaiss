@@ -10057,7 +10057,7 @@ static void TestScratchChannelPersistenceReservedBit()
 }
 
 
-// T-V3-Recall -- per-channel recall (D-V3-7): the MeasureScratchRecall seeded
+// T-V3-Recall -- per-channel recall: the MeasureScratchRecall seeded
 // routine gains a per-channel mode over the channel ranges, and channel-aware
 // FreezeWithRecall re-measures per-channel recall over the compacted rows
 // (section 23.9 slot-3 gate; section 23.4 item b; section 20). Both surfaces are
@@ -10929,11 +10929,11 @@ static void TestChannelScopedAnalyticsRefFeat()
 	}
 }
 
-// --- T-V3-A1-COS-REF: the bit-exact channel-scoped Cosine analytics REF (C-4/D-V3-10) ---
+// --- T-V3-A1-COS-REF: the bit-exact channel-scoped Cosine analytics REF ---
 //
 // An INDEPENDENT recode of the pinned channel-scoped Cosine epilogue, authored from the
 // section 23.5 contract -- NOT by calling the operator or reusing its file-local helpers.
-// The arithmetic pinned by C-4 / D-V3-10: a channel-scoped Cosine distance over the sub-range
+// The arithmetic: a channel-scoped Cosine distance over the sub-range
 // [offset, offset+length) is
 //     1 - crossDot / sqrt(aSq * bSq)
 // where crossDot, aSq, bSq are the INTEGER sub-range cross-dot / self-dots recomputed over the
@@ -10979,7 +10979,7 @@ namespace
 	}
 
 	// The pinned channel-scoped Cosine pair distance over two int8 sub-images of `length` lanes.
-	// A zero sub-norm member floors to a defined 0 (C-5/D-V3-11), matching XdChannelPairScore.
+	// A zero sub-norm member floors to a defined 0, matching XdChannelPairScore.
 	float CosRefChannelPair(const int8_t* a, const int8_t* b, int32_t length)
 	{
 		const int64_t cross = CosRefDotI8(a, b, length);
@@ -11021,7 +11021,7 @@ namespace
 } // namespace
 
 // T-V3-A1-COS-REF -- bit-exact Cosine REF for the four channel-scoped operators (dim 10,
-// C-4/D-V3-10), plus the C-5 zero-sub-norm-member floor in a reduction (D-V3-11). Asserts
+// the reference arithmetic), plus the zero-sub-norm-member floor in a reduction. Asserts
 // exact == between each operator's float result and the independent int->double recode
 // (CosRefChannelPair), across both channels of both banks. Expected GREEN on the shipped
 // pinned arithmetic; a disagreement is a genuine finding (operator vs the independent recode),
@@ -11180,7 +11180,7 @@ static void TestChannelScopedAnalyticsCosineRef()
 		}
 	}
 
-	// C-5 (D-V3-11): a zero-sub-norm Cosine channel MEMBER floors to a defined 0 in a
+	// A zero-sub-norm Cosine channel MEMBER floors to a defined 0 in a
 	// reduction (not ZeroNormQuery). A hand Cosine channel bank: row 0 has zero energy in
 	// channel 0 (its sub-norm is 0) but nonzero energy in channel 1, so the whole ROW
 	// normalizes and Append succeeds. A channel-0 Spread must stay defined; the zero-norm
@@ -11520,7 +11520,7 @@ static void TestChannelScopedAnalyticsRejections()
 // the arena's per-channel sub-norms bit-equal a fresh ComputeChannelInverseNorms over that
 // snapshot's own published rows -- i.e. a row NEVER appears in a snapshot without its
 // sub-norm. This directly exercises the append-time sub-norm-write-BEFORE-PublishedCount_
-// store-release ordering D-V3-8 commissioned: were the sub-norm write moved AFTER the count
+// store-release ordering: were the sub-norm write moved AFTER the count
 // publish, a snapshot acquiring the new count would read the just-published row with a stale
 // / unwritten sub-norm slot, and the recompute would disagree. GREEN on the current code
 // (correct ordering); the reader reads rows/sub-norms below the acquired count, which are
@@ -11904,7 +11904,7 @@ static void TestScratchChannelSaveVersionSelection()
 
 namespace
 {
-	// Independent floored channel-NN recode to the CORRECT C-5/D-V3-11 semantics: NO
+	// Independent floored channel-NN recode to the CORRECT semantics: NO
 	// zero-sub-norm skip and NO pre-rejection. For Cosine, nearest = minimum distance, and
 	// CosRefChannelPair floors any zero-sub-norm member (source OR target) to distance 0 -- so a
 	// zero-energy target is nearest to every source at distance 0, and a zero-energy source's
@@ -11977,7 +11977,7 @@ namespace
 	}
 } // namespace
 
-// [P1-B1] Zero-energy channel NN divergence must FLOOR, not reject (C-5/D-V3-11).
+// [P1-B1] Zero-energy channel NN divergence must FLOOR, not reject.
 // NNDivergenceChannel currently returns ZeroNormQuery for a zero-sub-norm source sub-row
 // (analytics.cpp:523) and continue-skips a zero-sub-norm target (analytics.cpp:548), aborting
 // with InvalidArgument when every target is skipped -- contradicting C-5, which floors a zero
@@ -12101,7 +12101,7 @@ static void TestChannelNNZeroEnergyFloor()
 	}
 }
 
-// [P1-B2] Zero-energy per-channel recall must SKIP the sample, not abort (D-V3-7 / C-5).
+// [P1-B2] Zero-energy per-channel recall must SKIP the sample, not abort.
 // MeasureScratchRecallPerChannel and FreezeWithRecall issue a segmented self-query per sampled
 // row; a sampled row whose channel sub-vector is zero-energy makes that per-channel Cosine
 // self-query ZeroNormQuery, and MeasureRecallLockedChannel (scratch.cpp:1503) returns it,

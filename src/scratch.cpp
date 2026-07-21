@@ -270,7 +270,7 @@ Status ScratchBank::Create(
 }
 
 // Channel-capable Create (V3.0, plan section 23.4): the channel table becomes a
-// scratch-bank property, set at Create (D-V3-2) and replaced thereafter only by the
+// scratch-bank property, set at Create and replaced thereafter only by the
 // exclusive Relabel operation (V3.1). The table is validated
 // at construction with the same rules ValidateBank applies to a baked channel table
 // (validation moves from import-time to construction-time); on a Cosine bank the arena
@@ -948,7 +948,7 @@ Status ScratchBank::Freeze(void* outRows, float* outScales, int32_t* outIndexMap
 }
 
 // Channel-aware Freeze that also re-measures per-channel recall over the compacted rows
-// (V3.0, D-V3-7). Requires a retention-enabled Cosine channel bank (the float reference the
+// (V3.0). Requires a retention-enabled Cosine channel bank (the float reference the
 // recall sweep scans). Each report is measured at the current generation — a fresh number
 // for the graduated bank, never a stale one.
 Status ScratchBank::FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap,
@@ -984,7 +984,7 @@ Status ScratchBank::FreezeWithRecall(void* outRows, float* outScales, int32_t* o
 	return FreezeChannelsLocked(outRows, outScales, outIndexMap, outChannelInvNorms);
 }
 
-// Per-channel recall (V3.0, D-V3-7): one seeded recall@k report per channel over its
+// Per-channel recall (V3.0): one seeded recall@k report per channel over its
 // sub-range. Requires a retention-enabled Cosine channel bank; InvalidArgument otherwise.
 Status ScratchBank::MeasureScratchRecallPerChannel(
 	Workspace& workspace, ScratchRecallReport* outReports, int32_t reportCount, uint64_t seed)
