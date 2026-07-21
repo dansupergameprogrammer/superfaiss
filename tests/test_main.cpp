@@ -19,8 +19,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <new>
 #include <sstream>
 #include <string>
@@ -17552,6 +17554,804 @@ static void TestS4SharedRowDecodeHelperAllThreeModules()
 }
 
 // ---------------------------------------------------------------------------
+// Coverage audit §7 closure (registry gap, found while building the registry
+// below): graph.h's MutualFilter/BuildDuplicateGroups/ConnectedComponents and
+// novelty.h's NoveltyScore are BINDS entry points the audit's own §6
+// specification never routed to a cell -- an entry point with no live cell
+// fails assertion 3 of the guard below, so this closes it with the standard
+// shape (§6.0): a bank/neighbor fixture warmed once, then >=10 identical
+// calls to each function inside one ScopedRawNewTracking scope.
+static void TestAllocFlatGraphAndNoveltyMisc()
+{
+	Rng rng(0x7A99);
+	const int32_t dims = 20, count = 48, k = 5;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank bank(src, count, dims, Quantization::Int8, Metric::L2);
+
+	Workspace ws;
+	std::vector<int32_t> neighbors(static_cast<size_t>(count) * k, -999);
+	std::vector<uint8_t> mutualFlags(static_cast<size_t>(count) * k, 0);
+	std::vector<int32_t> groupOf(static_cast<size_t>(count), -999);
+	std::vector<int32_t> dupScratch(static_cast<size_t>(count), -999);
+	std::vector<int32_t> componentId(static_cast<size_t>(count), -999);
+	std::vector<int32_t> unionScratch(static_cast<size_t>(count), -999);
+
+	std::vector<float> baseline(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i) baseline[static_cast<size_t>(i)] = static_cast<float>(i) * 0.1f;
+	std::sort(baseline.begin(), baseline.end());
+	const float probeDistance = baseline[static_cast<size_t>(count / 2)];
+
+	// Warm-up: allowed to allocate.
+	CHECK(BuildKnnNeighbors(bank.view, k, true, neighbors.data(), ws) == Status::Ok);
+	CHECK(MutualFilter(count, k, neighbors.data(), mutualFlags.data()) == Status::Ok);
+	CHECK(BuildDuplicateGroups(bank.view, groupOf.data(), dupScratch.data()) == Status::Ok);
+	CHECK(ConnectedComponents(count, k, neighbors.data(), mutualFlags.data(), groupOf.data(),
+		componentId.data(), unionScratch.data()) == Status::Ok);
+	float noveltyOut = -999.0f;
+	CHECK(NoveltyScore(baseline.data(), count, probeDistance, &noveltyOut) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(MutualFilter(count, k, neighbors.data(), mutualFlags.data()) == Status::Ok);
+			CHECK(BuildDuplicateGroups(bank.view, groupOf.data(), dupScratch.data()) == Status::Ok);
+			CHECK(ConnectedComponents(count, k, neighbors.data(), mutualFlags.data(), groupOf.data(),
+				componentId.data(), unionScratch.data()) == Status::Ok);
+			CHECK(NoveltyScore(baseline.data(), count, probeDistance, &noveltyOut) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"MutualFilter/BuildDuplicateGroups/ConnectedComponents/NoveltyScore allocated %llu "
+			"time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"MutualFilter/BuildDuplicateGroups/ConnectedComponents/NoveltyScore's seam-tracked "
+		"allocations grew on a warm workspace");
+}
+
+// ===========================================================================
+// Coverage audit §7 -- The Structural Guard: a public entry point added to
+// include/superfaiss/*.h with no allocation cell must fail the build. This
+// is the audit's single highest-value item (F-2) -- not because it proves
+// any one cell correct, but because it is the only thing that stops the
+// swept/public ratio from decaying silently as the surface grows.
+//
+// Mechanism (precedent: TestS4SharedRowDecodeHelperAllThreeModules above,
+// which already reads real repository source via ReadWholeSourceFile and
+// asserts structural properties over the text -- the working directory is
+// the repo root in every CI job, so relative paths under include/ resolve).
+// Source of truth is the real header directory
+// (std::filesystem::directory_iterator("include/superfaiss")), never a
+// hand-maintained list: the header text is parsed for declaration sites and
+// checked against the registry table below.
+//
+// What this guard proves, and what it explicitly does NOT (ceilings, stated
+// here so the next reader is not misled about what a green run means --
+// coverage audit §7.3):
+//   1. It is a text extractor, not a C++ parser. Templates, macro-generated
+//      declarations, and declarations whose return type and name are split
+//      in a way the extractor does not anticipate can be missed. The
+//      per-header expected-count pin below converts a miss into a loud
+//      failure rather than a silent, vacuously-passing "everything found has
+//      a row" check -- a parser that finds nothing still passes that
+//      assertion trivially unless the count is pinned separately. Today's
+//      surface has no templates and no macro-generated functions; that is a
+//      property of today's surface, not a guarantee.
+//   2. It proves a registered cell EXISTS, is CALLED from main(), and (for a
+//      Binds row) its body contains the ScopedRawNewTracking token. It does
+//      NOT prove the cell actually CALLS the function it is registered
+//      against -- a cell registered against the wrong symbol, or one that
+//      never reaches it, passes every assertion here. Closing that would
+//      require the cell to call a named checker the guard cross-references
+//      (e.g. RegisterAllocProbe("Workspace::Reserve")) -- a strictly larger
+//      change than this guard; assertion 4 plus code review carries it in
+//      the interim.
+//   3. It does not see branch coverage inside an entry point (the
+//      composition matrix in §6.1 is a cell-authoring concern, not something
+//      a registry can enforce).
+//   4. ScopedRawNewTracking is thread-local; an allocation on a
+//      library-spawned thread would be invisible. The library spawns no
+//      threads (no <thread> include outside scratch.cpp's
+//      std::this_thread::yield in the drain loop), so this is vacuous today
+//      -- stated so it stays checked if that ever changes.
+//   5. It does not see allocation inside a caller-supplied Allocator; tests
+//      must use DefaultAllocator(), which does not itself call ::operator new.
+//   6. It sees only include/superfaiss/*.h. A symbol exported from a .cpp
+//      with no header declaration is outside the enumeration by
+//      construction -- the correct boundary (an undeclared symbol is not a
+//      public entry point), stated as a boundary, not an absence of one.
+//
+// Registry totals reconcile against the real headers, read by executing the
+// extractor below, not against a hand count: the audit's own ceiling #4
+// (superfaiss-allocation-seam-coverage-audit.md §11) says its arithmetic was
+// not verified by execution and that the correct order is "write the
+// extractor, run it, reconcile ... and pin whatever it actually produces" --
+// this registry is that reconciliation. It sums to 157 entry points (153
+// registry rows; Create's three overloads and Freeze's two collapse into one
+// row each, tallied by the `overloads` field), which matches the audit's own
+// stated total (§1) once kernels.h's `detail::` namespace is counted
+// correctly at 23 symbols -- the audit's own §4.8 prose said "22" while its
+// own comma-separated list in the same paragraph names 23, an internal
+// contradiction caught only by running the extractor and reconciling against
+// the header text itself, exactly the failure mode ceiling #4 warns about.
+// ===========================================================================
+
+namespace
+{
+	enum class AllocBinding { Binds, Trivial, Exempt };
+
+	// One row per distinct (header, symbol) pair. `overloads` is the number
+	// of declarations sharing that symbol in that header (e.g. ScratchBank::
+	// Create's three overloads collapse into one row with overloads == 3);
+	// `cell` is "" for Exempt rows, else the name of the test function that
+	// proves this entry point (a Binds row's cell must use
+	// ScopedRawNewTracking; assertion 4 below).
+	struct AllocCellRow
+	{
+		const char* header;
+		const char* symbol;
+		AllocBinding binding;
+		const char* cell;
+		int overloads;
+	};
+
+	const AllocCellRow kAllocRegistry[] = {
+		// --- alloc.h (26 entry points / 25 rows: Workspace::Workspace has two ctors) ---
+		{"alloc.h", "DefaultAllocator", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "AllocationCount", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "detail::SeamAlloc", AllocBinding::Exempt, "", 1},
+		{"alloc.h", "detail::SeamFree", AllocBinding::Exempt, "", 1},
+		{"alloc.h", "Workspace::Workspace", AllocBinding::Exempt, "", 2},
+		{"alloc.h", "Workspace::~Workspace", AllocBinding::Exempt, "", 1},
+		{"alloc.h", "Workspace::Reserve", AllocBinding::Binds, "TestAllocFlatWorkspaceReserve", 1},
+		{"alloc.h", "Workspace::HeapStorage", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReservedK", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReservedBatch", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReserveQueryScratch", AllocBinding::Binds,
+			"TestAllocFlatWorkspaceReserveQueryScratch", 1},
+		{"alloc.h", "Workspace::QueryScratch", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReserveBiasBits", AllocBinding::Binds,
+			"TestAllocFlatWorkspaceReserveBiasBits", 1},
+		{"alloc.h", "Workspace::BiasBits", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReserveXdQuery", AllocBinding::Binds,
+			"TestAllocFlatWorkspaceReserveXdQuery", 1},
+		{"alloc.h", "Workspace::XdQ8", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::XdScale", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::XdSqSum", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::XdSlots", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::GrowthCount", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReserveBatchOutput", AllocBinding::Binds,
+			"TestAllocFlatWorkspaceReserveBatchOutput", 1},
+		{"alloc.h", "Workspace::BatchOutputHits", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::BatchOutputCounts", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+		{"alloc.h", "Workspace::ReserveIndexScratch", AllocBinding::Binds,
+			"TestAllocFlatWorkspaceReserveIndexScratch", 1},
+		{"alloc.h", "Workspace::IndexScratch", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
+
+		// --- analytics.h (10 entry points, all Binds) ---
+		{"analytics.h", "ScoreXdPair", AllocBinding::Binds, "TestAllocFlatAnalyticsWholeVector", 1},
+		{"analytics.h", "CentroidDistanceCrossDevice", AllocBinding::Binds,
+			"TestAllocFlatAnalyticsWholeVector", 1},
+		{"analytics.h", "MeanNNCrossDevice", AllocBinding::Binds, "TestAllocFlatAnalyticsWholeVector", 1},
+		{"analytics.h", "MaxNNCrossDevice", AllocBinding::Binds, "TestAllocFlatAnalyticsWholeVector", 1},
+		{"analytics.h", "SpreadCrossDevice", AllocBinding::Binds, "TestAllocFlatAnalyticsWholeVector", 1},
+		{"analytics.h", "CentroidDistanceCrossDeviceChannel", AllocBinding::Binds,
+			"TestAllocFlatAnalyticsChannel", 1},
+		{"analytics.h", "MeanNNCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
+		{"analytics.h", "MaxNNCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
+		{"analytics.h", "SpreadCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
+		{"analytics.h", "ProjectionReport", AllocBinding::Binds, "TestAllocFlatProjectionReport", 1},
+
+		// --- bake.h (5 entry points, all Binds) ---
+		{"bake.h", "NormalizeRows", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+		{"bake.h", "QuantizeRowsInt8", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+		{"bake.h", "PadRowsFloat32", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+		{"bake.h", "ValidateSourceRows", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+		{"bake.h", "ComputeChannelInverseNorms", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+
+		// --- compose.h (4 entry points) ---
+		{"compose.h", "MakeCentroid", AllocBinding::Binds, "TestAllocFlatCompose", 1},
+		{"compose.h", "MakeCentroidCrossDevice", AllocBinding::Binds, "TestAllocFlatCompose", 1},
+		{"compose.h", "MakeDirection", AllocBinding::Binds, "TestAllocFlatCompose", 1},
+		{"compose.h", "Margin", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+
+		// --- graph.h (4 entry points, all Binds) ---
+		{"graph.h", "BuildKnnNeighbors", AllocBinding::Binds, "TestS1FlatAllocationBuildKnnNeighbors", 1},
+		{"graph.h", "MutualFilter", AllocBinding::Binds, "TestAllocFlatGraphAndNoveltyMisc", 1},
+		{"graph.h", "BuildDuplicateGroups", AllocBinding::Binds, "TestAllocFlatGraphAndNoveltyMisc", 1},
+		{"graph.h", "ConnectedComponents", AllocBinding::Binds, "TestAllocFlatGraphAndNoveltyMisc", 1},
+
+		// --- inspector_common.h (1 entry point) ---
+		{"inspector_common.h", "DequantizeRowAsQuery", AllocBinding::Trivial,
+			"TestAllocFlatHeaderOnlyMath", 1},
+
+		// --- kernels.h (36 entry points: 12 non-detail Binds + ActiveSimdPath +
+		// 23 detail:: leaves -- the header's own detail namespace has 23 symbols,
+		// not the 22 the audit's §4.8 prose states; its own comma list in the same
+		// paragraph names all 23) ---
+		{"kernels.h", "ScoreChunk", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkPair", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkFused", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkSegmented", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkFusedSegmented", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "DecomposeRowScore", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "QuantizeQueryXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkSegmentedXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreChunkFusedXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "DecomposeRowScoreXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ScoreRowXd", AllocBinding::Binds, "TestAllocFlatKernels", 1},
+		{"kernels.h", "ActiveSimdPath", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotF32Scalar", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2F32Scalar", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotI8Scalar", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2I8Scalar", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotF32ScalarAvx2", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2F32ScalarAvx2", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotI8ScalarAvx2", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2I8ScalarAvx2", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotF32", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2F32", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotI8", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2I8", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotF32Mirror", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2F32Mirror", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotI8Mirror", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2I8Mirror", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::FloatBitsToDouble", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::RoundHalfEvenI32", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::DotI8I8", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::L2SumsI8I8", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::XdComposeBiasValue", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::ForceXdSimdPath", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+		{"kernels.h", "detail::ClearForcedXdSimdPath", AllocBinding::Trivial, "TestAllocFlatKernels", 1},
+
+		// --- matching.h (1 entry point) ---
+		{"matching.h", "MutualNearestMatches", AllocBinding::Binds,
+			"TestS1FlatAllocationMutualNearestMatches", 1},
+
+		// --- novelty.h (4 entry points, all Binds) ---
+		{"novelty.h", "NoveltyScore", AllocBinding::Binds, "TestAllocFlatGraphAndNoveltyMisc", 1},
+		{"novelty.h", "NoveltyProbeDistance", AllocBinding::Binds,
+			"TestS1FlatAllocationNoveltyProbeDistance", 1},
+		{"novelty.h", "KthNeighborDistance", AllocBinding::Binds,
+			"TestS1FlatAllocationKthNeighborDistanceProbe", 1},
+		{"novelty.h", "CalibrateNoveltyBaseline", AllocBinding::Binds,
+			"TestS1FlatAllocationCalibrateNoveltyBaseline", 1},
+
+		// --- pca.h (2 entry points, both Binds) ---
+		{"pca.h", "ComputePrincipalComponents", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+		{"pca.h", "ProjectRowsOntoComponents", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
+
+		// --- query.h (5 entry points, all Binds) ---
+		{"query.h", "Query", AllocBinding::Binds, "TestAllocationFlat", 1},
+		{"query.h", "QueryBatch", AllocBinding::Binds, "TestAllocFlatQueryBatch", 1},
+		{"query.h", "QueryIntersect", AllocBinding::Binds, "TestAllocFlatQueryIntersect", 1},
+		{"query.h", "QueryXd", AllocBinding::Binds, "TestPoolRecallAndContracts", 1},
+		{"query.h", "QueryXdBatch", AllocBinding::Binds, "TestAllocFlatQueryXdBatch", 1},
+
+		// --- scratch.h (40 entry points / 37 rows: Create's three overloads and
+		// Freeze's two collapse into one row each) ---
+		{"scratch.h", "ScratchBank::ScratchBank", AllocBinding::Exempt, "", 1},
+		{"scratch.h", "ScratchBank::~ScratchBank", AllocBinding::Exempt, "", 1},
+		{"scratch.h", "ScratchBank::Create", AllocBinding::Exempt, "", 3},
+		{"scratch.h", "ScratchBank::Destroy", AllocBinding::Exempt, "", 1},
+		{"scratch.h", "ScratchBank::Grow", AllocBinding::Exempt, "", 1},
+		{"scratch.h", "ScratchBank::Load", AllocBinding::Exempt, "", 1},
+		{"scratch.h", "ScratchBank::Relabel", AllocBinding::Binds, "TestRelabelWarmLifetimeSequence", 1},
+		{"scratch.h", "ScratchBank::Append", AllocBinding::Binds, "TestScratchBanks", 1},
+		{"scratch.h", "ScratchBank::Remove", AllocBinding::Binds, "TestScratchBanks", 1},
+		{"scratch.h", "ScratchBank::Snapshot", AllocBinding::Binds, "TestScratchBanks", 1},
+		{"scratch.h", "ScratchBank::Save", AllocBinding::Binds, "TestAllocFlatScratchSave", 1},
+		{"scratch.h", "ScratchBank::Freeze", AllocBinding::Binds, "TestAllocFlatScratchFreeze", 2},
+		{"scratch.h", "ScratchBank::FreezeWithRecall", AllocBinding::Binds,
+			"TestAllocFlatScratchFreezeWithRecall", 1},
+		{"scratch.h", "ScratchBank::MeasureScratchRecall", AllocBinding::Binds, "TestScratchRecall", 1},
+		{"scratch.h", "ScratchBank::MeasureScratchRecallPerChannel", AllocBinding::Binds,
+			"TestAllocFlatScratchMeasureScratchRecallPerChannel", 1},
+		{"scratch.h", "ScratchBank::TryPinReader", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::UnpinReader", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::BeginExclusive", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::EndExclusive", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::IsCreated", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::Count", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::LiveCount", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::Capacity", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::Dims", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::GetPaddedDims", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::GetMetric", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::GetQuantization", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::RetainsFloats", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::Generation", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::RetainedRow", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::QuantizedRowBytes", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::RetainedRowBytes", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::TombstoneWords", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::FreezeLiveCount", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::GetChannelCount", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::GetChannels", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "ScratchBank::RecallReportStale", AllocBinding::Trivial,
+			"TestAllocFlatScratchAccessors", 1},
+
+		// --- topk.h (6 entry points, all Trivial) ---
+		{"topk.h", "Better", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"topk.h", "TopK::Init", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"topk.h", "TopK::Size", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"topk.h", "TopK::Push", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"topk.h", "TopK::Finalize", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"topk.h", "MergeTopK", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+
+		// --- types.h (8 entry points, all Trivial) ---
+		{"types.h", "ScoringMetric", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "ElementSize", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "PaddedDims", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "RowBytes", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "BankBytes", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "ChunkRows", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "ChunkCount", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+		{"types.h", "IsExcluded", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
+
+		// --- validate.h (5 entry points, all Binds) ---
+		{"validate.h", "ValidateBank", AllocBinding::Binds, "TestAllocFlatValidate", 1},
+		{"validate.h", "ValidateQuery", AllocBinding::Binds, "TestAllocFlatValidate", 1},
+		{"validate.h", "ValidateSegments", AllocBinding::Binds, "TestAllocFlatValidate", 1},
+		{"validate.h", "ValidateBiasPairs", AllocBinding::Binds, "TestAllocFlatValidate", 1},
+		{"validate.h", "ValidateBankData", AllocBinding::Binds, "TestAllocFlatValidate", 1},
+	};
+
+	// Belt-and-braces (§7.2): a per-header expected declaration count, so a
+	// mis-parsing extractor fails loudly rather than silently matching
+	// nothing and passing "everything found has a row" vacuously.
+	struct HeaderExpectedCount { const char* header; int count; };
+	const HeaderExpectedCount kHeaderExpectedCounts[] = {
+		{"alloc.h", 26}, {"analytics.h", 10}, {"bake.h", 5}, {"compose.h", 4},
+		{"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
+		{"matching.h", 1}, {"novelty.h", 4}, {"pca.h", 2}, {"query.h", 5},
+		{"scratch.h", 40}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
+		{"validate.h", 5}, {"version.h", 0},
+	};
+
+	bool IsIdentChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; }
+
+	// Blanks preprocessor directive lines (#pragma, #include, ...), replacing
+	// their content with spaces but keeping the newline. Every header opens
+	// with "#pragma once" and one or more "#include"s before its first real
+	// declaration; left unstripped, the scope-detector's backward scan for
+	// "the last statement boundary" walks past them (a preprocessor line
+	// ends in neither '{', '}', nor ';') all the way to the start of the
+	// file, so "namespace superfaiss" is never recognized as the first word
+	// of its own opening statement. None of these headers use a macro that
+	// declares an enumerable symbol, so blanking directive lines costs
+	// nothing real.
+	std::string StripPreprocessorLines(const std::string& src)
+	{
+		std::string out;
+		out.reserve(src.size());
+		size_t i = 0;
+		const size_t n = src.size();
+		while (i < n)
+		{
+			size_t lineEnd = src.find('\n', i);
+			if (lineEnd == std::string::npos) lineEnd = n;
+			const size_t firstNonWs = src.find_first_not_of(" \t\r", i);
+			const bool isPreprocessor = (firstNonWs != std::string::npos && firstNonWs < lineEnd
+				&& src[firstNonWs] == '#');
+			if (isPreprocessor)
+			{
+				out.append(lineEnd - i, ' ');
+			}
+			else
+			{
+				out.append(src, i, lineEnd - i);
+			}
+			if (lineEnd < n) { out.push_back('\n'); }
+			i = lineEnd + 1;
+		}
+		return out;
+	}
+
+	// Strips // and /* */ comments (replaced with spaces; newlines preserved
+	// so downstream position math stays simple) and passes string/char
+	// literals through unexamined -- no target header uses one in a way that
+	// could confuse the scan below; this just keeps a comment's text from
+	// ever being mistaken for code.
+	std::string StripCommentsForExtraction(const std::string& src)
+	{
+		std::string out(src.size(), ' ');
+		size_t i = 0;
+		const size_t n = src.size();
+		bool inLineComment = false, inBlockComment = false, inString = false, inChar = false;
+		while (i < n)
+		{
+			const char c = src[i];
+			const char next = (i + 1 < n) ? src[i + 1] : '\0';
+			if (inLineComment) { if (c == '\n') { inLineComment = false; out[i] = '\n'; } ++i; continue; }
+			if (inBlockComment)
+			{
+				if (c == '*' && next == '/') { inBlockComment = false; i += 2; continue; }
+				if (c == '\n') out[i] = '\n';
+				++i; continue;
+			}
+			if (inString)
+			{
+				out[i] = c;
+				if (c == '\\' && i + 1 < n) { out[i + 1] = src[i + 1]; i += 2; continue; }
+				if (c == '"') inString = false;
+				++i; continue;
+			}
+			if (inChar)
+			{
+				out[i] = c;
+				if (c == '\\' && i + 1 < n) { out[i + 1] = src[i + 1]; i += 2; continue; }
+				if (c == '\'') inChar = false;
+				++i; continue;
+			}
+			if (c == '/' && next == '/') { inLineComment = true; ++i; continue; }
+			if (c == '/' && next == '*') { inBlockComment = true; i += 2; continue; }
+			if (c == '"') { inString = true; out[i] = c; ++i; continue; }
+			if (c == '\'') { inChar = true; out[i] = c; ++i; continue; }
+			out[i] = c;
+			++i;
+		}
+		return out;
+	}
+
+	// Extracts a (symbol -> declaration count) map from one header's
+	// comment-stripped text (§7.2's extractor). Scope rules: a free function
+	// declared directly in namespace superfaiss is unprefixed; one in
+	// namespace detail is "detail::Name"; a public member function,
+	// constructor, or destructor of a class/struct declared directly in
+	// namespace superfaiss is "ClassName::Name" ("ClassName::~Name" for the
+	// destructor). A class's default access is private (nothing is captured
+	// until a "public:" label); a struct's default is public. Declarations
+	// after a "private:"/"protected:" label are not captured. "= delete"
+	// declarations (a deleted copy constructor/assignment) are detected and
+	// excluded -- not callable, per the enumeration rule. Overloads collapse
+	// into one row per symbol name, tallied by count so a changed overload
+	// count is a stale-registry failure (assertion 2), not a silent pass.
+	std::map<std::string, int> ExtractHeaderSymbols(const std::string& text)
+	{
+		std::map<std::string, int> counts;
+		struct Scope { char kind; std::string name; bool isPublic; }; // kind: 'n' namespace, 'c' class/struct, 'o' other
+		std::vector<Scope> stack;
+		const size_t n = text.size();
+
+		auto startsWithWord = [](const std::string& s, const char* w) -> bool
+		{
+			const size_t wl = std::strlen(w);
+			if (s.size() < wl || s.compare(0, wl, w) != 0) return false;
+			return s.size() == wl || !IsIdentChar(s[wl]);
+		};
+		auto currentNamespacePrefix = [&]() -> std::string
+		{
+			if (!stack.empty() && stack.back().kind == 'n' && stack.back().name == "detail") return "detail::";
+			return "";
+		};
+		auto atCapturableDepth = [&]() -> bool
+		{
+			if (stack.empty()) return false;
+			const Scope& top = stack.back();
+			if (top.kind == 'n') return true;
+			if (top.kind == 'c') return top.isPublic;
+			return false;
+		};
+
+		size_t i = 0;
+		while (i < n)
+		{
+			const char c = text[i];
+			if (c == '{')
+			{
+				size_t j = i;
+				while (j > 0 && text[j - 1] != '{' && text[j - 1] != '}' && text[j - 1] != ';') --j;
+				size_t a = text.find_first_not_of(" \t\r\n", j);
+				std::string trimmed;
+				if (a != std::string::npos && a < i)
+				{
+					size_t b = i;
+					while (b > a && std::isspace(static_cast<unsigned char>(text[b - 1]))) --b;
+					trimmed = text.substr(a, b - a);
+				}
+				if (startsWithWord(trimmed, "namespace"))
+				{
+					std::string rest = trimmed.substr(std::strlen("namespace"));
+					size_t p = rest.find_first_not_of(" \t\r\n");
+					stack.push_back({'n', (p == std::string::npos) ? std::string() : rest.substr(p), true});
+				}
+				else if (startsWithWord(trimmed, "class") || startsWithWord(trimmed, "struct"))
+				{
+					const bool isStructKind = startsWithWord(trimmed, "struct");
+					const size_t kwLen = isStructKind ? std::strlen("struct") : std::strlen("class");
+					std::string rest = trimmed.substr(kwLen);
+					size_t p = rest.find_first_not_of(" \t\r\n");
+					rest = (p == std::string::npos) ? std::string() : rest.substr(p);
+					size_t end = rest.find_first_of(" \t\r\n:");
+					std::string name = (end == std::string::npos) ? rest : rest.substr(0, end);
+					stack.push_back({'c', name, isStructKind});
+				}
+				else
+				{
+					stack.push_back({'o', std::string(), false});
+				}
+				++i;
+				continue;
+			}
+			if (c == '}')
+			{
+				if (!stack.empty()) stack.pop_back();
+				++i;
+				continue;
+			}
+			if (!stack.empty() && stack.back().kind == 'c')
+			{
+				if (text.compare(i, 7, "public:") == 0 && (i + 7 >= n || !IsIdentChar(text[i + 7])))
+				{
+					stack.back().isPublic = true; i += 7; continue;
+				}
+				if (text.compare(i, 8, "private:") == 0 && (i + 8 >= n || !IsIdentChar(text[i + 8])))
+				{
+					stack.back().isPublic = false; i += 8; continue;
+				}
+				if (text.compare(i, 10, "protected:") == 0 && (i + 10 >= n || !IsIdentChar(text[i + 10])))
+				{
+					stack.back().isPublic = false; i += 10; continue;
+				}
+			}
+			if (c == '(' && atCapturableDepth())
+			{
+				// Function-pointer field syntax, "RetType (*name)(args);" -- a
+				// POD struct's callback member (Allocator::alloc/free,
+				// ScratchArchive::write/read), not a function declaration in
+				// our sense. Detected by '*' as the first token inside this
+				// paren; skipped to the next top-level ';' unconsumed by any
+				// capture so the return-type token before it (e.g. "void",
+				// "bool") is never mistaken for a declared symbol's name.
+				size_t afterOpen = i + 1;
+				while (afterOpen < n && std::isspace(static_cast<unsigned char>(text[afterOpen]))) ++afterOpen;
+				if (afterOpen < n && text[afterOpen] == '*')
+				{
+					const size_t semi = text.find(';', i);
+					i = (semi == std::string::npos) ? n : semi + 1;
+					continue;
+				}
+				size_t k = i;
+				while (k > 0 && std::isspace(static_cast<unsigned char>(text[k - 1]))) --k;
+				const size_t identEnd = k;
+				while (k > 0 && IsIdentChar(text[k - 1])) --k;
+				const std::string ident = text.substr(k, identEnd - k);
+				const bool isDtor = (k > 0 && text[k - 1] == '~');
+				size_t p = isDtor ? k - 1 : k;
+				while (p > 0 && std::isspace(static_cast<unsigned char>(text[p - 1]))) --p;
+				const bool precededByEquals = (p > 0 && text[p - 1] == '=');
+
+				if (!ident.empty() && !precededByEquals)
+				{
+					int depth = 0;
+					size_t k2 = i;
+					for (; k2 < n; ++k2)
+					{
+						if (text[k2] == '(') ++depth;
+						else if (text[k2] == ')') { --depth; if (depth == 0) { ++k2; break; } }
+					}
+					size_t p2 = k2;
+					while (p2 < n && std::isspace(static_cast<unsigned char>(text[p2]))) ++p2;
+					bool deleted = false;
+					if (p2 < n && text[p2] == '=')
+					{
+						size_t p3 = p2 + 1;
+						while (p3 < n && std::isspace(static_cast<unsigned char>(text[p3]))) ++p3;
+						deleted = (text.compare(p3, 6, "delete") == 0);
+					}
+					if (!deleted)
+					{
+						std::string symbol;
+						if (!stack.empty() && stack.back().kind == 'c')
+						{
+							symbol = stack.back().name + "::" + (isDtor ? "~" : "") + ident;
+						}
+						else
+						{
+							symbol = currentNamespacePrefix() + ident;
+						}
+						counts[symbol]++;
+					}
+					size_t afterParams = k2;
+					if (p2 < n && text[p2] == ':' && (p2 + 1 >= n || text[p2 + 1] != ':'))
+					{
+						size_t braceSearch = p2 + 1;
+						while (braceSearch < n && text[braceSearch] != '{' && text[braceSearch] != ';')
+							++braceSearch;
+						afterParams = braceSearch;
+					}
+					i = afterParams;
+					continue;
+				}
+			}
+			++i;
+		}
+		return counts;
+	}
+
+	// Reads every include/superfaiss/*.h via std::filesystem::directory_iterator
+	// (never a hardcoded header list -- a new header file enters the
+	// enumeration automatically) and returns header -> (symbol -> count).
+	std::map<std::string, std::map<std::string, int>> ExtractAllEntryPoints(std::string* outError)
+	{
+		std::map<std::string, std::map<std::string, int>> result;
+		std::error_code ec;
+		auto dirIt = std::filesystem::directory_iterator("include/superfaiss", ec);
+		if (ec)
+		{
+			*outError = "could not open include/superfaiss (run from the repo root, "
+				"matching build.bat's own working directory): " + ec.message();
+			return result;
+		}
+		for (const auto& entry : dirIt)
+		{
+			if (!entry.is_regular_file()) continue;
+			const std::filesystem::path& path = entry.path();
+			if (path.extension() != ".h") continue;
+			const std::string headerName = path.filename().string();
+			const std::string raw = ReadWholeSourceFile(path.string().c_str());
+			if (raw.empty())
+			{
+				*outError = "could not read " + path.string() + " (run from the repo root)";
+				return result;
+			}
+			const std::string stripped = StripCommentsForExtraction(StripPreprocessorLines(raw));
+			result[headerName] = ExtractHeaderSymbols(stripped);
+		}
+		return result;
+	}
+
+	// Finds "static void <cell>(" 's function body [ '{' , matching '}' )
+	// substring in `src`. Empty string if not found or unbalanced.
+	std::string FindFunctionBody(const std::string& src, const std::string& cellName)
+	{
+		const std::string needle = "static void " + cellName + "(";
+		const size_t defPos = src.find(needle);
+		if (defPos == std::string::npos) return std::string();
+		size_t bracePos = src.find('{', defPos);
+		if (bracePos == std::string::npos) return std::string();
+		int depth = 0;
+		size_t i = bracePos;
+		for (; i < src.size(); ++i)
+		{
+			if (src[i] == '{') ++depth;
+			else if (src[i] == '}') { --depth; if (depth == 0) { ++i; break; } }
+		}
+		if (depth != 0) return std::string();
+		return src.substr(bracePos, i - bracePos);
+	}
+}
+
+static void TestAllocationCellRegistryComplete()
+{
+	std::string err;
+	const auto extracted = ExtractAllEntryPoints(&err);
+	CHECK_MSG(err.empty(), "%s", err.c_str());
+
+	for (const auto& expected : kHeaderExpectedCounts)
+	{
+		const auto foundHeader = extracted.find(expected.header);
+		int total = 0;
+		if (foundHeader != extracted.end())
+		{
+			for (const auto& sym : foundHeader->second) total += sym.second;
+		}
+		CHECK_MSG(total == expected.count,
+			"%s: extractor found %d entry-point declarations, expected %d "
+			"(either the extractor's own reading changed, or a header gained/"
+			"lost a declaration -- see this test's file comment for what the "
+			"extractor can and cannot see)",
+			expected.header, total, expected.count);
+	}
+
+	const std::string testSrc = ReadWholeSourceFile("tests/test_main.cpp");
+	CHECK_MSG(!testSrc.empty(), "could not read tests/test_main.cpp (run from the repo root)");
+	size_t mainBraceStart = std::string::npos, mainBraceEnd = std::string::npos;
+	const size_t mainPos = testSrc.find("\nint main()");
+	if (mainPos != std::string::npos)
+	{
+		mainBraceStart = testSrc.find('{', mainPos);
+		if (mainBraceStart != std::string::npos)
+		{
+			int depth = 0;
+			size_t i = mainBraceStart;
+			for (; i < testSrc.size(); ++i)
+			{
+				if (testSrc[i] == '{') ++depth;
+				else if (testSrc[i] == '}') { --depth; if (depth == 0) { mainBraceEnd = i; break; } }
+			}
+		}
+	}
+	CHECK_MSG(mainBraceStart != std::string::npos && mainBraceEnd != std::string::npos,
+		"could not locate int main()'s body span in tests/test_main.cpp");
+	const std::string mainBody =
+		(mainBraceStart != std::string::npos && mainBraceEnd != std::string::npos)
+		? testSrc.substr(mainBraceStart, mainBraceEnd - mainBraceStart) : std::string();
+
+	// Assertion 1: no unregistered entry point -- every (header, symbol) the
+	// extractor found has a registry row.
+	for (const auto& headerEntry : extracted)
+	{
+		for (const auto& symEntry : headerEntry.second)
+		{
+			bool found = false;
+			for (const auto& row : kAllocRegistry)
+			{
+				if (headerEntry.first == row.header && symEntry.first == row.symbol) { found = true; break; }
+			}
+			CHECK_MSG(found,
+				"%s: %s is declared in the public header but has no registry row -- "
+				"a new public entry point must be classified (Binds/Trivial/Exempt) "
+				"and, if binding, routed to an allocation cell (coverage audit §7)",
+				headerEntry.first.c_str(), symEntry.first.c_str());
+		}
+	}
+
+	// Assertions 2-4: every registry row is live.
+	for (const auto& row : kAllocRegistry)
+	{
+		const auto headerIt = extracted.find(row.header);
+		int foundCount = 0;
+		if (headerIt != extracted.end())
+		{
+			const auto symIt = headerIt->second.find(row.symbol);
+			if (symIt != headerIt->second.end()) foundCount = symIt->second;
+		}
+		// Assertion 2: no stale registry row (symbol gone, renamed, or
+		// overload count changed).
+		CHECK_MSG(foundCount == row.overloads,
+			"%s: registry row '%s' expects %d declaration(s), header has %d -- "
+			"the symbol was renamed, removed, or its overload count changed "
+			"(coverage audit §7)",
+			row.header, row.symbol, row.overloads, foundCount);
+
+		if (row.binding == AllocBinding::Exempt)
+		{
+			continue;
+		}
+
+		// Assertion 3: the registered cell exists as a definition and is
+		// called from main()'s body.
+		const std::string body = FindFunctionBody(testSrc, row.cell);
+		CHECK_MSG(!body.empty(),
+			"%s: registry row '%s' names cell '%s', which is not defined as "
+			"'static void %s(' in tests/test_main.cpp (coverage audit §7)",
+			row.header, row.symbol, row.cell, row.cell);
+		const std::string callNeedle = std::string(row.cell) + "();";
+		CHECK_MSG(mainBody.find(callNeedle) != std::string::npos,
+			"%s: registry row '%s' names cell '%s', which is not called from "
+			"main() (coverage audit §7 -- a cell that exists but never runs "
+			"proves nothing)",
+			row.header, row.symbol, row.cell);
+
+		// Assertion 4 (the false-green closer): a cell registered against a
+		// Binds row must use the raw-new instrument, not AllocationCount()
+		// alone (§3).
+		if (row.binding == AllocBinding::Binds && !body.empty())
+		{
+			CHECK_MSG(body.find("ScopedRawNewTracking") != std::string::npos,
+				"%s: registry row '%s' is Binds but cell '%s' does not contain "
+				"ScopedRawNewTracking -- an AllocationCount()-only assertion is "
+				"structurally blind to a raw ::operator new (§3) and this row "
+				"would read swept while proving nothing (coverage audit §7)",
+				row.header, row.symbol, row.cell);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // §6.5/§6.6 -- grouped allocation-flatness cells for the remaining BINDS and
 // BINDS-TRIVIAL surface (coverage audit F-3: nine of eleven absolute
 // "allocation-free"/"no memory is allocated" contract claims were entirely
@@ -18602,11 +19402,16 @@ int main()
 	// Test design: Claude/Curie/superfaiss-v3.2-s4-s1-shared-helper-workspace-
 	// tracking-test-design-2026-07-19.md.
 	TestS4SharedRowDecodeHelperAllThreeModules();
+	TestAllocFlatGraphAndNoveltyMisc();
 	TestS1FlatAllocationBuildKnnNeighbors();
 	TestS1FlatAllocationCalibrateNoveltyBaseline();
 	TestS1FlatAllocationNoveltyProbeDistance();
 	TestS1FlatAllocationKthNeighborDistanceProbe();
 	TestS1FlatAllocationMutualNearestMatches();
+
+	// Coverage audit §7 -- the structural registry guard. Runs last so every
+	// cell it references above has already executed at least once.
+	TestAllocationCellRegistryComplete();
 
 	std::printf("superfaiss tests: %d checks, %d failures (simd path: %s)\n",
 		GChecks, GFailures,
