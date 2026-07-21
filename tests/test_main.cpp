@@ -2778,6 +2778,45 @@ static void TestScratchGeometryCeilings()
 	}
 }
 
+// A Cosine channel bank with zero rows is representable: the inverse sub-norms are one
+// per row, so no rows require none. This is the shape a channel-carrying scratch bank
+// graduates into once every row has been removed — an emptied channel bank is still a
+// channel bank, and rejecting it forced the graduation to drop its channels instead.
+static void TestEmptyCosineChannelBankValidates()
+{
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		BankView empty;
+		empty.rows = nullptr;
+		empty.scales = nullptr;
+		empty.count = 0;
+		empty.dims = 64;
+		empty.paddedDims = PaddedDims(64, quant);
+		empty.quant = quant;
+		empty.metric = Metric::Cosine;
+		empty.channels = channels;
+		empty.channelCount = 2;
+		empty.channelInvNorms = nullptr;
+		CHECK_MSG(ValidateBank(empty) == Status::Ok,
+			"zero-row Cosine channel bank rejected (quant %d)", static_cast<int>(quant));
+		CHECK(ValidateBankData(empty, nullptr) == Status::Ok);
+	}
+	// With rows present the array is still required — the relaxation is about count, not
+	// about the rule.
+	{
+		Rng rng(0x4E5701ull);
+		const int32_t dims = 64, count = 8;
+		TestBank bank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+		BankView view = bank.view;
+		view.channels = channels;
+		view.channelCount = 2;
+		view.channelInvNorms = nullptr;
+		CHECK_MSG(ValidateBank(view) == Status::BadFormat,
+			"a populated Cosine channel bank must still require its sub-norms");
+	}
+}
+
 // PeekScratchArchive reports a serialized archive's geometry and — the reason it exists —
 // the exact byte length a Load consumes, so a host that appends its own trailer can find
 // and validate that trailer BEFORE committing the load.
@@ -12730,17 +12769,17 @@ static void TestPerChannelRecallOracle()
 	}
 }
 
-// [hole] Version/header coherence. version.h must declare v3.0.0 for the v3.0 release. RED now
-// (it reads 2/5/0); the header is bumped separately. Kept as a standalone assertion so the release-version
-// truth has a test, not just a header edit.
+// Version/header coherence: version.h declares the release this tree IS. Kept as a
+// standalone assertion so the release-version truth has a test, not just a header edit —
+// the CHANGELOG's newest entry and these three numbers move together or the suite says so.
 static void TestVersionHeaderCoherence()
 {
 	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
-		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.1, got %d", SUPERFAISS_VERSION_MAJOR);
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.2, got %d", SUPERFAISS_VERSION_MAJOR);
 	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 2,
-		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.1, got %d", SUPERFAISS_VERSION_MINOR);
-	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 1,
-		"SUPERFAISS_VERSION_PATCH should be 1 for v3.2.1, got %d", SUPERFAISS_VERSION_PATCH);
+		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.2, got %d", SUPERFAISS_VERSION_MINOR);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 2,
+		"SUPERFAISS_VERSION_PATCH should be 2 for v3.2.2, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 // ===========================================================================
@@ -19626,6 +19665,7 @@ int main()
 	// V3.2.2: public-path geometry ceilings, and the archive peek the host trailer
 	// validation is built on.
 	TestScratchGeometryCeilings();
+	TestEmptyCosineChannelBankValidates();
 	TestPeekScratchArchive();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every

@@ -29,6 +29,12 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   `kMaxCrossDeviceDims` dims) before any size is computed, returning `InvalidArgument`.
   The archive loader already applied these caps; direct construction did not, and
   `Grow` bounded its request only against the current capacity.
+- **A Cosine channel bank with zero rows was unrepresentable.** `ValidateBank` required
+  the per-channel inverse sub-norm array whenever a Cosine bank carried channels, but
+  those norms are one per row — a bank with no rows requires none, and no scan reads the
+  array at zero rows. The rule now applies only when `count > 0`. The shape is not
+  degenerate: it is what a channel-carrying scratch bank graduates into once every row
+  has been removed, and rejecting it forced that graduation to drop its channels.
 
 ## [3.2.1] — 2026-07-21
 
