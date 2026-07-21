@@ -7804,13 +7804,26 @@ static void TestBankAnalytics()
 		CHECK(MeanNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
 			nbuf.data(), warm, &m) == Status::Ok);
 		const uint64_t before = AllocationCount();
-		CHECK(MeanNNCrossDevice(e.view, nullptr, c.view, nullptr, qbuf.data(), hbuf.data(),
-			nbuf.data(), warm, &m) == Status::Ok); // smaller source count
-		CHECK(MaxNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
-			nbuf.data(), warm, &m) == Status::Ok);
+		const uint64_t growthBefore = warm.GrowthCount();
+		{
+			// G1 (coverage audit §6.5): raw-new instrument, not seam-only, and
+			// >=10 iterations rather than one call each.
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 10; ++i)
+			{
+				CHECK(MeanNNCrossDevice(e.view, nullptr, c.view, nullptr, qbuf.data(), hbuf.data(),
+					nbuf.data(), warm, &m) == Status::Ok); // smaller source count
+				CHECK(MaxNNCrossDevice(c.view, nullptr, e.view, nullptr, qbuf.data(), hbuf.data(),
+					nbuf.data(), warm, &m) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"MeanNNCrossDevice/MaxNNCrossDevice allocated %llu time(s) outside the Workspace seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
+		}
 		CHECK_MSG(AllocationCount() == before, "warm analytics workspace grew: %llu -> %llu",
 			static_cast<unsigned long long>(before),
 			static_cast<unsigned long long>(AllocationCount()));
+		CHECK(warm.GrowthCount() == growthBefore);
 	}
 
 	// --- T-V2.5-2 forced-path sweep + golden hash (GOLD) ---
@@ -17538,6 +17551,567 @@ static void TestS4SharedRowDecodeHelperAllThreeModules()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// §6.5/§6.6 -- grouped allocation-flatness cells for the remaining BINDS and
+// BINDS-TRIVIAL surface (coverage audit F-3: nine of eleven absolute
+// "allocation-free"/"no memory is allocated" contract claims were entirely
+// unproven). Each cell drives its family >=10 times inside one
+// ScopedRawNewTracking scope after a warm pass, asserting raw 0 (+ seam flat
+// where a Workspace is in play).
+
+// G1 remainder (CentroidDistanceCrossDevice, SpreadCrossDevice, ScoreXdPair)
+// -- MeanNNCrossDevice/MaxNNCrossDevice are upgraded in place above (T-V2.5).
+static void TestAllocFlatAnalyticsWholeVector()
+{
+	Rng rng(0x7A01);
+	const int32_t dims = 32, count = 64;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::L2);
+	const int32_t idxA[4] = {0, 1, 2, 3};
+	const int32_t idxB[4] = {4, 5, 6, 7};
+	AlignedBuf scratchA(static_cast<size_t>(bank.view.paddedDims));
+	AlignedBuf scratchB(static_cast<size_t>(bank.view.paddedDims));
+	AlignedBuf q8A(static_cast<size_t>(bank.view.paddedDims));
+	AlignedBuf q8B(static_cast<size_t>(bank.view.paddedDims));
+	double scaleA = 0.0, scaleB = 0.0;
+	int64_t sqA = 0, sqB = 0;
+	CHECK(MakeCentroidCrossDevice(bank.view, idxA, 4, nullptr, nullptr, q8A.I8(), &scaleA, &sqA) == Status::Ok);
+	CHECK(MakeCentroidCrossDevice(bank.view, idxB, 4, nullptr, nullptr, q8B.I8(), &scaleB, &sqB) == Status::Ok);
+	const XdQuery xa{q8A.I8(), scaleA, sqA};
+	const XdQuery xb{q8B.I8(), scaleB, sqB};
+
+	float distance = 0.0f, spread = 0.0f, pairScore = 0.0f;
+	// Warm.
+	CHECK(CentroidDistanceCrossDevice(bank.view, idxA, 4, nullptr, nullptr, bank.view, idxB, 4,
+			nullptr, nullptr, Metric::L2, scratchA.I8(), scratchB.I8(), &distance) == Status::Ok);
+	CHECK(SpreadCrossDevice(bank.view, idxA, 4, nullptr, Reduce::Mean, scratchA.I8(), &spread) == Status::Ok);
+	CHECK(ScoreXdPair(xa, xb, bank.view.paddedDims, Metric::L2, &pairScore) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(CentroidDistanceCrossDevice(bank.view, idxA, 4, nullptr, nullptr, bank.view, idxB, 4,
+					nullptr, nullptr, Metric::L2, scratchA.I8(), scratchB.I8(), &distance) == Status::Ok);
+			CHECK(SpreadCrossDevice(bank.view, idxA, 4, nullptr, Reduce::Mean, scratchA.I8(), &spread) == Status::Ok);
+			CHECK(ScoreXdPair(xa, xb, bank.view.paddedDims, Metric::L2, &pairScore) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"CentroidDistanceCrossDevice/SpreadCrossDevice/ScoreXdPair allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// G2: the four *Channel analytics variants.
+static void TestAllocFlatAnalyticsChannel()
+{
+	Rng rng(0x7A02);
+	const int32_t dims = 32, count = 64;
+	const std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
+	GChannelBank cb(std::vector<float>(), 0, 0, Quantization::Int8, Metric::L2, ch); // placeholder, replaced below
+	(void)cb;
+	// Build directly against a channel-carrying TestBank via GChannelBank's own ctor path.
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GChannelBank bank(src, count, dims, Quantization::Int8, Metric::L2, ch);
+	const int32_t idxA[4] = {0, 1, 2, 3};
+	const int32_t idxB[4] = {4, 5, 6, 7};
+	AlignedBuf scratchA(static_cast<size_t>(bank.bank.view.paddedDims));
+	AlignedBuf scratchB(static_cast<size_t>(bank.bank.view.paddedDims));
+	Workspace ws;
+	std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+	std::vector<Hit> hbuf(static_cast<size_t>(count));
+	std::vector<int32_t> nbuf(static_cast<size_t>(count));
+	float distance = 0.0f, meanNN = 0.0f, maxNN = 0.0f, spread = 0.0f;
+
+	CHECK(CentroidDistanceCrossDeviceChannel(bank.bank.view, idxA, 4, nullptr, nullptr,
+			bank.bank.view, idxB, 4, nullptr, nullptr, Metric::L2, 0,
+			scratchA.I8(), scratchB.I8(), &distance) == Status::Ok);
+	CHECK(MeanNNCrossDeviceChannel(bank.bank.view, nullptr, bank.bank.view, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &meanNN) == Status::Ok);
+	CHECK(MaxNNCrossDeviceChannel(bank.bank.view, nullptr, bank.bank.view, nullptr, 0,
+			qbuf.data(), hbuf.data(), nbuf.data(), ws, &maxNN) == Status::Ok);
+	CHECK(SpreadCrossDeviceChannel(bank.bank.view, idxA, 4, nullptr, Reduce::Mean, 0,
+			scratchA.I8(), &spread) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(CentroidDistanceCrossDeviceChannel(bank.bank.view, idxA, 4, nullptr, nullptr,
+					bank.bank.view, idxB, 4, nullptr, nullptr, Metric::L2, 0,
+					scratchA.I8(), scratchB.I8(), &distance) == Status::Ok);
+			CHECK(MeanNNCrossDeviceChannel(bank.bank.view, nullptr, bank.bank.view, nullptr, 0,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &meanNN) == Status::Ok);
+			CHECK(MaxNNCrossDeviceChannel(bank.bank.view, nullptr, bank.bank.view, nullptr, 0,
+					qbuf.data(), hbuf.data(), nbuf.data(), ws, &maxNN) == Status::Ok);
+			CHECK(SpreadCrossDeviceChannel(bank.bank.view, idxA, 4, nullptr, Reduce::Mean, 0,
+					scratchA.I8(), &spread) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"*CrossDeviceChannel analytics allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// G3: ProjectionReport, with and without groupBits/outSeparation.
+static void TestAllocFlatProjectionReport()
+{
+	Rng rng(0x7A03);
+	const int32_t dims = 24, count = 40;
+	TestBank bank(rng, count, dims, Quantization::Float32, Metric::Dot);
+	std::vector<float> direction(static_cast<size_t>(bank.view.paddedDims), 0.0f);
+	direction[0] = 1.0f;
+	std::vector<float> projections(static_cast<size_t>(count));
+	std::vector<uint32_t> groupBits(static_cast<size_t>((count + 31) / 32), 0xAAAAAAAAu);
+	float separation = 0.0f;
+
+	CHECK(ProjectionReport(bank.view, direction.data(), nullptr, projections.data(), nullptr) == Status::Ok);
+	CHECK(ProjectionReport(bank.view, direction.data(), groupBits.data(), projections.data(), &separation) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(ProjectionReport(bank.view, direction.data(), nullptr, projections.data(), nullptr) == Status::Ok);
+			CHECK(ProjectionReport(bank.view, direction.data(), groupBits.data(), projections.data(), &separation) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ProjectionReport allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// G4: MakeCentroid, MakeDirection (MakeCentroidCrossDevice is upgraded in
+// place above, T-V2.4-P11); the sub-range (offset/length) leg is added here.
+static void TestAllocFlatCompose()
+{
+	Rng rng(0x7A04);
+	const int32_t dims = 32, count = 40;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::Dot);
+	const int32_t idx[4] = {0, 1, 2, 3};
+	std::vector<float> centroid(static_cast<size_t>(bank.view.paddedDims));
+	AlignedBuf subRange(static_cast<size_t>(bank.view.paddedDims));
+	double subScale = 0.0;
+	int64_t subSq = 0;
+
+	AlignedBuf qa(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+	AlignedBuf qb(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+	std::vector<float> rawA(dims), rawB(dims);
+	for (auto& v : rawA) v = rng.NextFloat();
+	for (auto& v : rawB) v = rng.NextFloat();
+	PadQuery(rawA, bank.view.paddedDims, qa.F32());
+	PadQuery(rawB, bank.view.paddedDims, qb.F32());
+	std::vector<float> direction(static_cast<size_t>(bank.view.paddedDims));
+
+	CHECK(MakeCentroid(bank.view, idx, 4, centroid.data()) == Status::Ok);
+	CHECK(MakeDirection(qa.F32(), qb.F32(), dims, bank.view.paddedDims, direction.data()) == Status::Ok);
+	CHECK(MakeCentroidCrossDevice(bank.view, idx, 4, nullptr, nullptr, subRange.I8(), &subScale, &subSq,
+			0, 16) == Status::Ok); // sub-range leg
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(MakeCentroid(bank.view, idx, 4, centroid.data()) == Status::Ok);
+			CHECK(MakeDirection(qa.F32(), qb.F32(), dims, bank.view.paddedDims, direction.data()) == Status::Ok);
+			CHECK(MakeCentroidCrossDevice(bank.view, idx, 4, nullptr, nullptr, subRange.I8(), &subScale, &subSq,
+					0, 16) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"MakeCentroid/MakeDirection/MakeCentroidCrossDevice(sub-range) allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// G5: all twelve non-detail kernels.h primitives, ActiveSimdPath, and all
+// 22 detail:: leaves -- the cheapest rows in the matrix, one loop each.
+static void TestAllocFlatKernels()
+{
+	Rng rng(0x7A05);
+	const int32_t dims = 48, count = 32, k = 6;
+	TestBank i8Bank(rng, count, dims, Quantization::Int8, Metric::L2);
+	TestBank f32Bank(rng, count, dims, Quantization::Float32, Metric::L2);
+	AlignedBuf qi8(static_cast<size_t>(i8Bank.view.paddedDims) * sizeof(float));
+	AlignedBuf qf32(static_cast<size_t>(f32Bank.view.paddedDims) * sizeof(float));
+	std::vector<float> raw(dims);
+	for (auto& v : raw) v = rng.NextFloat();
+	PadQuery(raw, i8Bank.view.paddedDims, qi8.F32());
+	PadQuery(raw, f32Bank.view.paddedDims, qf32.F32());
+
+	// Fixed-size stack storage for every kernel call below -- no std::vector
+	// inside the tracked loop, so the fixture's own allocator traffic (which
+	// ScopedRawNewTracking would also see, since it hooks global ::operator
+	// new) never contaminates the measurement.
+	Hit heap[6], heapA[6], heapB[6], heapFused[6], heapSeg[6], heapFusedSeg[6],
+		heapXd[6], heapSegXd[6], heapFusedXd[6];
+	TopK topk;
+	float contributions[dims];
+	const QuerySegment segs[1] = {{0, 48, 1.0f}}; // i8Bank.view.paddedDims == 48 (dims=48, int8 grid 16)
+	float qq[96]; // 2 x paddedDims (paddedDims <= 48 here)
+
+	XdQuery xq{};
+	AlignedBuf xq8(static_cast<size_t>(i8Bank.view.paddedDims));
+	double xScale = 0.0;
+	int64_t xSqSum = 0;
+	QuantizeQueryXd(qi8.F32(), i8Bank.view.paddedDims, xq8.I8(), &xScale, &xSqSum);
+	xq = XdQuery{xq8.I8(), xScale, xSqSum};
+	AlignedBuf outQ8(static_cast<size_t>(i8Bank.view.paddedDims));
+
+	const int8_t* row0I8 = static_cast<const int8_t*>(i8Bank.view.rows);
+	const float row0Scale = i8Bank.view.scales[0];
+	const float* row0F32 = static_cast<const float*>(f32Bank.view.rows);
+
+	CHECK(i8Bank.view.paddedDims <= 48); // qq's fixed 2x sizing assumption
+
+	auto driveOnce = [&]() {
+		topk.Init(heap, k, Metric::L2);
+		ScoreChunk(i8Bank.view, qi8.F32(), 0, nullptr, topk);
+		TopK topkPairA, topkPairB;
+		topkPairA.Init(heapA, k, Metric::L2);
+		topkPairB.Init(heapB, k, Metric::L2);
+		ScoreChunkPair(i8Bank.view, qi8.F32(), qi8.F32(), 0, nullptr, topkPairA, topkPairB);
+		TopK topkFused;
+		topkFused.Init(heapFused, k, Metric::L2);
+		std::memcpy(qq, qi8.F32(), static_cast<size_t>(i8Bank.view.paddedDims) * sizeof(float));
+		std::memcpy(qq + i8Bank.view.paddedDims, qi8.F32(), static_cast<size_t>(i8Bank.view.paddedDims) * sizeof(float));
+		ScoreChunkFused(i8Bank.view, qq, 2, 0, nullptr, topkFused);
+		DecomposeRowScore(i8Bank.view, qi8.F32(), 0, segs, 1, contributions);
+		TopK topkSeg;
+		topkSeg.Init(heapSeg, k, Metric::L2);
+		ScoreChunkSegmented(i8Bank.view, qi8.F32(), 0, nullptr, segs, 1, topkSeg);
+		TopK topkFusedSeg;
+		topkFusedSeg.Init(heapFusedSeg, k, Metric::L2);
+		ScoreChunkFusedSegmented(i8Bank.view, qq, 2, 0, nullptr, segs, 1, topkFusedSeg);
+		double sc = 0.0; int64_t sq = 0;
+		QuantizeQueryXd(qi8.F32(), i8Bank.view.paddedDims, outQ8.I8(), &sc, &sq);
+		TopK topkXd;
+		topkXd.Init(heapXd, k, Metric::L2);
+		ScoreChunkXd(i8Bank.view, xq, 0, nullptr, topkXd);
+		TopK topkSegXd;
+		topkSegXd.Init(heapSegXd, k, Metric::L2);
+		ScoreChunkSegmentedXd(i8Bank.view, xq, 0, nullptr, segs, 1, topkSegXd);
+		TopK topkFusedXd;
+		topkFusedXd.Init(heapFusedXd, k, Metric::L2);
+		const XdQuery xqs[2] = {xq, xq};
+		ScoreChunkFusedXd(i8Bank.view, xqs, 2, 0, nullptr, nullptr, 0, topkFusedXd);
+		DecomposeRowScoreXd(i8Bank.view, xq, 0, segs, 1, contributions);
+		ScoreRowXd(i8Bank.view, xq, 0);
+		(void)ActiveSimdPath();
+
+		detail::DotF32Scalar(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::L2F32Scalar(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::DotI8Scalar(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::L2I8Scalar(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::DotF32ScalarAvx2(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::L2F32ScalarAvx2(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::DotI8ScalarAvx2(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::L2I8ScalarAvx2(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::DotF32(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::L2F32(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::DotI8(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::L2I8(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::DotF32Mirror(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::L2F32Mirror(row0F32, qf32.F32(), f32Bank.view.paddedDims);
+		detail::DotI8Mirror(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::L2I8Mirror(row0I8, row0Scale, qi8.F32(), i8Bank.view.paddedDims);
+		detail::FloatBitsToDouble(1.5f);
+		detail::RoundHalfEvenI32(2.5);
+		detail::DotI8I8(row0I8, xq8.I8(), i8Bank.view.paddedDims);
+		int32_t crossOut = 0, rowSqOut = 0;
+		detail::L2SumsI8I8(row0I8, xq8.I8(), i8Bank.view.paddedDims, &crossOut, &rowSqOut);
+		detail::XdComposeBiasValue(1.0f, 0.5f);
+		detail::ForceXdSimdPath(SimdPath::Scalar);
+		detail::ClearForcedXdSimdPath();
+	};
+
+	driveOnce(); // warm
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			driveOnce();
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"kernels.h primitives allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// G6: all five validate.h functions, each on a VALID input and a REJECTING
+// input -- an error path is where a diagnostic string would be built.
+static void TestAllocFlatValidate()
+{
+	Rng rng(0x7A06);
+	const int32_t dims = 32, count = 20;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+	AlignedBuf q(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+	std::vector<float> raw(dims);
+	for (auto& v : raw) v = rng.NextFloat();
+	PadQuery(raw, bank.view.paddedDims, q.F32());
+	const QuerySegment goodSegs[1] = {{0, bank.view.paddedDims, 1.0f}};
+	const QuerySegment badSegs[1] = {{0, bank.view.paddedDims + 16, 1.0f}}; // past the row
+	const BiasPair goodPairs[1] = {{0, 0.5f}};
+	const BiasPair badPairs[1] = {{count, 0.5f}}; // out of range
+	std::vector<uint32_t> seenBits(static_cast<size_t>((count + 31) / 32));
+	BankView badBank = bank.view;
+	badBank.paddedDims = -1; // triggers ValidateBank's structural rejection
+	AlignedBuf badQuery(static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+	std::memcpy(badQuery.F32(), q.F32(), static_cast<size_t>(bank.view.paddedDims) * sizeof(float));
+	badQuery.F32()[0] = std::numeric_limits<float>::quiet_NaN();
+
+	auto driveOnce = [&]() {
+		CHECK(ValidateBank(bank.view) == Status::Ok);
+		CHECK(ValidateBank(badBank) != Status::Ok);
+		CHECK(ValidateQuery(bank.view, q.F32()) == Status::Ok);
+		CHECK(ValidateQuery(bank.view, badQuery.F32()) != Status::Ok);
+		CHECK(ValidateSegments(bank.view, q.F32(), goodSegs, 1) == Status::Ok);
+		CHECK(ValidateSegments(bank.view, q.F32(), badSegs, 1) != Status::Ok);
+		std::fill(seenBits.begin(), seenBits.end(), 0u);
+		CHECK(ValidateBiasPairs(bank.view, goodPairs, 1, seenBits.data()) == Status::Ok);
+		std::fill(seenBits.begin(), seenBits.end(), 0u);
+		CHECK(ValidateBiasPairs(bank.view, badPairs, 1, seenBits.data()) != Status::Ok);
+		int32_t badRow = -1;
+		CHECK(ValidateBankData(bank.view, &badRow) == Status::Ok);
+	};
+
+	driveOnce(); // warm
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			driveOnce();
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"validate.h functions allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// G7: NormalizeRows, QuantizeRowsInt8, PadRowsFloat32, ValidateSourceRows,
+// ComputeChannelInverseNorms (bake.h), plus ComputePrincipalComponents and
+// ProjectRowsOntoComponents (pca.h) -- pca.h's "no memory is allocated" is an
+// absolute claim (F-3) and had no cell at all.
+static void TestAllocFlatBakeAndPca()
+{
+	Rng rng(0x7A07);
+	const int32_t dims = 16, count = 24, paddedDims = 16;
+	std::vector<float> rows(static_cast<size_t>(count) * dims);
+	for (auto& v : rows) v = rng.NextFloat() + 0.1f; // keep off zero-norm
+	std::vector<int8_t> outI8(static_cast<size_t>(count) * paddedDims);
+	std::vector<float> outScales(static_cast<size_t>(count));
+	std::vector<float> outPadded(static_cast<size_t>(count) * paddedDims);
+	int32_t badRow = -1;
+
+	const ChannelInfo channels[2] = {{0, 8}, {8, 8}};
+	TestBank cosineBank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+	std::vector<float> invNorms(static_cast<size_t>(count) * 2);
+	BankView chView = cosineBank.view;
+	chView.channels = channels;
+	chView.channelCount = 2;
+
+	const int32_t componentCount = 2, iterations = 4;
+	std::vector<float> mean(static_cast<size_t>(cosineBank.view.dims));
+	std::vector<float> components(static_cast<size_t>(componentCount) * cosineBank.view.dims);
+	std::vector<float> scratch(static_cast<size_t>(cosineBank.view.dims));
+	std::vector<float> coords(static_cast<size_t>(count) * componentCount);
+
+	auto driveOnce = [&]() {
+		std::vector<float> localRows = rows; // normalize-in-place needs a mutable copy
+		CHECK(NormalizeRows(localRows.data(), count, dims, &badRow) == Status::Ok);
+		QuantizeRowsInt8(rows.data(), count, dims, paddedDims, outI8.data(), outScales.data());
+		PadRowsFloat32(rows.data(), count, dims, paddedDims, outPadded.data());
+		CHECK(ValidateSourceRows(rows.data(), count, dims, &badRow) == Status::Ok);
+		CHECK(ComputeChannelInverseNorms(chView, invNorms.data()) == Status::Ok);
+		CHECK(ComputePrincipalComponents(cosineBank.view, componentCount, iterations,
+				mean.data(), components.data(), scratch.data()) == Status::Ok);
+		CHECK(ProjectRowsOntoComponents(cosineBank.view, mean.data(), components.data(),
+				componentCount, coords.data()) == Status::Ok);
+	};
+
+	// NormalizeRows' localRows copy inside driveOnce would itself allocate
+	// (std::vector) -- warm outside the tracked window, then measure only the
+	// LIBRARY functions by pre-sizing a reused mutable buffer for the tracked
+	// pass instead of copying inside the lambda.
+	driveOnce();
+	std::vector<float> mutableRows = rows;
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(NormalizeRows(mutableRows.data(), count, dims, &badRow) == Status::Ok);
+			// Reset element-by-element into the ALREADY-SIZED buffer -- never
+			// vector-assign here, which is free to reallocate.
+			std::copy(rows.begin(), rows.end(), mutableRows.begin());
+			QuantizeRowsInt8(rows.data(), count, dims, paddedDims, outI8.data(), outScales.data());
+			PadRowsFloat32(rows.data(), count, dims, paddedDims, outPadded.data());
+			CHECK(ValidateSourceRows(rows.data(), count, dims, &badRow) == Status::Ok);
+			CHECK(ComputeChannelInverseNorms(chView, invNorms.data()) == Status::Ok);
+			CHECK(ComputePrincipalComponents(cosineBank.view, componentCount, iterations,
+					mean.data(), components.data(), scratch.data()) == Status::Ok);
+			CHECK(ProjectRowsOntoComponents(cosineBank.view, mean.data(), components.data(),
+					componentCount, coords.data()) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"bake.h/pca.h functions allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// T1: all 8 types.h helpers, compose.h::Margin, inspector_common.h::
+// DequantizeRowAsQuery, all 6 topk.h entry points.
+static void TestAllocFlatHeaderOnlyMath()
+{
+	Rng rng(0x7A08);
+	const int32_t dims = 24, count = 12, k = 4;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::L2);
+	float decoded[24];
+	Hit heapStorage[4], mergeScratch[4], mergedOut[4];
+	const Hit listA[2] = {{0, 1.0f}, {1, 2.0f}};
+	const Hit listB[2] = {{2, 0.5f}, {3, 3.0f}};
+	const Hit* lists[2] = {listA, listB};
+	const int32_t listCounts[2] = {2, 2};
+	const Hit hitBetter{0, 1.0f}, hitWorse{1, 2.0f};
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			(void)ScoringMetric(bank.view, QueryParams{});
+			(void)ElementSize(Quantization::Int8);
+			(void)PaddedDims(dims, Quantization::Int8);
+			(void)RowBytes(bank.view);
+			(void)BankBytes(bank.view);
+			(void)ChunkRows(bank.view);
+			(void)ChunkCount(bank.view);
+			(void)IsExcluded(nullptr, 0);
+			(void)Margin(hitBetter, hitWorse, Metric::L2);
+			DequantizeRowAsQuery(bank.view, 0, decoded);
+			(void)Better(hitBetter, hitWorse, Metric::L2);
+			TopK topk;
+			topk.Init(heapStorage, k, Metric::L2);
+			(void)topk.Size();
+			topk.Push(0, 1.0f);
+			topk.Push(1, 0.5f);
+			Hit finalized[4];
+			topk.Finalize(finalized);
+			(void)MergeTopK(lists, listCounts, 2, Metric::L2, k, mergeScratch, mergedOut);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"types.h/compose.h::Margin/inspector_common.h/topk.h allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// T2: DefaultAllocator, AllocationCount, and all 13 Workspace accessors.
+static void TestAllocFlatWorkspaceAccessors()
+{
+	Workspace ws;
+	CHECK(ws.Reserve(4, 2));
+	CHECK(ws.ReserveQueryScratch(16, 2));
+	CHECK(ws.ReserveBiasBits(8));
+	CHECK(ws.ReserveXdQuery(16, 2));
+	CHECK(ws.ReserveBatchOutput(4, 2, 0));
+	CHECK(ws.ReserveIndexScratch(8, 0));
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			(void)DefaultAllocator();
+			(void)AllocationCount();
+			(void)ws.HeapStorage(0);
+			(void)ws.ReservedK();
+			(void)ws.ReservedBatch();
+			(void)ws.QueryScratch(0);
+			(void)ws.BiasBits();
+			(void)ws.XdQ8(0);
+			(void)ws.XdScale(0);
+			(void)ws.XdSqSum(0);
+			(void)ws.XdSlots();
+			(void)ws.GrowthCount();
+			(void)ws.BatchOutputHits(0);
+			(void)ws.BatchOutputCounts(0);
+			(void)ws.IndexScratch(0);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"DefaultAllocator/AllocationCount/Workspace accessors allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// T3: all 22 ScratchBank accessors and the pin/exclusive primitives,
+// including TryPinReader/BeginExclusive under contention.
+static void TestAllocFlatScratchAccessors()
+{
+	Rng rng(0x7A09);
+	const int32_t dims = 32, count = 8;
+	const ChannelInfo channels[2] = {{0, 16}, {16, 16}}; // int8 grid = 16 elements
+	ScratchBank bank;
+	CHECK(bank.Create(count, dims, Metric::Cosine, Quantization::Int8, channels, 2,
+			/*retainFloats=*/true) == Status::Ok);
+	for (int32_t r = 0; r < count; ++r)
+	{
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (auto& v : row) v = rng.NextFloat();
+		CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+	}
+	ScratchRecallReport dummyReport;
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(bank.TryPinReader());
+			bank.UnpinReader();
+			(void)bank.IsCreated();
+			(void)bank.Count();
+			(void)bank.LiveCount();
+			(void)bank.Capacity();
+			(void)bank.Dims();
+			(void)bank.GetPaddedDims();
+			(void)bank.GetMetric();
+			(void)bank.GetQuantization();
+			(void)bank.RetainsFloats();
+			(void)bank.Generation();
+			(void)bank.RetainedRow(0);
+			(void)bank.QuantizedRowBytes();
+			(void)bank.RetainedRowBytes();
+			(void)ScratchBank::TombstoneWords(count);
+			(void)bank.FreezeLiveCount();
+			(void)bank.GetChannelCount();
+			(void)bank.GetChannels();
+			(void)bank.RecallReportStale(dummyReport);
+			CHECK(bank.BeginExclusive());
+			bank.EndExclusive();
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScratchBank accessors/pin primitives allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
 // S1 (graph.h) — BuildKnnNeighbors' per-call std::vector<Hit>/std::vector<int32_t>
 // output buffers heap-allocate via global `new` on every call, untracked by the
 // allocator seam (Poirot afabc08-graph-h-m1-review.md S1; standing per 15a0668-
@@ -17803,6 +18377,16 @@ int main()
 	TestAllocFlatWorkspaceReserveXdQuery();
 	TestAllocFlatWorkspaceReserveBatchOutput();
 	TestAllocFlatWorkspaceReserveIndexScratch();
+	TestAllocFlatAnalyticsWholeVector();
+	TestAllocFlatAnalyticsChannel();
+	TestAllocFlatProjectionReport();
+	TestAllocFlatCompose();
+	TestAllocFlatKernels();
+	TestAllocFlatValidate();
+	TestAllocFlatBakeAndPca();
+	TestAllocFlatHeaderOnlyMath();
+	TestAllocFlatWorkspaceAccessors();
+	TestAllocFlatScratchAccessors();
 	TestScratchChannelFreeze();
 	TestScratchChannelPersistenceRoundTrip();
 	TestScratchChannelPersistenceVersioning();
