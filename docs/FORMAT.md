@@ -9,7 +9,8 @@ and **2** (named channels).
 ## 1. Interchange: the `.wvbank` sidecar pair
 
 Two files, deliberately primitive so any pipeline can emit them in a few lines
-(reference implementation: [`tools/wvbank.py`](../tools/wvbank.py)):
+(reference implementation:
+[`tools/wvbank.py`](https://github.com/dansupergameprogrammer/superfaiss/blob/master/tools/wvbank.py)):
 
 **This sidecar pair is the encoder contract.** SuperFAISS ships no encoders and never
 will — anything that turns domain data (text, images, gameplay state) into vectors is
