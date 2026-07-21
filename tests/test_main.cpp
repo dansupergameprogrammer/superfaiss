@@ -10407,6 +10407,187 @@ static void TestAllocFlatScratchMeasureScratchRecallPerChannel()
 }
 
 // ---------------------------------------------------------------------------
+// §6.3 -- Workspace's warm-no-op reservations (coverage audit F-7): "a warm
+// workspace never grows" (alloc.h:52) has no direct cell. Each cell warms
+// twice at shape S (proving the fast-return branch, not just the first
+// allocation), then asserts re-calling at S and at smaller shapes is raw-0 /
+// seam-flat / growth-flat, and separately that growing ONE axis while
+// shrinking the other grows EXACTLY ONCE and never shrinks the live
+// reservation (alloc.cpp's max-of-both logic) -- the specific reuse edge no
+// prior cell drove.
+
+static void TestAllocFlatWorkspaceReserve()
+{
+	Workspace ws;
+	CHECK(ws.Reserve(8, 4));
+	CHECK(ws.Reserve(8, 4)); // warm twice at S
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.Reserve(8, 4));   // same shape
+		CHECK(ws.Reserve(4, 4));   // smaller k
+		CHECK(ws.Reserve(8, 2));   // smaller batchWidth
+		CHECK(ws.Reserve(4, 2));   // smaller on both axes
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::Reserve allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+
+	// Grow one axis while shrinking the other: exactly one growth, and the
+	// reservation never shrinks (max-of-both, alloc.cpp:214-215).
+	CHECK(ws.Reserve(9, 3)); // k grows, batchWidth shrinks from 4
+	CHECK(ws.GrowthCount() == growthBefore + 1);
+	CHECK(ws.ReservedK() == 9);
+	CHECK_MSG(ws.ReservedBatch() == 4,
+		"Reserve must not shrink a live reservation: batchWidth fell to %d", ws.ReservedBatch());
+}
+
+static void TestAllocFlatWorkspaceReserveQueryScratch()
+{
+	Workspace ws;
+	CHECK(ws.ReserveQueryScratch(64, 4));
+	CHECK(ws.ReserveQueryScratch(64, 4));
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.ReserveQueryScratch(64, 4));
+		CHECK(ws.ReserveQueryScratch(32, 4));
+		CHECK(ws.ReserveQueryScratch(64, 2));
+		CHECK(ws.ReserveQueryScratch(32, 2));
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::ReserveQueryScratch allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+
+	CHECK(ws.ReserveQueryScratch(80, 2)); // paddedDims grows, count shrinks from 4
+	CHECK(ws.GrowthCount() == growthBefore + 1);
+}
+
+static void TestAllocFlatWorkspaceReserveBiasBits()
+{
+	Workspace ws;
+	const int32_t S = 300;
+	CHECK(ws.ReserveBiasBits(S));
+	CHECK(ws.ReserveBiasBits(S));
+
+	// The warm path zeroes the words every call (alloc.cpp:187-190) -- O(count/8)
+	// work, not an allocation. Confirm the zeroing actually happens (write a
+	// sentinel, re-reserve, read back zero) so a future "optimization" that
+	// skips the zeroing cannot pass silently, AND that raw/seam counts stay
+	// flat across it.
+	ws.BiasBits()[0] = 0xFFFFFFFFu;
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.ReserveBiasBits(S));
+		CHECK_MSG(ws.BiasBits()[0] == 0u,
+			"ReserveBiasBits must re-zero the words on every warm call, sentinel survived");
+		CHECK(ws.ReserveBiasBits(S / 2)); // smaller count
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::ReserveBiasBits allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+static void TestAllocFlatWorkspaceReserveXdQuery()
+{
+	Workspace ws;
+	CHECK(ws.ReserveXdQuery(64, 4));
+	CHECK(ws.ReserveXdQuery(64, 4));
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.ReserveXdQuery(64, 4));
+		CHECK(ws.ReserveXdQuery(48, 4));
+		CHECK(ws.ReserveXdQuery(64, 2));
+		CHECK(ws.ReserveXdQuery(48, 2));
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::ReserveXdQuery allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+
+	CHECK(ws.ReserveXdQuery(80, 2)); // paddedDims grows, count shrinks from 4
+	CHECK(ws.GrowthCount() == growthBefore + 1);
+}
+
+static void TestAllocFlatWorkspaceReserveBatchOutput()
+{
+	Workspace ws;
+	CHECK(ws.ReserveBatchOutput(8, 4, 0));
+	CHECK(ws.ReserveBatchOutput(8, 4, 0));
+	CHECK(ws.ReserveBatchOutput(6, 3, 1)); // slot 1, independently
+	CHECK(ws.ReserveBatchOutput(6, 3, 1));
+
+	const Hit* slot0HitsBefore = ws.BatchOutputHits(0);
+	const int32_t* slot0CountsBefore = ws.BatchOutputCounts(0);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.ReserveBatchOutput(8, 4, 0));
+		CHECK(ws.ReserveBatchOutput(4, 4, 0));
+		CHECK(ws.ReserveBatchOutput(8, 2, 0));
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::ReserveBatchOutput allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+
+	// A growth costs TWO seam allocations (alloc.cpp:249,256), and slot 0 and
+	// slot 1 are provably independent -- growing slot 1 must not disturb
+	// slot 0's pointer or counts.
+	CHECK(ws.ReserveBatchOutput(9, 5, 1)); // grow slot 1 only
+	CHECK(ws.GrowthCount() == growthBefore + 1);
+	CHECK_MSG(ws.BatchOutputHits(0) == slot0HitsBefore,
+		"growing slot 1 must not disturb slot 0's Hit pointer");
+	CHECK_MSG(ws.BatchOutputCounts(0) == slot0CountsBefore,
+		"growing slot 1 must not disturb slot 0's count pointer");
+}
+
+static void TestAllocFlatWorkspaceReserveIndexScratch()
+{
+	Workspace ws;
+	CHECK(ws.ReserveIndexScratch(64, 0));
+	CHECK(ws.ReserveIndexScratch(64, 0));
+	CHECK(ws.ReserveIndexScratch(40, 1)); // slot 1, independently
+	CHECK(ws.ReserveIndexScratch(40, 1));
+
+	const int32_t* slot0Before = ws.IndexScratch(0);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		CHECK(ws.ReserveIndexScratch(64, 0));
+		CHECK(ws.ReserveIndexScratch(32, 0));
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Workspace::ReserveIndexScratch allocated %llu time(s) outside the seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+	CHECK(ws.GrowthCount() == growthBefore);
+
+	CHECK(ws.ReserveIndexScratch(80, 1)); // grow slot 1 only
+	CHECK(ws.GrowthCount() == growthBefore + 1);
+	CHECK_MSG(ws.IndexScratch(0) == slot0Before,
+		"growing slot 1 must not disturb slot 0's pointer");
+}
+
+// ---------------------------------------------------------------------------
 // T-V3 (slot 4) -- Tier-2 channel-scoped analytics (SuperFAISS_V2_Plan.md
 // section 23.5; section 23.9 slot-4 gate; section 23.8 dims 3/4/6/8/10) plus
 // the two D-V3-8 concurrency storms. Authored red-first by Curie on the green
@@ -17616,6 +17797,12 @@ int main()
 	TestAllocFlatScratchFreezeChannelAware();
 	TestAllocFlatScratchFreezeWithRecall();
 	TestAllocFlatScratchMeasureScratchRecallPerChannel();
+	TestAllocFlatWorkspaceReserve();
+	TestAllocFlatWorkspaceReserveQueryScratch();
+	TestAllocFlatWorkspaceReserveBiasBits();
+	TestAllocFlatWorkspaceReserveXdQuery();
+	TestAllocFlatWorkspaceReserveBatchOutput();
+	TestAllocFlatWorkspaceReserveIndexScratch();
 	TestScratchChannelFreeze();
 	TestScratchChannelPersistenceRoundTrip();
 	TestScratchChannelPersistenceVersioning();
