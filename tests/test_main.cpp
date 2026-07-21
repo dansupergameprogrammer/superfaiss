@@ -18120,73 +18120,120 @@ static void TestAllocFlatScratchAccessors()
 // heap allocations (and a flat seam AllocationCount/GrowthCount) across repeated
 // calls on the same warm workspace. Red until the output buffers route through
 // workspace-tracked storage.
+//
+// Coverage audit §6.1 (F-5): the allocation-free property is not uniform across a
+// function's branches (dimension 8, composition) — widened to
+// {Float32, Int8} x {Dot, Cosine, L2} x excludeSelf in {true, false}, each
+// combination its own warm-twice-then-loop measurement, so a std::vector
+// reintroduced on any one leg fails here instead of passing behind the one
+// configuration the original cell drove.
 static void TestS1FlatAllocationBuildKnnNeighbors()
 {
-	Rng rng(0x51A1);
-	const int32_t dims = 32, count = 200, k = 6;
-	std::vector<float> src;
-	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
-	GBank bank(src, count, dims, Quantization::Int8, Metric::L2);
-
-	Workspace ws;
-	std::vector<int32_t> nb(static_cast<size_t>(count) * k, -999);
-
-	// Warm-up: allowed to allocate, on either counter.
-	CHECK(BuildKnnNeighbors(bank.view, k, true, nb.data(), ws) == Status::Ok);
-
-	const uint64_t allocsBefore = AllocationCount();
-	const uint64_t growthBefore = ws.GrowthCount();
+	const Quantization quants[] = {Quantization::Float32, Quantization::Int8};
+	const Metric metrics[] = {Metric::Dot, Metric::Cosine, Metric::L2};
+	const bool excludeSelfs[] = {true, false};
+	uint32_t seed = 0x51A1;
+	for (Quantization q : quants)
 	{
-		ScopedRawNewTracking rawTracking;
-		for (int32_t i = 0; i < 20; ++i)
+		for (Metric m : metrics)
 		{
-			CHECK(BuildKnnNeighbors(bank.view, k, true, nb.data(), ws) == Status::Ok);
+			for (bool excludeSelf : excludeSelfs)
+			{
+				Rng rng(seed++);
+				const int32_t dims = 32, count = 200, k = 6;
+				std::vector<float> src;
+				for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+				GBank bank(src, count, dims, q, m);
+
+				Workspace ws;
+				std::vector<int32_t> nb(static_cast<size_t>(count) * k, -999);
+
+				// Warm-up: allowed to allocate, on either counter. Twice, not once —
+				// a second-call growth would be invisible after one call (§6.0).
+				CHECK(BuildKnnNeighbors(bank.view, k, excludeSelf, nb.data(), ws) == Status::Ok);
+				CHECK(BuildKnnNeighbors(bank.view, k, excludeSelf, nb.data(), ws) == Status::Ok);
+
+				const uint64_t allocsBefore = AllocationCount();
+				const uint64_t growthBefore = ws.GrowthCount();
+				{
+					ScopedRawNewTracking rawTracking;
+					for (int32_t i = 0; i < 20; ++i)
+					{
+						CHECK(BuildKnnNeighbors(bank.view, k, excludeSelf, nb.data(), ws) == Status::Ok);
+					}
+					CHECK_MSG(rawTracking.Count() == 0,
+						"BuildKnnNeighbors allocated %llu time(s) outside the Workspace seam on a warm "
+						"workspace (quant=%d, metric=%d, excludeSelf=%d)",
+						static_cast<unsigned long long>(rawTracking.Count()),
+						static_cast<int>(q), static_cast<int>(m), excludeSelf ? 1 : 0);
+				}
+				CHECK_MSG(AllocationCount() == allocsBefore,
+					"BuildKnnNeighbors' seam-tracked allocations grew on a warm workspace "
+					"(quant=%d, metric=%d, excludeSelf=%d)",
+					static_cast<int>(q), static_cast<int>(m), excludeSelf ? 1 : 0);
+				CHECK(ws.GrowthCount() == growthBefore);
+			}
 		}
-		CHECK_MSG(rawTracking.Count() == 0,
-			"BuildKnnNeighbors allocated %llu time(s) outside the Workspace seam on a warm workspace",
-			static_cast<unsigned long long>(rawTracking.Count()));
 	}
-	CHECK_MSG(AllocationCount() == allocsBefore,
-		"BuildKnnNeighbors' seam-tracked allocations grew on a warm workspace: %llu -> %llu",
-		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
-	CHECK(ws.GrowthCount() == growthBefore);
 }
 
 // S1 (novelty.h, "baseline calibration" half) — CalibrateNoveltyBaseline shares
 // BuildKnnNeighbors' exact batch-output shape and the exact same defect (Poirot
 // 15a0668-s1s2s3-fix-verify.md S1 names this file:line directly — novelty.cpp's
 // allHits/hitCounts). Same construction as the graph.h cell above.
+//
+// Coverage audit §6.1 (F-5): widened to {Float32, Int8} x {Cosine, L2} (Dot
+// rejects, per KthNeighborDistance/CalibrateNoveltyBaseline's shared contract) x
+// k in {1, count-1}, each combination its own warm-twice-then-loop measurement.
 static void TestS1FlatAllocationCalibrateNoveltyBaseline()
 {
-	Rng rng(0x51A2);
-	const int32_t dims = 24, count = 180, k = 5, sampleLimit = 512;
-	std::vector<float> src;
-	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
-	GBank bank(src, count, dims, Quantization::Int8, Metric::L2);
-
-	Workspace ws;
-	std::vector<float> baseline(static_cast<size_t>(count), -999.0f);
-	int32_t outCount = -999;
-
-	CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws) == Status::Ok);
-
-	const uint64_t allocsBefore = AllocationCount();
-	const uint64_t growthBefore = ws.GrowthCount();
+	const Quantization quants[] = {Quantization::Float32, Quantization::Int8};
+	const Metric metrics[] = {Metric::Cosine, Metric::L2};
+	uint32_t seed = 0x51A2;
+	for (Quantization q : quants)
 	{
-		ScopedRawNewTracking rawTracking;
-		for (int32_t i = 0; i < 20; ++i)
+		for (Metric m : metrics)
 		{
-			CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws)
-				== Status::Ok);
+			const int32_t dims = 24, count = 180, sampleLimit = 512;
+			for (int32_t k : {1, count - 1})
+			{
+				Rng rng(seed++);
+				std::vector<float> src;
+				for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+				GBank bank(src, count, dims, q, m);
+
+				Workspace ws;
+				std::vector<float> baseline(static_cast<size_t>(count), -999.0f);
+				int32_t outCount = -999;
+
+				CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws)
+					== Status::Ok);
+				CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws)
+					== Status::Ok);
+
+				const uint64_t allocsBefore = AllocationCount();
+				const uint64_t growthBefore = ws.GrowthCount();
+				{
+					ScopedRawNewTracking rawTracking;
+					for (int32_t i = 0; i < 20; ++i)
+					{
+						CHECK(CalibrateNoveltyBaseline(bank.view, k, sampleLimit, baseline.data(), &outCount, ws)
+							== Status::Ok);
+					}
+					CHECK_MSG(rawTracking.Count() == 0,
+						"CalibrateNoveltyBaseline allocated %llu time(s) outside the Workspace seam on a "
+						"warm workspace (quant=%d, metric=%d, k=%d)",
+						static_cast<unsigned long long>(rawTracking.Count()),
+						static_cast<int>(q), static_cast<int>(m), k);
+				}
+				CHECK_MSG(AllocationCount() == allocsBefore,
+					"CalibrateNoveltyBaseline's seam-tracked allocations grew on a warm workspace "
+					"(quant=%d, metric=%d, k=%d)",
+					static_cast<int>(q), static_cast<int>(m), k);
+				CHECK(ws.GrowthCount() == growthBefore);
+			}
 		}
-		CHECK_MSG(rawTracking.Count() == 0,
-			"CalibrateNoveltyBaseline allocated %llu time(s) outside the Workspace seam on a warm workspace",
-			static_cast<unsigned long long>(rawTracking.Count()));
 	}
-	CHECK_MSG(AllocationCount() == allocsBefore,
-		"CalibrateNoveltyBaseline's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
-		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
-	CHECK(ws.GrowthCount() == growthBefore);
 }
 
 // Finding 3 (cf3f750-v32-core-batch-review.md): NoveltyProbeDistance's int8 leg
@@ -18199,41 +18246,63 @@ static void TestS1FlatAllocationCalibrateNoveltyBaseline()
 // TestS1FlatAllocationBuildKnnNeighbors/CalibrateNoveltyBaseline above. Both the
 // whole-row and channel legs are exercised (both now route through the same
 // workspace.ReserveXdQuery block).
+// Coverage audit §6.1 (F-5): the Float32 whole-row leg was exercised for
+// correctness but never for allocation. Widened to {Float32, Int8} x
+// {Cosine, L2} (Dot never dispatches) x channel in {-1, 0, last}, each
+// combination its own warm-twice-then-loop measurement.
 static void TestS1FlatAllocationNoveltyProbeDistance()
 {
-	Rng rng(0x51A3);
-	const int32_t dims = 32, count = 4;
-	std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
-	std::vector<float> src;
-	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
-	GChannelBank b(src, count, dims, Quantization::Int8, Metric::Cosine, ch);
-	std::vector<float> probeSrc(static_cast<size_t>(dims));
-	for (float& v : probeSrc) v = rng.NextFloat();
-	std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
-
-	Workspace ws;
-	float out = -999.0f;
-	CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, -1, &out, ws) == Status::Ok); // warm
-	CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);   // warm, channel
-
-	const uint64_t allocsBefore = AllocationCount();
-	const uint64_t growthBefore = ws.GrowthCount();
+	const Quantization quants[] = {Quantization::Float32, Quantization::Int8};
+	const Metric metrics[] = {Metric::Cosine, Metric::L2};
+	uint32_t seed = 0x51A3;
+	for (Quantization q : quants)
 	{
-		ScopedRawNewTracking rawTracking;
-		for (int32_t i = 0; i < 20; ++i)
+		for (Metric m : metrics)
 		{
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, -1, &out, ws) == Status::Ok);
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, 0, &out, ws) == Status::Ok);
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, 1, &out, ws) == Status::Ok);
+			const int32_t dims = 32, count = 4;
+			std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
+			Rng rng(seed++);
+			std::vector<float> src;
+			for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+			GChannelBank b(src, count, dims, q, m, ch);
+			std::vector<float> probeSrc(static_cast<size_t>(dims));
+			for (float& v : probeSrc) v = rng.NextFloat();
+			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+
+			Workspace ws;
+			float out = -999.0f;
+			const int32_t lastChannel = static_cast<int32_t>(ch.size()) - 1;
+			for (int32_t channel : {-1, 0, lastChannel})
+			{
+				// Warm at this channel/shape at least twice before measuring (§6.0) —
+				// a second-call growth on a channel-specific sub-buffer would be
+				// invisible after one call.
+				CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, channel, &out, ws) == Status::Ok);
+				CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, channel, &out, ws) == Status::Ok);
+
+				const uint64_t allocsBefore = AllocationCount();
+				const uint64_t growthBefore = ws.GrowthCount();
+				{
+					ScopedRawNewTracking rawTracking;
+					for (int32_t i = 0; i < 20; ++i)
+					{
+						CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, channel, &out, ws)
+							== Status::Ok);
+					}
+					CHECK_MSG(rawTracking.Count() == 0,
+						"NoveltyProbeDistance allocated %llu time(s) outside the Workspace seam on a warm "
+						"workspace (quant=%d, metric=%d, channel=%d)",
+						static_cast<unsigned long long>(rawTracking.Count()),
+						static_cast<int>(q), static_cast<int>(m), channel);
+				}
+				CHECK_MSG(AllocationCount() == allocsBefore,
+					"NoveltyProbeDistance's seam-tracked allocations grew on a warm workspace "
+					"(quant=%d, metric=%d, channel=%d)",
+					static_cast<int>(q), static_cast<int>(m), channel);
+				CHECK(ws.GrowthCount() == growthBefore);
+			}
 		}
-		CHECK_MSG(rawTracking.Count() == 0,
-			"NoveltyProbeDistance allocated %llu time(s) outside the Workspace seam on a warm workspace",
-			static_cast<unsigned long long>(rawTracking.Count()));
 	}
-	CHECK_MSG(AllocationCount() == allocsBefore,
-		"NoveltyProbeDistance's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
-		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
-	CHECK(ws.GrowthCount() == growthBefore);
 }
 
 // S1 (novelty.h, "probe" half — bonus finding, not named in any prior casebook).
@@ -18250,37 +18319,62 @@ static void TestS1FlatAllocationNoveltyProbeDistance()
 // in the test-design artifact; not invented coverage — it is §25.4's own
 // zero-allocation contract applied to a call site that happens to share
 // novelty.cpp with the already-known CalibrateNoveltyBaseline instance.
+// Coverage audit §6.1 (F-5): widened to {Float32, Int8} x {Cosine, L2} x
+// excludeBits in {null, non-null}, each combination its own
+// warm-twice-then-loop measurement.
 static void TestS1FlatAllocationKthNeighborDistanceProbe()
 {
-	Rng rng(0x51A3);
-	const int32_t dims = 16, count = 64, k = 4;
-	std::vector<float> src;
-	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
-	GBank bank(src, count, dims, Quantization::Float32, Metric::Cosine);
-	std::vector<float> query = M2PaddedProbeFromRow(bank, 0);
-
-	Workspace ws;
-	float out = -999.0f;
-
-	// Warm-up: allowed to allocate.
-	CHECK(KthNeighborDistance(bank.view, query.data(), k, nullptr, &out, ws) == Status::Ok);
-
-	const uint64_t allocsBefore = AllocationCount();
-	const uint64_t growthBefore = ws.GrowthCount();
+	const Quantization quants[] = {Quantization::Float32, Quantization::Int8};
+	const Metric metrics[] = {Metric::Cosine, Metric::L2};
+	uint32_t seed = 0x51A3;
+	for (Quantization q : quants)
 	{
-		ScopedRawNewTracking rawTracking;
-		for (int32_t i = 0; i < 20; ++i)
+		for (Metric m : metrics)
 		{
-			CHECK(KthNeighborDistance(bank.view, query.data(), k, nullptr, &out, ws) == Status::Ok);
+			const int32_t dims = 16, count = 64, k = 4;
+			Rng rng(seed++);
+			std::vector<float> src;
+			for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+			GBank bank(src, count, dims, q, m);
+			std::vector<float> query = M2PaddedProbeFromRow(bank, 0);
+
+			std::vector<uint32_t> exclude(static_cast<size_t>((count + 31) / 32), 0u);
+			exclude[0] |= 1u << 0;
+			exclude[0] |= 1u << 1;
+
+			const uint32_t* excludeOptions[] = {nullptr, exclude.data()};
+			for (const uint32_t* excludeBits : excludeOptions)
+			{
+				Workspace ws;
+				float out = -999.0f;
+
+				// Warm-up: allowed to allocate. Twice, not once (§6.0).
+				CHECK(KthNeighborDistance(bank.view, query.data(), k, excludeBits, &out, ws) == Status::Ok);
+				CHECK(KthNeighborDistance(bank.view, query.data(), k, excludeBits, &out, ws) == Status::Ok);
+
+				const uint64_t allocsBefore = AllocationCount();
+				const uint64_t growthBefore = ws.GrowthCount();
+				{
+					ScopedRawNewTracking rawTracking;
+					for (int32_t i = 0; i < 20; ++i)
+					{
+						CHECK(KthNeighborDistance(bank.view, query.data(), k, excludeBits, &out, ws)
+							== Status::Ok);
+					}
+					CHECK_MSG(rawTracking.Count() == 0,
+						"KthNeighborDistance allocated %llu time(s) outside the Workspace seam on a warm "
+						"workspace (quant=%d, metric=%d, excludeBits=%d)",
+						static_cast<unsigned long long>(rawTracking.Count()),
+						static_cast<int>(q), static_cast<int>(m), excludeBits != nullptr);
+				}
+				CHECK_MSG(AllocationCount() == allocsBefore,
+					"KthNeighborDistance's seam-tracked allocations grew on a warm workspace "
+					"(quant=%d, metric=%d, excludeBits=%d)",
+					static_cast<int>(q), static_cast<int>(m), excludeBits != nullptr);
+				CHECK(ws.GrowthCount() == growthBefore);
+			}
 		}
-		CHECK_MSG(rawTracking.Count() == 0,
-			"KthNeighborDistance allocated %llu time(s) outside the Workspace seam on a warm workspace",
-			static_cast<unsigned long long>(rawTracking.Count()));
 	}
-	CHECK_MSG(AllocationCount() == allocsBefore,
-		"KthNeighborDistance's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
-		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
-	CHECK(ws.GrowthCount() == growthBefore);
 }
 
 // S1 (matching.h) — MutualNearestMatches' two-pass batch output
@@ -18292,6 +18386,11 @@ static void TestS1FlatAllocationKthNeighborDistanceProbe()
 // above) already establishes distinctCount is stable across identical warm
 // calls, so this is a clean warm/steady-state measurement, mirroring the two
 // cells above.
+// Coverage audit §6.1 (F-5): widened to add the A/B-differing-quantization leg
+// (E-D1-3 — Quantization MAY differ across views as long as Dims and Metric
+// match), the one that calls DequantizeRowAsQuery with an explicit
+// targetPaddedDims rather than the same-quant decode path the original cell
+// alone exercised.
 static void TestS1FlatAllocationMutualNearestMatches()
 {
 	Rng rng(0x51A4);
@@ -18300,35 +18399,44 @@ static void TestS1FlatAllocationMutualNearestMatches()
 	for (int32_t i = 0; i < aCount * dims; ++i) aSrc.push_back(rng.NextFloat());
 	for (int32_t i = 0; i < bCount * dims; ++i) bSrc.push_back(rng.NextFloat());
 	GBank fullA(aSrc, aCount, dims, Quantization::Int8, Metric::Cosine);
-	GBank fullB(bSrc, bCount, dims, Quantization::Int8, Metric::Cosine);
+	GBank fullBSameQuant(bSrc, bCount, dims, Quantization::Int8, Metric::Cosine);
+	GBank fullBCrossQuant(bSrc, bCount, dims, Quantization::Float32, Metric::Cosine);
 	std::vector<int32_t> sampleIdx;
 	for (int32_t i = 0; i < aCount; ++i) sampleIdx.push_back(i);
 
-	Workspace ws;
-	std::vector<MatchPair> out(static_cast<size_t>(aCount));
-	int32_t outCount = -999;
-
-	// Warm-up: allowed to allocate.
-	CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
-		nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
-
-	const uint64_t allocsBefore = AllocationCount();
-	const uint64_t growthBefore = ws.GrowthCount();
+	const GBank* bViews[] = {&fullBSameQuant, &fullBCrossQuant};
+	for (const GBank* bView : bViews)
 	{
-		ScopedRawNewTracking rawTracking;
-		for (int32_t i = 0; i < 20; ++i)
+		Workspace ws;
+		std::vector<MatchPair> out(static_cast<size_t>(aCount));
+		int32_t outCount = -999;
+
+		// Warm-up: allowed to allocate. Twice, not once (§6.0).
+		CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), bView->view, nullptr, fullA.view,
+			nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+		CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), bView->view, nullptr, fullA.view,
+			nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+
+		const uint64_t allocsBefore = AllocationCount();
+		const uint64_t growthBefore = ws.GrowthCount();
 		{
-			CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), fullB.view, nullptr, fullA.view,
-				nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 20; ++i)
+			{
+				CHECK(MutualNearestMatches(fullA.view, sampleIdx.data(), bView->view, nullptr, fullA.view,
+					nullptr, matchK, out.data(), &outCount, ws) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"MutualNearestMatches allocated %llu time(s) outside the Workspace seam on a warm "
+				"workspace (crossQuant=%d)",
+				static_cast<unsigned long long>(rawTracking.Count()),
+				bView->view.quant == Quantization::Float32 ? 1 : 0);
 		}
-		CHECK_MSG(rawTracking.Count() == 0,
-			"MutualNearestMatches allocated %llu time(s) outside the Workspace seam on a warm workspace",
-			static_cast<unsigned long long>(rawTracking.Count()));
+		CHECK_MSG(AllocationCount() == allocsBefore,
+			"MutualNearestMatches' seam-tracked allocations grew on a warm workspace (crossQuant=%d)",
+			bView->view.quant == Quantization::Float32 ? 1 : 0);
+		CHECK(ws.GrowthCount() == growthBefore);
 	}
-	CHECK_MSG(AllocationCount() == allocsBefore,
-		"MutualNearestMatches' seam-tracked allocations grew on a warm workspace: %llu -> %llu",
-		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
-	CHECK(ws.GrowthCount() == growthBefore);
 }
 
 int main()
