@@ -750,13 +750,194 @@ static void TestAllocationFlat()
 
 	const uint64_t allocsBefore = AllocationCount();
 	const uint64_t growthBefore = ws.GrowthCount();
-	for (int32_t i = 0; i < 1000; ++i)
 	{
-		CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		// Q1 (coverage audit §6.2): AllocationCount() alone is blind to a raw
+		// ::operator new (§3) -- wrap the loop in the raw-new instrument so this,
+		// the claim's headline entry point, is genuinely proven, not merely
+		// seam-flat.
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 1000; ++i)
+		{
+			CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"Query allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
 	}
 	CHECK_MSG(AllocationCount() == allocsBefore, "allocations grew: %llu -> %llu",
 		static_cast<unsigned long long>(allocsBefore),
 		static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// Q2 (coverage audit §6.2): QueryBatch had no allocation cell of any kind.
+// Warm at the loop's max queryCount/k, then re-drive at that shape AND at a
+// smaller queryCount (a shrink must not re-reserve -- the sharp edge the
+// audit names), crossed with per-query bias.
+static void TestAllocFlatQueryBatch()
+{
+	Rng rng(0x6A1C);
+	const int32_t dims = 32, count = 300, maxQueryCount = 12, smallQueryCount = 4, k = 8;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+
+	std::vector<float> rawQueries(static_cast<size_t>(maxQueryCount) * dims);
+	for (auto& v : rawQueries) v = rng.NextFloat();
+	AlignedBuf qbuf(static_cast<size_t>(maxQueryCount) * bank.view.paddedDims * sizeof(float));
+	for (int32_t i = 0; i < maxQueryCount; ++i)
+	{
+		std::vector<float> row(rawQueries.begin() + i * dims, rawQueries.begin() + (i + 1) * dims);
+		PadQuery(row, bank.view.paddedDims, qbuf.F32() + static_cast<size_t>(i) * bank.view.paddedDims);
+	}
+
+	std::vector<RowBias> biases(static_cast<size_t>(maxQueryCount));
+	std::vector<float> denseBias(static_cast<size_t>(count), 0.0625f);
+	for (auto& b : biases) b.dense = denseBias.data();
+
+	Workspace ws;
+	std::vector<Hit> hits(static_cast<size_t>(maxQueryCount) * k);
+	std::vector<int32_t> counts(static_cast<size_t>(maxQueryCount));
+	QueryParams params;
+	params.k = k;
+	params.bias = biases.data();
+
+	// Warm: twice at the max shape.
+	CHECK(QueryBatch(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+	CHECK(QueryBatch(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(QueryBatch(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+		}
+		// The shrink leg: a smaller queryCount must not re-reserve.
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(QueryBatch(bank.view, qbuf.F32(), smallQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"QueryBatch allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"QueryBatch's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// Q3 (coverage audit §6.2): QueryIntersect had no allocation cell of any kind.
+// Warm at max queryCount/k (the fused path reserves query scratch for weight
+// folding); drive queryCount == 1 (the degenerate Query-identical path) and
+// queryCount > 1, both with and without segments.
+static void TestAllocFlatQueryIntersect()
+{
+	Rng rng(0x6A1D);
+	const int32_t dims = 32, count = 200, maxQueryCount = 4, k = 6;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+
+	std::vector<float> rawQueries(static_cast<size_t>(maxQueryCount) * dims);
+	for (auto& v : rawQueries) v = rng.NextFloat();
+	AlignedBuf qbuf(static_cast<size_t>(maxQueryCount) * bank.view.paddedDims * sizeof(float));
+	for (int32_t i = 0; i < maxQueryCount; ++i)
+	{
+		std::vector<float> row(rawQueries.begin() + i * dims, rawQueries.begin() + (i + 1) * dims);
+		PadQuery(row, bank.view.paddedDims, qbuf.F32() + static_cast<size_t>(i) * bank.view.paddedDims);
+	}
+	const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 1.0f}};
+
+	Workspace ws;
+	Hit hits[6];
+	int32_t n = 0;
+	QueryParams params;
+	params.k = k;
+
+	// Warm: twice at the max shape, with segments (the widest reservation).
+	params.segments = segs;
+	params.segmentCount = 2;
+	CHECK(QueryIntersect(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits, &n) == Status::Ok);
+	CHECK(QueryIntersect(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits, &n) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(QueryIntersect(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits, &n) == Status::Ok);
+		}
+		params.segments = nullptr;
+		params.segmentCount = 0;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(QueryIntersect(bank.view, qbuf.F32(), maxQueryCount, params, ws, hits, &n) == Status::Ok);
+			CHECK(QueryIntersect(bank.view, qbuf.F32(), 1, params, ws, hits, &n) == Status::Ok); // degenerate
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"QueryIntersect allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"QueryIntersect's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
+// Q5 (coverage audit §6.2): QueryXdBatch had no allocation cell of any kind.
+// Warm at max queryCount; Workspace must be warm for the k and for the
+// ReserveXdQuery slot block. Per-query bias, params.bias carries queryCount
+// entries (the QueryBatch convention).
+static void TestAllocFlatQueryXdBatch()
+{
+	Rng rng(0x6A1E);
+	const int32_t dims = 32, count = 256, maxQueryCount = 6, k = 8;
+	TestBank bank(rng, count, dims, Quantization::Int8, Metric::Dot);
+
+	std::vector<XdQuery> queries(static_cast<size_t>(maxQueryCount));
+	std::vector<std::vector<int8_t>> images(static_cast<size_t>(maxQueryCount));
+	for (int32_t i = 0; i < maxQueryCount; ++i)
+	{
+		std::vector<int32_t> idx = {i % count};
+		AlignedBuf q8(static_cast<size_t>(bank.view.paddedDims));
+		double scale = 0.0;
+		int64_t sqSum = 0;
+		CHECK(MakeCentroidCrossDevice(bank.view, idx.data(), 1, nullptr, nullptr,
+				q8.I8(), &scale, &sqSum) == Status::Ok);
+		images[i].assign(q8.I8(), q8.I8() + bank.view.paddedDims);
+		queries[i] = XdQuery{images[i].data(), scale, sqSum};
+	}
+
+	std::vector<RowBias> biases(static_cast<size_t>(maxQueryCount));
+	std::vector<float> denseBias(static_cast<size_t>(count), 0.03125f);
+	for (auto& b : biases) b.dense = denseBias.data();
+
+	Workspace ws;
+	std::vector<Hit> hits(static_cast<size_t>(maxQueryCount) * k);
+	std::vector<int32_t> counts(static_cast<size_t>(maxQueryCount));
+	QueryParams params;
+	params.k = k;
+	params.exactness = Exactness::CrossDevice;
+	params.bias = biases.data();
+
+	CHECK(QueryXdBatch(bank.view, queries.data(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+	CHECK(QueryXdBatch(bank.view, queries.data(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(QueryXdBatch(bank.view, queries.data(), maxQueryCount, params, ws, hits.data(), counts.data()) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"QueryXdBatch allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"QueryXdBatch's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
 	CHECK(ws.GrowthCount() == growthBefore);
 }
 
@@ -3547,10 +3728,17 @@ static void TestPerRowBias()
 		CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
 		const uint64_t allocs = AllocationCount();
 		const uint64_t growth = ws.GrowthCount();
-		for (int32_t i = 0; i < 32; ++i)
 		{
-			params.bias = (i & 1) ? &rbDense : &rbSparse;
-			CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+			// Q1 (coverage audit §6.2): raw-new instrument, not seam-only.
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 32; ++i)
+			{
+				params.bias = (i & 1) ? &rbDense : &rbSparse;
+				CHECK(Query(bank.view, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"Query (biased) allocated %llu time(s) outside the Workspace seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
 		}
 		CHECK(AllocationCount() == allocs);
 		CHECK(ws.GrowthCount() == growth);
@@ -4226,11 +4414,20 @@ static void TestCrossDevice()
 		int32_t n = 0;
 		CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok); // warm
 		const uint64_t before = AllocationCount();
-		for (int32_t i = 0; i < 16; ++i)
+		const uint64_t growthBefore = ws.GrowthCount();
 		{
-			CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok);
+			// Q1 (coverage audit §6.2): raw-new instrument, not seam-only.
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 16; ++i)
+			{
+				CHECK(Query(bank.view, q.F32(), p, ws, hits, &n) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"Query (CrossDevice) allocated %llu time(s) outside the Workspace seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
 		}
 		CHECK_MSG(AllocationCount() == before, "warm CrossDevice queries allocated");
+		CHECK(ws.GrowthCount() == growthBefore);
 	}
 
 	// --- The forced-path matrix + the pinned committed-fixture hash (19.4) ---
@@ -5906,11 +6103,19 @@ static void TestPoolRecallAndContracts()
 		CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
 		const uint64_t allocs = AllocationCount();
 		const uint64_t growth = ws.GrowthCount();
-		for (int32_t i = 0; i < 16; ++i)
 		{
-			CHECK(MakeCentroidCrossDevice(bank.view, idx, 6, nullptr, nullptr,
-					q8.I8(), &scale, &sqSum) == Status::Ok);
-			CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+			// Q4/G4 (coverage audit §6.2/§6.5): raw-new instrument over both
+			// MakeCentroidCrossDevice and QueryXd, not seam-only.
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 16; ++i)
+			{
+				CHECK(MakeCentroidCrossDevice(bank.view, idx, 6, nullptr, nullptr,
+						q8.I8(), &scale, &sqSum) == Status::Ok);
+				CHECK(QueryXd(bank.view, xq, p, ws, hits, &n) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"MakeCentroidCrossDevice/QueryXd allocated %llu time(s) outside the seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
 		}
 		CHECK_MSG(AllocationCount() == allocs, "warm pooling allocated");
 		CHECK(ws.GrowthCount() == growth);
@@ -8939,9 +9144,17 @@ static void TestScratchChannelLifetimeShapeContracts()
 		int32_t extraIdx = -1;
 		float extra[dims];
 		std::memcpy(extra, fx.rawSource.data(), static_cast<size_t>(dims) * sizeof(float));
-		CHECK(fx.bank.Append(extra, dims, &extraIdx) == Status::Ok); // append with sub-norm write
-		CHECK(Query(snap, qbuf.F32(), p1, ws, hits, &n) == Status::Ok);
-		CHECK(Query(snap, qbuf.F32(), p2, ws, hits, &n) == Status::Ok);
+		{
+			// Q1 (coverage audit §6.2): raw-new instrument, not seam-only, over the
+			// segmented-channel query path plus a live Append in the same window.
+			ScopedRawNewTracking rawTracking;
+			CHECK(fx.bank.Append(extra, dims, &extraIdx) == Status::Ok); // append with sub-norm write
+			CHECK(Query(snap, qbuf.F32(), p1, ws, hits, &n) == Status::Ok);
+			CHECK(Query(snap, qbuf.F32(), p2, ws, hits, &n) == Status::Ok);
+			CHECK_MSG(rawTracking.Count() == 0,
+				"channel append/query allocated %llu time(s) outside the Workspace/ScratchBank seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
+		}
 		CHECK_MSG(AllocationCount() == allocsBefore,
 			"channel append/query allocated: %llu -> %llu",
 			static_cast<unsigned long long>(allocsBefore),
@@ -17076,6 +17289,9 @@ int main()
 	TestBake();
 	TestExclusion();
 	TestAllocationFlat();
+	TestAllocFlatQueryBatch();
+	TestAllocFlatQueryIntersect();
+	TestAllocFlatQueryXdBatch();
 	TestBatchEquivalence();
 	TestRepeatDeterminism();
 	TestCentroid();
