@@ -44,6 +44,19 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   `kMaxCrossDeviceDims` dims) before any size is computed, returning `InvalidArgument`.
   The archive loader already applied these caps; direct construction did not, and
   `Grow` bounded its request only against the current capacity.
+- **Bank-inspection review follow-ups (lower-severity, from a whole-project pass).**
+  `graph.cpp`: `MutualFilter`/`ConnectedComponents` bound caller-supplied neighbour and
+  duplicate-group values to `[0, count)` before indexing the neighbour list and the
+  union-find scratch, so a malformed hand-built input degrades to a dropped edge rather
+  than an out-of-bounds access. `analytics.cpp`: the int8 off-grid channel guard from
+  `novelty.cpp` now also protects the channel-analytics legs (added once in the shared
+  `ChannelSubRange`), and the channel NN divergence pre-lifts each target's self-dot once
+  instead of once per source row. `pca.cpp`: the covariance-apply accumulator (and its
+  scratch buffer) is now `double` to match the mean's precision, and
+  `ProjectRowsOntoComponents` bounds `componentCount` by `dims` like its sibling. Scale
+  decode goes through `detail::FloatBitsToDouble` on the remaining `compose.cpp`/`pca.cpp`/
+  `analytics.cpp` paths, so a subnormal scale decodes identically under any FTZ/DAZ mode.
+  A comment documents that `novelty.cpp`'s `sampleLimit` is a ceiling, not a down-sampler.
 - **A Cosine channel bank with zero rows was unrepresentable.** `ValidateBank` required
   the per-channel inverse sub-norm array whenever a Cosine bank carried channels, but
   those norms are one per row — a bank with no rows requires none, and no scan reads the
