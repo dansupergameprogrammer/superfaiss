@@ -9,7 +9,7 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
-## [Unreleased]
+## [3.2.0] — 2026-07-20
 
 ### Added
 - **Bank-inspection primitives (`graph.h`, `novelty.h`, `matching.h`) — Bank Inspector I.**

@@ -455,7 +455,10 @@ cancellation residue even on an exact duplicate, so a caller checks it against a
 epsilon (`1e-8f`), never bare equality. `channel == -1` scores the whole row; a channel
 index scores that sub-range only, and a zero-energy Cosine slice on either side rejects
 (`ZeroNormQuery`) rather than silently floors to a false match. Dot banks are rejected
-outright — the verdict domain is L2 and Cosine only. **Limb 2 (statistical rank):**
+outright — the verdict domain is L2 and Cosine only. On an int8 bank, a channel whose
+`offset`/`length` is not a multiple of the int8 SIMD grid is `InvalidArgument` — every
+validated bank's channel table is grid-aligned by construction, so this only fires
+against a hand-built `BankView`. **Limb 2 (statistical rank):**
 `KthNeighborDistance` is a raw k-th-nearest-neighbour probe against a full view (ties are
 the caller's own exclusion set, not self-widened); `NoveltyScore` converts a distance
 into the baseline's empirical-CDF rank (ties resolve to the lowest rank), which the

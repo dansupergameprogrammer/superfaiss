@@ -83,7 +83,10 @@ Status NoveltyScore(
 // Rejections (InvalidArgument, no write): `bank.count < 1`; `storedRow` outside
 // `[0, bank.count)`; `channel` outside `[-1, bank.channelCount)`, or `channel != -1` on a
 // bank with no channel table; a null `paddedProbeQuery`/`outDistance`; `bank.metric ==
-// Metric::Dot`.
+// Metric::Dot`; on an int8 bank, a channel whose `offset`/`length` is not a multiple of
+// the int8 SIMD grid (`kAlignment / ElementSize(Int8)`) — never fires on a validated
+// bank (`validate.cpp` grid-aligns every channel), closes the gap for a hand-built
+// `BankView`.
 // `workspace` stages the int8 leg's quantized probe (ReserveXdQuery/XdQ8/XdScale/XdSqSum)
 // -- the same warm, tracked buffer KthNeighborDistance/CalibrateNoveltyBaseline reuse via
 // their own `workspace` params, never a per-call heap allocation (Finding 3,
