@@ -9,7 +9,7 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
-## [3.2.2] — 2026-07-21
+## [3.3.0] — 2026-07-21
 
 ### Added
 - **`PeekScratchArchive`** — reads a serialized scratch archive's header and channel
@@ -19,6 +19,20 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   drift). A host that appends its own trailer after the archive can therefore locate and
   validate that trailer *before* committing the load, rather than discovering a broken
   trailer with the rows already replaced.
+
+### Changed
+- **`ComputePrincipalComponents`'s `scratch` parameter is now `double*`** (was `float*`).
+  The covariance-apply accumulator now matches the mean's accumulation precision — a
+  float accumulator rounded once per row and degraded the power iteration with bank
+  size — and the caller-owned scratch buffer changed type to match. This is
+  source-breaking: every existing caller must change the parameter's declared type from
+  `float*` to `double*` **and** double the size of the buffer it allocates (`dims`
+  doubles, not `dims` floats).
+- **`MeanNNCrossDeviceChannel`/`MaxNNCrossDeviceChannel` can now return `OutOfMemory`.**
+  Both now stage a pre-lift of the target's non-excluded sub-rows into the `Workspace`
+  argument (so each target's self-dot is computed once rather than once per source row,
+  see the self-dot hoist below); if that reservation fails, the call now returns
+  `OutOfMemory`, a status neither function could previously return.
 
 ### Fixed
 - **`ScratchBank::Load` now validates the retention region.** A retained row is by
@@ -58,12 +72,11 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   than an out-of-bounds access. `analytics.cpp`: the int8 off-grid channel guard from
   `novelty.cpp` now also protects the channel-analytics legs (added once in the shared
   `ChannelSubRange`), and the channel NN divergence pre-lifts each target's self-dot once
-  instead of once per source row. `pca.cpp`: the covariance-apply accumulator (and its
-  scratch buffer) is now `double` to match the mean's precision, and
-  `ProjectRowsOntoComponents` bounds `componentCount` by `dims` like its sibling. Scale
-  decode goes through `detail::FloatBitsToDouble` on the remaining `compose.cpp`/`pca.cpp`/
-  `analytics.cpp` paths, so a subnormal scale decodes identically under any FTZ/DAZ mode.
-  A comment documents that `novelty.cpp`'s `sampleLimit` is a ceiling, not a down-sampler.
+  instead of once per source row. `pca.cpp`: `ProjectRowsOntoComponents` bounds
+  `componentCount` by `dims` like its sibling. Scale decode goes through
+  `detail::FloatBitsToDouble` on the remaining `compose.cpp`/`pca.cpp`/`analytics.cpp`
+  paths, so a subnormal scale decodes identically under any FTZ/DAZ mode. A comment
+  documents that `novelty.cpp`'s `sampleLimit` is a ceiling, not a down-sampler.
 - **A Cosine channel bank with zero rows was unrepresentable.** `ValidateBank` required
   the per-channel inverse sub-norm array whenever a Cosine bank carried channels, but
   those norms are one per row — a bank with no rows requires none, and no scan reads the
@@ -128,6 +141,27 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   test suite) still carried 3.0.1 through both 3.1 releases; both now read 3.1.2. Found while
   closing an external review's release-identity finding.
 
+## [3.1.1] — 2026-07-18
+
+### Fixed
+- **AVX2 float32 dot/L2 dropped a sub-8 segment remainder.** `DotF32Avx2`/`L2F32Avx2` (and
+  their scalar mirrors) accumulated only in whole 8-lane groups with no remainder; a
+  float32 segment/channel stride lies on the 4-float (16-byte) grid, so a range whose
+  length is congruent to 4 mod 8 had its trailing 4 elements dropped entirely — a
+  length-4 channel scored exactly 0 on AVX2 while SSE/portable/NEON scored it correctly.
+  **This changed numeric results for affected widths**: `ResolveRowKernels` wires the
+  AVX2 dispatchers in directly for the segmented and per-channel-cosine scan, so any
+  named-channel or segmented query over a sub-8-remainder length (e.g. a length-4
+  channel) on AVX2 hardware returned a different, wrong score before this fix — a
+  consumer bisecting a score change across 3.1.0 to 3.1.2 should attribute the delta at
+  those widths to this fix, not to 3.1.0's `Relabel`. Whole-row scans were unaffected
+  (`DotF32`/`L2F32` route non-multiple-of-8 `paddedDims` to the SSE path, and
+  `paddedDims` is always a multiple of 8 for banks large enough to matter). The 4-element
+  remainder is now added to both the intrinsics and their scalar mirrors, bit-identically.
+- CI now requires the AVX2 path on the Linux job (previously accepted SSE or AVX2), so a
+  runner without AVX2 hardware cannot silently skip the new sub-8 remainder coverage;
+  Windows keeps the looser SSE-or-AVX2 check as the general x86 path.
+
 ## [3.1.0] — 2026-07-17
 
 ### Added
@@ -150,6 +184,23 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   100k × 256 Cosine bank costs ~30 ms against ~166 ms to rebuild from the rows on int8
   (~5.5× cheaper), ~2.1× on float32; promote/demote adds/frees a `capacity × channelCount × 4`
   sub-norm arena (~3.0 MB at 100k rows / 8 channels).
+
+## [3.0.1] — 2026-07-13
+
+### Fixed
+- **`version.h` still read 2.5.0 at the v3.0 tag.** Corrected to 3.0.0, with a coherence
+  test added so a future release cannot ship the same drift.
+- **`MeanNNCrossDeviceChannel`/`MaxNNCrossDeviceChannel` rejected a zero-energy Cosine
+  source and skipped zero-energy targets**, contradicting the documented "a degenerate
+  member floors to a defined 0 in a reduction" contract already honored by
+  `CentroidDistanceCrossDeviceChannel`/`SpreadCrossDeviceChannel`. Both guards are
+  removed so a degenerate channel member floors to 0 through the shared pair score,
+  consistent across all four channel operators.
+- **`MeasureRecallLockedChannel` aborted the whole per-channel recall audit** when a
+  sampled row's channel sub-vector was zero-energy — a valid row whose per-channel
+  self-query is `ZeroNormQuery`. It now excludes that sample, refills the reservoir from
+  the remaining rows, and reports the sample count actually scored rather than the
+  pre-set target.
 
 ## [3.0.0] — 2026-07-12
 
