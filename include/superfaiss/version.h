@@ -3,8 +3,8 @@
 #include <cstdint>
 
 #define SUPERFAISS_VERSION_MAJOR 3
-#define SUPERFAISS_VERSION_MINOR 2
-#define SUPERFAISS_VERSION_PATCH 2
+#define SUPERFAISS_VERSION_MINOR 3
+#define SUPERFAISS_VERSION_PATCH 0
 
 namespace superfaiss
 {
