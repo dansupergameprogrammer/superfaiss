@@ -51,9 +51,8 @@ Status NoveltyScore(
 //     (rejected upstream of this call on a Cosine bank).
 //   - float32, whole-row: the SAME two formulas, accumulated in DOUBLE over the plain
 //     floats (see the header note above), ending in the same subnormal floor.
-//     **Disclosed limit (F-M2-5, D-V32-51, 2026-07-19, Brunel's provisional call — Dan
-//     unavailable, PENDING his confirmation): this leg does NOT carry int8's "exact zero
-//     for any scalar multiple" guarantee.** Int8 exactness rests on cross/aSq/bSq being
+//     **Disclosed limit (F-M2-5, D-V32-51, ratified by Dan 2026-07-19, commit 37cb3c9c27):
+//     this leg does NOT carry int8's "exact zero for any scalar multiple" guarantee.** Int8 exactness rests on cross/aSq/bSq being
 //     EXACT INTEGER sums (D-V32-47) — zero rounding until the one final division+sqrt, so
 //     parallel int8 codes give a provably exact ratio. Float32 has no such step: even
 //     constructing a scaled probe (`c * row`) is itself a rounded float32 multiplication,
@@ -85,12 +84,19 @@ Status NoveltyScore(
 // `[0, bank.count)`; `channel` outside `[-1, bank.channelCount)`, or `channel != -1` on a
 // bank with no channel table; a null `paddedProbeQuery`/`outDistance`; `bank.metric ==
 // Metric::Dot`.
+// `workspace` stages the int8 leg's quantized probe (ReserveXdQuery/XdQ8/XdScale/XdSqSum)
+// -- the same warm, tracked buffer KthNeighborDistance/CalibrateNoveltyBaseline reuse via
+// their own `workspace` params, never a per-call heap allocation (Finding 5,
+// cf3f750-v32-core-batch-review.md: this entry used to bypass the library's own
+// AllocationCount() seam via a raw std::vector). The float32 leg does not touch
+// `workspace` (no quantization to stage).
 Status NoveltyProbeDistance(
 	const BankView& bank,
 	const float* paddedProbeQuery,
 	int32_t storedRow,
 	int32_t channel, // -1 = whole-row
-	float* outDistance);
+	float* outDistance,
+	Workspace& workspace);
 
 // The k-th-nearest-neighbour distance of `query` against the FULL view (plan 25.4), the
 // probe of research 4.4, converted to a RankDistance BEFORE anything ranks it (D-V32-19 —

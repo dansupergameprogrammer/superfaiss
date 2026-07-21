@@ -15224,6 +15224,11 @@ namespace
 static void TestM2NoveltyProbeDistance()
 {
 	Rng rng(0x4E5031);
+	// Finding 5 (Poirot cf3f750-v32-core-batch-review.md): NoveltyProbeDistance now takes
+	// a Workspace, matching its three sibling M2 entries (KthNeighborDistance,
+	// CalibrateNoveltyBaseline take one already) -- one warm workspace serves every call
+	// in this function.
+	Workspace ws;
 
 	// --- Trust boundaries (dim 2): storedRow/channel/null rejections, no write. ---
 	{
@@ -15234,21 +15239,21 @@ static void TestM2NoveltyProbeDistance()
 		std::vector<float> probe(static_cast<size_t>(b.view.paddedDims), 0.1f);
 		float out = -999.0f;
 
-		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), -1, -1, &out) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), -1, -1, &out, ws) == Status::InvalidArgument,
 			"storedRow -1 must reject");
-		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), count, -1, &out) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), count, -1, &out, ws) == Status::InvalidArgument,
 			"storedRow == count must reject");
-		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, 0, &out) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, 0, &out, ws) == Status::InvalidArgument,
 			"channel 0 on a bank with no channel table must reject");
-		CHECK_MSG(NoveltyProbeDistance(b.view, nullptr, 0, -1, &out) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(b.view, nullptr, 0, -1, &out, ws) == Status::InvalidArgument,
 			"null paddedProbeQuery must reject");
-		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, -1, nullptr) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(b.view, probe.data(), 0, -1, nullptr, ws) == Status::InvalidArgument,
 			"null outDistance must reject");
 		CHECK_MSG(out == -999.0f, "a rejected call must not write outDistance");
 
 		BankView dotView = b.view;
 		dotView.metric = Metric::Dot;
-		CHECK_MSG(NoveltyProbeDistance(dotView, probe.data(), 0, -1, &out) == Status::InvalidArgument,
+		CHECK_MSG(NoveltyProbeDistance(dotView, probe.data(), 0, -1, &out, ws) == Status::InvalidArgument,
 			"a Dot bank must reject -- never dispatched (verdict-unavailable is upstream)");
 		CHECK_MSG(out == -999.0f, "the Dot rejection must not write outDistance");
 	}
@@ -15265,8 +15270,8 @@ static void TestM2NoveltyProbeDistance()
 		GChannelBank b(src, count, dims, Quantization::Int8, Metric::Cosine, ch);
 		std::vector<float> probe(static_cast<size_t>(b.bank.view.paddedDims), 0.1f);
 		float out = -999.0f;
-		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, -2, &out) == Status::InvalidArgument);
-		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 2, &out) == Status::InvalidArgument);
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, -2, &out, ws) == Status::InvalidArgument);
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 2, &out, ws) == Status::InvalidArgument);
 		CHECK(out == -999.0f);
 	}
 
@@ -15294,7 +15299,7 @@ static void TestM2NoveltyProbeDistance()
 		{
 			std::vector<float> probe = M2PaddedProbeFromRow(b, 2);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), 2, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 2, -1, &out, ws) == Status::Ok);
 			if (metric == Metric::Cosine)
 			{
 				CHECK_MSG(out == 0.0f,
@@ -15315,7 +15320,7 @@ static void TestM2NoveltyProbeDistance()
 		{
 			std::vector<float> probe = M2PaddedProbeFromRow(b, (r + 3) % count);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), r, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), r, -1, &out, ws) == Status::Ok);
 			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), r, -1);
 			CHECK_MSG(ref.status == Status::Ok && ref.distance == out,
 				"int8 whole-row %s row %d: entry %.9g oracle %.9g",
@@ -15329,7 +15334,7 @@ static void TestM2NoveltyProbeDistance()
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.view.paddedDims);
 			const int32_t row = rng.NextIndex(count);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), row, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), row, -1, &out, ws) == Status::Ok);
 			const M2ProbeResult ref = M2OracleProbeDistance(b.view, probe.data(), row, -1);
 			CHECK_MSG(ref.status == Status::Ok && ref.distance == out,
 				"int8 whole-row %s random pair: entry %.9g oracle %.9g",
@@ -15353,7 +15358,7 @@ static void TestM2NoveltyProbeDistance()
 			std::vector<float> probe(normalizedRow.size());
 			for (size_t i = 0; i < probe.size(); ++i) probe[i] = c * normalizedRow[i];
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 0.0f,
 				"whole-row Cosine int8: scalar multiple c=%.6g of the stored row must score "
 				"exactly 0 (true cosine duplicate; byte-identity would miss most of these), "
@@ -15376,7 +15381,7 @@ static void TestM2NoveltyProbeDistance()
 		{
 			std::vector<float> probe = M2PaddedProbe({0, 1, 0, 0, 0, 0, 0, 0}, dims, b.view.paddedDims);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 0, -1, &out, ws) == Status::Ok);
 			const float expect = metric == Metric::Cosine ? 1.0f : 2.0f;
 			CHECK_MSG(out == expect, "whole-row float32 %s orthogonal pair: expected %.6g got %.9g",
 				metric == Metric::Cosine ? "Cosine" : "L2",
@@ -15385,7 +15390,7 @@ static void TestM2NoveltyProbeDistance()
 		{
 			std::vector<float> probe = M2PaddedProbeFromRow(b, 1);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.view, probe.data(), 1, -1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.view, probe.data(), 1, -1, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 0.0f, "whole-row float32 %s duplicate must score exactly 0, got %.9g",
 				metric == Metric::Cosine ? "Cosine" : "L2", static_cast<double>(out));
 		}
@@ -15401,7 +15406,7 @@ static void TestM2NoveltyProbeDistance()
 				std::vector<float> probe = M2PaddedProbe(probeSrc, rdims, rb.view.paddedDims);
 				const int32_t row = rng.NextIndex(rcount);
 				float out = -999.0f;
-				CHECK(NoveltyProbeDistance(rb.view, probe.data(), row, -1, &out) == Status::Ok);
+				CHECK(NoveltyProbeDistance(rb.view, probe.data(), row, -1, &out, ws) == Status::Ok);
 				const M2ProbeResult ref = M2OracleProbeDistance(rb.view, probe.data(), row, -1);
 				CHECK_MSG(ref.status == Status::Ok &&
 						std::fabs(ref.distance - out) <= 1e-5f * std::max(1.0f, std::fabs(ref.distance)),
@@ -15431,7 +15436,7 @@ static void TestM2NoveltyProbeDistance()
 			probeSrc[0] = 1.0f; // exact channel-0 direction match
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 0.0f,
 				"channel-scoped Cosine int8: exact-direction slice twin (strike 10) must "
 				"score exactly 0, got %.9g", static_cast<double>(out));
@@ -15441,7 +15446,7 @@ static void TestM2NoveltyProbeDistance()
 			probeSrc[1] = 1.0f; // orthogonal to row A's channel-0 direction
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 1.0f,
 				"channel-scoped Cosine int8: a different-direction slice must NOT score 0 "
 				"(orthogonal -> 1), got %.9g", static_cast<double>(out));
@@ -15469,7 +15474,7 @@ static void TestM2NoveltyProbeDistance()
 		probeSrc[16] = 1.0f;
 		std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 		float out = -999.0f;
-		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out) == Status::Ok);
+		CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);
 		// Near-zero, not exact-0: the pair is exact by hand-verified RATIONAL arithmetic
 		// (12500/127^2 + 12500/127^2 - 25000/127^2 == 0 exactly, since 2/127 and 1/127 are
 		// each other's cross-consistent scale), but the EXPANDED-FORM double computation
@@ -15501,7 +15506,7 @@ static void TestM2NoveltyProbeDistance()
 			probeSrc[17] = 1.0f; // channel-1 direction, axis 1 (orthogonal to row1)
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out);
+			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out, ws);
 			CHECK_MSG(s == Status::ZeroNormQuery,
 				"channel Cosine zero-energy STORED row (strike 12) must reject ZeroNormQuery, "
 				"got status=%d distance=%.9g", static_cast<int>(s), static_cast<double>(out));
@@ -15512,7 +15517,7 @@ static void TestM2NoveltyProbeDistance()
 			probeSrc[17] = 1.0f;
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out, ws) == Status::Ok);
 			CHECK_MSG(out == 1.0f,
 				"channel Cosine control (orthogonal, non-zero stored slice) must score 1, "
 				"got %.9g", static_cast<double>(out));
@@ -15522,7 +15527,7 @@ static void TestM2NoveltyProbeDistance()
 			probeSrc[0] = 1.0f; // nonzero elsewhere, but channel-1 [16,32) is all zero
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out);
+			const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 1, 1, &out, ws);
 			CHECK_MSG(s == Status::ZeroNormQuery,
 				"channel Cosine zero-energy PROBE slice must also reject ZeroNormQuery, "
 				"got status=%d distance=%.9g", static_cast<int>(s), static_cast<double>(out));
@@ -15541,7 +15546,7 @@ static void TestM2NoveltyProbeDistance()
 		probeSrc[16] = 3.0f;
 		std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 		float out = -999.0f;
-		const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out);
+		const Status s = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out, ws);
 		CHECK_MSG(s == Status::Ok,
 			"channel L2 zero-energy slice must NOT reject (no Cosine-only guard), got status=%d",
 			static_cast<int>(s));
@@ -15562,7 +15567,7 @@ static void TestM2NoveltyProbeDistance()
 			std::vector<float> probeSrc = {0, 0, 0, 0, 5, 0, 0, 0};
 			std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
 			float out = -999.0f;
-			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 1, &out, ws) == Status::Ok);
 			const float expect = metric == Metric::Cosine ? 0.0f : (5.0f - 2.0f) * (5.0f - 2.0f);
 			CHECK_MSG(out == expect, "channel float32 %s same-direction leg: expected %.6g got %.9g",
 				metric == Metric::Cosine ? "Cosine" : "L2",
@@ -15576,7 +15581,7 @@ static void TestM2NoveltyProbeDistance()
 			for (int32_t c = 0; c < 2; ++c)
 			{
 				float out = -999.0f;
-				CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, c, &out) == Status::Ok);
+				CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, c, &out, ws) == Status::Ok);
 				const M2ProbeResult ref = M2OracleProbeDistance(b.bank.view, probe.data(), 0, c);
 				CHECK_MSG(ref.status == Status::Ok &&
 						std::fabs(ref.distance - out) <= 1e-5f * std::max(1.0f, std::fabs(ref.distance)),
@@ -15585,6 +15590,36 @@ static void TestM2NoveltyProbeDistance()
 					static_cast<double>(out), static_cast<double>(ref.distance));
 			}
 		}
+	}
+
+	// --- Finding 5 (cf3f750-v32-core-batch-review.md): an off-grid int8 channel (length
+	// not a multiple of the 16-element grid DotI8I8's SIMD path assumes) must be a clean
+	// InvalidArgument, never a silently-wrong distance computed on the SIMD-padded slop.
+	// Hand-built BankView (validate.cpp would reject this table at bake; this proves the
+	// entry itself refuses it too, independent of upstream validation). An ON-grid channel
+	// on the SAME bank stays green -- the guard is scoped to the off-grid case only. ---
+	{
+		const int32_t dims = 32, count = 1;
+		std::vector<ChannelInfo> ch = {{0, 10}, {10, 22}}; // 10 is NOT a multiple of 16
+		std::vector<float> src(static_cast<size_t>(dims), 0.0f);
+		src[0] = 1.0f;
+		GChannelBank b(src, count, dims, Quantization::Int8, Metric::L2, ch);
+		std::vector<float> probeSrc(static_cast<size_t>(dims), 0.0f);
+		probeSrc[0] = 1.0f;
+		std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+		float out = -999.0f;
+		const Status offGrid = NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws);
+		CHECK_MSG(offGrid == Status::InvalidArgument,
+			"off-grid int8 channel (length 10, not a multiple of 16) must reject, got status=%d",
+			static_cast<int>(offGrid));
+
+		// The on-grid sibling channel (offset 10, length 22 -- also off-grid, so use a
+		// second, genuinely on-grid bank instead of channel 1 of this one) stays green.
+		std::vector<ChannelInfo> chOk = {{0, 16}, {16, 16}};
+		GChannelBank bOk(src, count, dims, Quantization::Int8, Metric::L2, chOk);
+		float outOk = -999.0f;
+		CHECK_MSG(NoveltyProbeDistance(bOk.bank.view, probe.data(), 0, 0, &outOk, ws) == Status::Ok,
+			"an ON-grid channel on the same bank shape must stay green");
 	}
 }
 
@@ -15837,7 +15872,7 @@ namespace
 		for (int32_t r = 0; r < bank.count; ++r)
 		{
 			float d = -999.0f;
-			const Status s = NoveltyProbeDistance(bank, query, r, channel, &d);
+			const Status s = NoveltyProbeDistance(bank, query, r, channel, &d, ws);
 			if (s == Status::Ok && d == 0.0f)
 			{
 				return M2Verdict::Duplicate;
@@ -16885,6 +16920,53 @@ static void TestS1FlatAllocationCalibrateNoveltyBaseline()
 	CHECK(ws.GrowthCount() == growthBefore);
 }
 
+// Finding 3 (cf3f750-v32-core-batch-review.md): NoveltyProbeDistance's int8 leg
+// heap-allocated a std::vector<int8_t> on EVERY call via ::operator new, invisible to
+// AllocationCount() (which only sees traffic through the Workspace seam) -- exactly the
+// blind spot the header comment above this file's ScopedRawNewTracking documents. An
+// AllocationCount()-only assertion around this call reports flat whether or not the
+// violation is present (confirmed: it does, on the pre-fix code) and so cannot serve as
+// the oracle alone; ScopedRawNewTracking closes the blind spot. Same construction as
+// TestS1FlatAllocationBuildKnnNeighbors/CalibrateNoveltyBaseline above. Both the
+// whole-row and channel legs are exercised (both now route through the same
+// workspace.ReserveXdQuery block).
+static void TestS1FlatAllocationNoveltyProbeDistance()
+{
+	Rng rng(0x51A3);
+	const int32_t dims = 32, count = 4;
+	std::vector<ChannelInfo> ch = {{0, 16}, {16, 16}};
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GChannelBank b(src, count, dims, Quantization::Int8, Metric::Cosine, ch);
+	std::vector<float> probeSrc(static_cast<size_t>(dims));
+	for (float& v : probeSrc) v = rng.NextFloat();
+	std::vector<float> probe = M2PaddedProbe(probeSrc, dims, b.bank.view.paddedDims);
+
+	Workspace ws;
+	float out = -999.0f;
+	CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, -1, &out, ws) == Status::Ok); // warm
+	CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), 0, 0, &out, ws) == Status::Ok);   // warm, channel
+
+	const uint64_t allocsBefore = AllocationCount();
+	const uint64_t growthBefore = ws.GrowthCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 20; ++i)
+		{
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, -1, &out, ws) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, 0, &out, ws) == Status::Ok);
+			CHECK(NoveltyProbeDistance(b.bank.view, probe.data(), i % count, 1, &out, ws) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"NoveltyProbeDistance allocated %llu time(s) outside the Workspace seam on a warm workspace",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK_MSG(AllocationCount() == allocsBefore,
+		"NoveltyProbeDistance's seam-tracked allocations grew on a warm workspace: %llu -> %llu",
+		static_cast<unsigned long long>(allocsBefore), static_cast<unsigned long long>(AllocationCount()));
+	CHECK(ws.GrowthCount() == growthBefore);
+}
+
 // S1 (novelty.h, "probe" half — bonus finding, not named in any prior casebook).
 // KthNeighborDistance calls workspace.Reserve(k, 1) and then STILL parks its
 // output in a fresh std::vector<Hit> instead of workspace.HeapStorage() — the
@@ -17121,6 +17203,7 @@ int main()
 	TestS4SharedRowDecodeHelperAllThreeModules();
 	TestS1FlatAllocationBuildKnnNeighbors();
 	TestS1FlatAllocationCalibrateNoveltyBaseline();
+	TestS1FlatAllocationNoveltyProbeDistance();
 	TestS1FlatAllocationKthNeighborDistanceProbe();
 	TestS1FlatAllocationMutualNearestMatches();
 

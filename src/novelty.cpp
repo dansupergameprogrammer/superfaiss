@@ -20,7 +20,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <vector>
 
 namespace superfaiss
 {
@@ -82,7 +81,8 @@ Status NoveltyScore(const float* sortedBaseline, int32_t count, float distance, 
 }
 
 Status NoveltyProbeDistance(
-	const BankView& bank, const float* paddedProbeQuery, int32_t storedRow, int32_t channel, float* outDistance)
+	const BankView& bank, const float* paddedProbeQuery, int32_t storedRow, int32_t channel, float* outDistance,
+	Workspace& workspace)
 {
 	if (bank.count < 1 || storedRow < 0 || storedRow >= bank.count || paddedProbeQuery == nullptr ||
 		outDistance == nullptr || bank.metric == Metric::Dot)
@@ -98,6 +98,21 @@ Status NoveltyProbeDistance(
 	const int32_t offset = wholeRow ? 0 : bank.channels[channel].offset;
 	const int32_t length = wholeRow ? bank.paddedDims : bank.channels[channel].length;
 
+	// Finding 5 (cf3f750-v32-core-batch-review.md): detail::DotI8I8's SIMD paths assume a
+	// length that is a multiple of the int8 grid (kAlignment / ElementSize(Int8) == 16) and
+	// have no scalar remainder tail -- computing on an off-grid channel range would read the
+	// SIMD-padded slop instead of cleanly refusing. Every VALIDATED bank's channel table is
+	// grid-aligned by construction (validate.cpp's offset/length % grid == 0 rejection), so
+	// this never fires on production data; it closes the gap for a hand-built BankView.
+	if (!wholeRow && bank.quant == Quantization::Int8)
+	{
+		const int32_t grid = kAlignment / ElementSize(Quantization::Int8);
+		if (offset % grid != 0 || length % grid != 0)
+		{
+			return Status::InvalidArgument;
+		}
+	}
+
 	double cross = 0.0, aSq = 0.0, bSq = 0.0;
 	double aScaleD = 1.0, bScaleD = 1.0;
 
@@ -108,10 +123,20 @@ Status NoveltyProbeDistance(
 		// channel leg then restricts every sum to [offset, offset+length) on both operands
 		// (the stored row keeps its own whole-row scale too — channel scoring never
 		// renormalizes, the XdChannelPairScore convention).
-		std::vector<int8_t> probeQ8(static_cast<size_t>(bank.paddedDims));
-		double probeScale = 0.0;
-		int64_t probeSqSum = 0;
-		QuantizeQueryXd(paddedProbeQuery, bank.paddedDims, probeQ8.data(), &probeScale, &probeSqSum);
+		//
+		// Finding 3 (cf3f750-v32-core-batch-review.md): staged through `workspace`'s own
+		// ReserveXdQuery/XdQ8 block -- the same warm, tracked buffer query.cpp's CrossDevice
+		// leg uses (query.cpp:314-322) -- never a per-call std::vector heap allocation, so
+		// this entry is visible to the library's own AllocationCount() zero-alloc seam like
+		// every other hot path.
+		if (!workspace.ReserveXdQuery(bank.paddedDims, 1))
+		{
+			return Status::OutOfMemory;
+		}
+		int8_t* probeQ8 = workspace.XdQ8(0);
+		QuantizeQueryXd(paddedProbeQuery, bank.paddedDims, probeQ8, workspace.XdScale(0), workspace.XdSqSum(0));
+		const double probeScale = *workspace.XdScale(0);
+		const int64_t probeSqSum = *workspace.XdSqSum(0);
 
 		const int8_t* rowBytes = static_cast<const int8_t*>(bank.rows) + static_cast<int64_t>(storedRow) * bank.paddedDims;
 		const double rowScale = detail::FloatBitsToDouble(bank.scales[storedRow]);
@@ -120,20 +145,13 @@ Status NoveltyProbeDistance(
 		{
 			// Delegate to the PUBLIC entry: byte-identical to the strike-verified ground
 			// truth by construction, not by re-deriving the same arithmetic twice.
-			const XdQuery probeQuery{probeQ8.data(), probeScale, probeSqSum};
+			const XdQuery probeQuery{probeQ8, probeScale, probeSqSum};
 			const XdQuery rowQuery{rowBytes, rowScale, detail::DotI8I8(rowBytes, rowBytes, bank.paddedDims)};
 			return ScoreXdPair(probeQuery, rowQuery, bank.paddedDims, bank.metric, outDistance);
 		}
 
-		// NOTE (F-M2-3, routed): detail::DotI8I8's SIMD paths assume `n` is a multiple of
-		// 16 (kernels.cpp's own "int8 ranges are multiples of 16" comment) and have no
-		// scalar remainder tail — silently wrong (not a crash) for a non-grid-aligned
-		// channel length. Every PRODUCTION channel table is grid-aligned by construction
-		// (validate.cpp's offset/length % grid == 0 rejection), so this is safe for any
-		// validated bank; it is NOT safe against a hand-built test BankView with an
-		// off-grid channel table.
-		cross = static_cast<double>(detail::DotI8I8(rowBytes + offset, probeQ8.data() + offset, length));
-		aSq = static_cast<double>(detail::DotI8I8(probeQ8.data() + offset, probeQ8.data() + offset, length));
+		cross = static_cast<double>(detail::DotI8I8(rowBytes + offset, probeQ8 + offset, length));
+		aSq = static_cast<double>(detail::DotI8I8(probeQ8 + offset, probeQ8 + offset, length));
 		bSq = static_cast<double>(detail::DotI8I8(rowBytes + offset, rowBytes + offset, length));
 		aScaleD = probeScale;
 		bScaleD = rowScale;
