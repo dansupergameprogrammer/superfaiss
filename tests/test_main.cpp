@@ -12099,9 +12099,12 @@ static void TestChannelQueryOnlyStorm()
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 	// The reader must have observed the count ADVANCE past the initial rows, or the storm
-	// never exercised a concurrent publish (the P-1 defect this rewrite fixes). Guaranteed by
-	// the wait above (Count() is monotonically non-decreasing), and kept as a live regression
-	// check against that guarantee rather than deleted.
+	// never exercised a concurrent publish (the P-1 defect this rewrite fixes). NOT implied
+	// by the wait above: the gate polls bank.Count() directly, while maxCountSeen is
+	// accumulated from snap.count via bank.Snapshot() -- a different read path. This is the
+	// check that catches a regression in Snapshot's own acquire ordering (Snapshot returning
+	// a stale count even though Count() itself has advanced); it is a live guard on a
+	// distinct path from the gate and must not be removed as redundant with it.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -12204,8 +12207,11 @@ static void TestChannelScopedReductionStorm()
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
-	// Guaranteed by the wait above (Count() is monotonically non-decreasing); kept as a live
-	// regression check against that guarantee rather than deleted.
+	// NOT implied by the wait above: the gate polls bank.Count() directly, while
+	// maxCountSeen is accumulated from snap.count via bank.Snapshot() -- a different read
+	// path. This is the check that catches a regression in Snapshot's own acquire ordering
+	// (Snapshot returning a stale count even though Count() itself has advanced); it is a
+	// live guard on a distinct path from the gate and must not be removed as redundant.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -13743,8 +13749,11 @@ static void TestRelabelExclusiveDrainStorm()
 	CHECK_MSG(matchedSomeTarget,
 		"relabel storm: the final channel table never left the fixture's initial (1-channel) "
 		"table -- Relabel never mutated the bank under concurrent load");
-	// Guaranteed by the wait above (Count() is monotonically non-decreasing); kept as a live
-	// regression check against that guarantee rather than deleted.
+	// NOT implied by the wait above: the gate polls bank.Count() directly, while
+	// maxCountSeen is accumulated from snap.count via bank.Snapshot() -- a different read
+	// path. This is the check that catches a regression in Snapshot's own acquire ordering
+	// (Snapshot returning a stale count even though Count() itself has advanced); it is a
+	// live guard on a distinct path from the gate and must not be removed as redundant.
 	CHECK_MSG(maxCountSeen > appended,
 		"relabel storm: reader never observed a freshly-published row (count stayed at %d)",
 		maxCountSeen);
