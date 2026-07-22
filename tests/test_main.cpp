@@ -15,6 +15,7 @@
 #include "xd_fixtures.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -328,6 +329,31 @@ static void PadQuery(const std::vector<float>& q, int32_t pd, float* out)
 {
 	std::memset(out, 0, static_cast<size_t>(pd) * sizeof(float));
 	std::memcpy(out, q.data(), q.size() * sizeof(float));
+}
+
+// Bounded-wait for a ScratchBank's published count to advance past `appended` -- the
+// deterministic form of "the writer has published at least one fresh row" that a storm
+// test's reader needs before its measured loop starts. Count() is an atomic acquire load
+// (safe to poll unpinned, from any thread), so this returns as soon as the writer's first
+// successful Append lands under real scheduling instead of on a fixed iteration budget.
+// Bounded by `timeoutMs`: a genuine regression in the append/publish path (the writer never
+// actually advancing the count) still fails the test loudly here, rather than leaving the
+// caller's own liveness assertion to trip only when the reader happens to outrun the writer,
+// or leaving the wait to hang forever.
+static bool WaitForPublishPastCount(const ScratchBank& bank, int32_t appended,
+	int32_t timeoutMs = 5000)
+{
+	const auto deadline =
+		std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+	while (bank.Count() <= appended)
+	{
+		if (std::chrono::steady_clock::now() >= deadline)
+		{
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,11 +1126,15 @@ static void TestSimdEqualsScalar()
 // Where the defect actually bites (established while authoring this test — the coord's
 // original "length-4 scores 0 on the whole-row path" framing was imprecise):
 //   * The WHOLE-ROW dispatch DotF32()/L2F32() (src/kernels.cpp) selects the AVX2
-//     intrinsic ONLY when paddedDims % 8 == 0 (else DotF32Sse, which handles the tail).
-//     PaddedDims is always a multiple of 8 for f32 banks big enough to matter, so a
-//     length ≡ 4 mod 8 never reaches the intrinsic through that dispatch — the whole-
-//     row path was NOT wrong in production. That is why the correctness check in Part A
-//     runs against the scalar MIRROR directly, not through DotF32().
+//     intrinsic ONLY when the length it is handed is a multiple of 8 (else DotF32Sse,
+//     which handles the tail), so a length ≡ 4 mod 8 never reaches the intrinsic through
+//     that dispatch. That is why the correctness check in Part A runs against the scalar
+//     MIRROR directly, not through DotF32().
+//     (This bullet used to add "PaddedDims is always a multiple of 8 for f32 banks big
+//     enough to matter". That is FALSE — f32 strides are multiples of 4, so dims 20, 36,
+//     52, 100 and 132 all produce odd strides — and the belief is what let the two scan
+//     paths diverge unnoticed at those widths. TestSegmentedEqualsWholeRowAcrossWidths
+//     now sweeps them and compares the two paths to each other.)
 //   * The defect bites the SEGMENTED / per-channel-cosine scan: ResolveRowKernels()
 //     (src/kernels.cpp) wires k.dotF32 = DotF32Avx2 RAW (no % 8 guard), and the non-
 //     foldable per-channel-cosine path (ScoreChunkSegmented) calls it over each
@@ -2027,7 +2057,7 @@ static void TestPca()
 
 		std::vector<float> mean(static_cast<size_t>(dims));
 		std::vector<float> comps(static_cast<size_t>(2) * dims);
-		std::vector<float> scratch(static_cast<size_t>(dims));
+		std::vector<double> scratch(static_cast<size_t>(dims));
 		CHECK(ComputePrincipalComponents(view, 2, 48, mean.data(), comps.data(),
 			scratch.data()) == Status::Ok);
 
@@ -2062,6 +2092,12 @@ static void TestPca()
 		std::vector<float> coords(static_cast<size_t>(count) * 2);
 		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), 2,
 			coords.data()) == Status::Ok);
+		// componentCount is bounded by dims on BOTH entry points (a count above dims would
+		// index past `components`), the same rejection ComputePrincipalComponents applies.
+		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), dims + 1,
+			coords.data()) == Status::InvalidArgument);
+		CHECK(ProjectRowsOntoComponents(view, mean.data(), comps.data(), 0,
+			coords.data()) == Status::InvalidArgument);
 		{
 			const int32_t r = 7;
 			double expect = 0.0;
@@ -2105,7 +2141,7 @@ static void TestPca()
 		view.metric = Metric::Dot;
 		std::vector<float> mean(static_cast<size_t>(d));
 		std::vector<float> comps(static_cast<size_t>(d));
-		std::vector<float> scratch(static_cast<size_t>(d));
+		std::vector<double> scratch(static_cast<size_t>(d));
 		CHECK(ComputePrincipalComponents(view, 1, 16, mean.data(), comps.data(),
 			scratch.data()) == Status::Ok);
 		double norm = 0.0;
@@ -2130,6 +2166,107 @@ static void TestPca()
 //        unchanged.
 //   B  — repeat determinism, external chunk-fusion merge bit-identity,
 //        validation rejections including the query-side zero-norm segment law.
+
+// The path-equality contract, swept across the widths that can break it.
+//
+// TestSegmentedScan's A1 already asserts "degenerate one-segment query == whole-row
+// scan, bit-identical" — but only at dims 32, where the float32 stride is a multiple of
+// 8. That is precisely where the two paths cannot disagree, because the float32 kernel
+// dispatchers select AVX2 only at `length % 8 == 0` and both paths then choose it. The
+// mechanism was covered; the width was not, and 12/32/64/128/256/768 all miss it.
+//
+// Float32 strides are multiples of 4, so dims 20, 36, 52, 100 and 132 produce strides
+// that are NOT multiples of 8. At those widths a second selection rule anywhere in the
+// scan shows up as a last-ulp disagreement between the two paths — which is what
+// DETERMINISM.md's "no second code path exists to drift" forbids, and what the plugin's
+// "contributions sum EXACTLY to the hit's score" is built on.
+//
+// This is the cross-PATH check. T11's sweep compares each kernel against its own scalar
+// mirror, which stays green while the two paths pick different kernels, because each is
+// individually correct. Comparing a path to a mirror is not comparing a path to a path.
+static void TestSegmentedEqualsWholeRowAcrossWidths()
+{
+	Rng rng(0x9D71A55ull);
+	const int32_t count = 120;
+	const int32_t k = 8;
+	// Chosen so the float32 stride is NOT a multiple of 8 (20, 36, 52, 100, 132) with
+	// multiple-of-8 controls (32, 64) beside them.
+	const int32_t dimsSet[] = {20, 32, 36, 52, 64, 100, 132};
+
+	for (int32_t dims : dimsSet)
+	{
+		for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+		{
+			if (dims % (kAlignment / ElementSize(quant)) != 0)
+			{
+				continue; // not on this quantization's element grid; not a legal segment
+			}
+			for (Metric metric : {Metric::Dot, Metric::Cosine, Metric::L2})
+			{
+				TestBank bank(rng, count, dims, quant, metric);
+				const int32_t pd = bank.view.paddedDims;
+				AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
+				std::vector<float> qv(static_cast<size_t>(dims));
+				for (auto& x : qv)
+				{
+					x = rng.NextFloat();
+				}
+				PadQuery(qv, pd, q.F32());
+
+				QueryParams plain;
+				plain.k = k;
+				Workspace ws1;
+				std::vector<Hit> whole(static_cast<size_t>(k));
+				int32_t wholeCount = 0;
+				CHECK(Query(bank.view, q.F32(), plain, ws1, whole.data(), &wholeCount) ==
+					Status::Ok);
+
+				const QuerySegment degenerate[1] = {{0, pd, 1.0f}};
+				QueryParams seg = plain;
+				seg.segments = degenerate;
+				seg.segmentCount = 1;
+				Workspace ws2;
+				std::vector<Hit> segmented(static_cast<size_t>(k));
+				int32_t segCount = 0;
+				CHECK(Query(bank.view, q.F32(), seg, ws2, segmented.data(), &segCount) ==
+					Status::Ok);
+
+				CHECK_MSG(segCount == wholeCount,
+					"dims=%d pd=%d quant=%d metric=%d: hit counts differ (%d vs %d)",
+					dims, pd, static_cast<int>(quant), static_cast<int>(metric),
+					wholeCount, segCount);
+				for (int32_t i = 0; i < wholeCount && i < segCount; ++i)
+				{
+					CHECK_MSG(segmented[i].index == whole[i].index &&
+							segmented[i].score == whole[i].score,
+						"dims=%d pd=%d quant=%d metric=%d hit %d: whole-row (%d, %.9g) vs "
+						"one-segment (%d, %.9g) — the two scan paths disagree",
+						dims, pd, static_cast<int>(quant), static_cast<int>(metric), i,
+						whole[i].index, static_cast<double>(whole[i].score),
+						segmented[i].index, static_cast<double>(segmented[i].score));
+				}
+
+				// The decomposition surface rides the same kernel table, and its published
+				// claim is that a contribution IS the score. With one whole-row segment
+				// there is exactly one contribution and no summation order to argue about,
+				// so this is the claim stated at its sharpest.
+				if (wholeCount > 0)
+				{
+					float contribution = 0.0f;
+					const float total = DecomposeRowScore(bank.view, q.F32(),
+						whole[0].index, degenerate, 1, &contribution);
+					CHECK_MSG(total == whole[0].score,
+						"dims=%d pd=%d quant=%d metric=%d: decomposed total %.9g != scan "
+						"score %.9g for row %d",
+						dims, pd, static_cast<int>(quant), static_cast<int>(metric),
+						static_cast<double>(total),
+						static_cast<double>(whole[0].score), whole[0].index);
+					CHECK(contribution == total);
+				}
+			}
+		}
+	}
+}
 
 static void TestSegmentedScan()
 {
@@ -2721,6 +2858,339 @@ namespace
 		ScratchArchive Reader() { return {nullptr, &MemArchive::Read, this}; }
 	};
 } // namespace
+
+// The public construction paths bound their geometry BEFORE the arena size arithmetic
+// runs on it. ArenaBytes multiplies capacity by dims in signed int64, so an uncapped
+// int32 pair is overflow — undefined behavior, not a refused allocation. The archive
+// loader already applied these ceilings; Create and Grow did not.
+static void TestScratchGeometryCeilings()
+{
+	// Over-cap capacity: an argument defect, and nothing is allocated — the bank stays
+	// uncreated, so a subsequent valid Create on the same object still succeeds.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(kMaxBankRows + 1, 64, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+		CHECK(bank.Create(16, 64, Metric::Dot, Quantization::Float32) == Status::Ok);
+	}
+	// Over-cap dims, on the retention overload.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(16, kMaxCrossDeviceDims + 1, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+	}
+	// The channel overload carries its own preamble, so it needs its own proof. A fresh
+	// bank per case: on a shared object the second call would be refused for being
+	// already-created, and the cap would read proven while never having run.
+	{
+		const ChannelInfo channels[1] = {{0, 16}};
+		ScratchBank overRows;
+		CHECK(overRows.Create(kMaxBankRows + 1, 64, Metric::Cosine, Quantization::Float32,
+				  channels, 1) == Status::InvalidArgument);
+		CHECK(!overRows.IsCreated());
+		ScratchBank overDims;
+		CHECK(overDims.Create(16, kMaxCrossDeviceDims + 1, Metric::Cosine,
+				  Quantization::Float32, channels, 1) == Status::InvalidArgument);
+		CHECK(!overDims.IsCreated());
+	}
+	// The pair that overflows the arena arithmetic outright. Rejected on geometry, so the
+	// multiply never runs on it.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(INT32_MAX, INT32_MAX, Metric::Dot, Quantization::Float32) ==
+			Status::InvalidArgument);
+		CHECK(!bank.IsCreated());
+	}
+	// Grow takes the same ceiling, and a refused Grow leaves the bank exactly as it was.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(16, 64, Metric::Dot, Quantization::Float32) == Status::Ok);
+		CHECK(bank.Grow(kMaxBankRows + 1) == Status::InvalidArgument);
+		CHECK(bank.Grow(INT32_MAX) == Status::InvalidArgument);
+		CHECK(bank.Capacity() == 16);
+		CHECK(bank.Grow(32) == Status::Ok);
+		CHECK(bank.Capacity() == 32);
+	}
+}
+
+// A Cosine channel bank with zero rows is representable: the inverse sub-norms are one
+// per row, so no rows require none. This is the shape a channel-carrying scratch bank
+// graduates into once every row has been removed — an emptied channel bank is still a
+// channel bank, and rejecting it forced the graduation to drop its channels instead.
+static void TestEmptyCosineChannelBankValidates()
+{
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		BankView empty;
+		empty.rows = nullptr;
+		empty.scales = nullptr;
+		empty.count = 0;
+		empty.dims = 64;
+		empty.paddedDims = PaddedDims(64, quant);
+		empty.quant = quant;
+		empty.metric = Metric::Cosine;
+		empty.channels = channels;
+		empty.channelCount = 2;
+		empty.channelInvNorms = nullptr;
+		CHECK_MSG(ValidateBank(empty) == Status::Ok,
+			"zero-row Cosine channel bank rejected (quant %d)", static_cast<int>(quant));
+		CHECK(ValidateBankData(empty, nullptr) == Status::Ok);
+	}
+	// With rows present the array is still required — the relaxation is about count, not
+	// about the rule.
+	{
+		Rng rng(0x4E5701ull);
+		const int32_t dims = 64, count = 8;
+		TestBank bank(rng, count, dims, Quantization::Int8, Metric::Cosine);
+		BankView view = bank.view;
+		view.channels = channels;
+		view.channelCount = 2;
+		view.channelInvNorms = nullptr;
+		CHECK_MSG(ValidateBank(view) == Status::BadFormat,
+			"a populated Cosine channel bank must still require its sub-norms");
+	}
+}
+
+// The retention region is part of what "the archive is not trusted" covers. A retained
+// row is by construction the post-normalization row the quantizer consumed, so replaying
+// the bake on it must reproduce the stored row exactly; a fabricated-but-finite retained
+// array would otherwise load clean and hand MeasureScratchRecall an invented reference to
+// audit the quantized rows against — through the one API whose whole job is honest.
+static void TestScratchLoadValidatesRetainedRegion()
+{
+	Rng rng(0x2E7A15ull);
+	const int32_t dims = 32, count = 24;
+
+	for (Quantization quant : {Quantization::Float32, Quantization::Int8})
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(count, dims, Metric::Cosine, quant, /*retainFloats=*/true) ==
+			Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < count; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		MemArchive good;
+		CHECK(bank.Save(good.Writer()) == Status::Ok);
+
+		// The clean blob loads, so the corruptions below fail for their own reason.
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			ScratchBank target;
+			CHECK(target.Load(a.Reader()) == Status::Ok);
+			CHECK(target.RetainsFloats());
+		}
+
+		// The retained region is the LAST thing Save writes, so the trailing
+		// count * dims floats are it. Perturb one value: still finite, still plausible,
+		// but no longer the row the quantizer consumed.
+		const size_t retainedBytes =
+			static_cast<size_t>(count) * dims * sizeof(float);
+		CHECK(good.bytes.size() > retainedBytes);
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			float* retained = reinterpret_cast<float*>(a.bytes.data() +
+				(a.bytes.size() - retainedBytes));
+			retained[0] = retained[0] + 0.25f; // finite, wrong
+			ScratchBank target;
+			CHECK_MSG(target.Load(a.Reader()) == Status::BadFormat,
+				"a fabricated retained row must be rejected (quant %d)",
+				static_cast<int>(quant));
+		}
+		// A non-finite retained value is rejected too.
+		{
+			MemArchive a;
+			a.bytes = good.bytes;
+			float* retained = reinterpret_cast<float*>(a.bytes.data() +
+				(a.bytes.size() - retainedBytes));
+			retained[3] = std::numeric_limits<float>::quiet_NaN();
+			ScratchBank target;
+			CHECK(target.Load(a.Reader()) == Status::BadFormat);
+		}
+	}
+}
+
+// PeekScratchArchive reports a serialized archive's geometry and — the reason it exists —
+// the exact byte length a Load consumes, so a host that appends its own trailer can find
+// and validate that trailer BEFORE committing the load.
+static void TestPeekScratchArchive()
+{
+	Rng rng(0x9E5A11ull);
+	const int32_t dims = 64;
+	const ChannelInfo channels[2] = {{0, 32}, {32, 32}};
+
+	struct Shape
+	{
+		const char* name;
+		bool hasChannels;
+		bool retain;
+		Quantization quant;
+		Metric metric;
+	};
+	const Shape shapes[] = {
+		{"legacy f32 dot", false, false, Quantization::Float32, Metric::Dot},
+		{"legacy int8 cosine", false, false, Quantization::Int8, Metric::Cosine},
+		{"retention int8 cosine", false, true, Quantization::Int8, Metric::Cosine},
+		{"channels f32 cosine", true, false, Quantization::Float32, Metric::Cosine},
+		{"channels+retention int8 cosine", true, true, Quantization::Int8, Metric::Cosine},
+		{"channels int8 dot", true, false, Quantization::Int8, Metric::Dot},
+	};
+	for (const Shape& shape : shapes)
+	{
+		ScratchBank bank;
+		const Status created = shape.hasChannels
+			? bank.Create(32, dims, shape.metric, shape.quant, channels, 2, shape.retain)
+			: bank.Create(32, dims, shape.metric, shape.quant, shape.retain);
+		CHECK_MSG(created == Status::Ok, "%s: create failed (%d)", shape.name,
+			static_cast<int>(created));
+		if (created != Status::Ok)
+		{
+			continue;
+		}
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 20; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		CHECK(bank.Remove(4) == Status::Ok); // tombstone words are part of the length
+
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+
+		ScratchArchiveInfo info;
+		const Status peeked = PeekScratchArchive(
+			archive.bytes.data(), static_cast<int64_t>(archive.bytes.size()), &info);
+		CHECK_MSG(peeked == Status::Ok, "%s: peek failed (%d)", shape.name,
+			static_cast<int>(peeked));
+		if (peeked != Status::Ok)
+		{
+			continue;
+		}
+		CHECK_MSG(info.archiveBytes == static_cast<int64_t>(archive.bytes.size()),
+			"%s: archiveBytes %lld, blob %lld", shape.name,
+			static_cast<long long>(info.archiveBytes),
+			static_cast<long long>(archive.bytes.size()));
+		CHECK(info.count == bank.Count());
+		CHECK(info.capacity == bank.Capacity());
+		CHECK(info.dims == dims);
+		CHECK(info.paddedDims == bank.GetPaddedDims());
+		CHECK(info.metric == shape.metric);
+		CHECK(info.quant == shape.quant);
+		CHECK_MSG(info.retainFloats == shape.retain, "%s: retention flag lost", shape.name);
+		CHECK_MSG(info.channelCount == (shape.hasChannels ? 2 : 0),
+			"%s: channelCount %d", shape.name, info.channelCount);
+		for (int32_t c = 0; c < info.channelCount; ++c)
+		{
+			CHECK(info.channels[c].offset == channels[c].offset &&
+				info.channels[c].length == channels[c].length);
+		}
+
+		// A span that does not cover the archive it declares is truncated — a format
+		// defect, never a short read to paper over.
+		ScratchArchiveInfo truncated;
+		CHECK(PeekScratchArchive(archive.bytes.data(),
+				  static_cast<int64_t>(archive.bytes.size()) - 1, &truncated) ==
+			Status::BadFormat);
+		CHECK(PeekScratchArchive(archive.bytes.data(), 8, &truncated) == Status::BadFormat);
+		CHECK(PeekScratchArchive(archive.bytes.data(), 0, &truncated) == Status::BadFormat);
+
+		// Trailing bytes belong to the caller: the peek succeeds and points at them.
+		std::vector<uint8_t> withTrailer = archive.bytes;
+		withTrailer.push_back(0xABu);
+		withTrailer.push_back(0xCDu);
+		ScratchArchiveInfo trailed;
+		CHECK(PeekScratchArchive(withTrailer.data(),
+				  static_cast<int64_t>(withTrailer.size()), &trailed) == Status::Ok);
+		CHECK_MSG(trailed.archiveBytes == static_cast<int64_t>(archive.bytes.size()),
+			"%s: trailer moved the reported archive length", shape.name);
+	}
+
+	// The header rules are the loader's own: whatever a peek rejects, a Load rejects.
+	{
+		ScratchBank bank;
+		CHECK(bank.Create(8, 32, Metric::Dot, Quantization::Float32) == Status::Ok);
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+
+		std::vector<uint8_t> badMagic = archive.bytes;
+		badMagic[0] = static_cast<uint8_t>(badMagic[0] ^ 0xFFu);
+		std::vector<uint8_t> badVersion = archive.bytes;
+		badVersion[4] = 4u; // a future version: the standing old-reader/new-data reject
+		std::vector<uint8_t> zeroVersion = archive.bytes;
+		zeroVersion[4] = 0u;
+		std::vector<uint8_t> forgedV3 = archive.bytes;
+		forgedV3[4] = 3u; // v3 without the channels flag is a shape the writer never emits
+
+		const std::vector<uint8_t>* bad[] = {&badMagic, &badVersion, &zeroVersion, &forgedV3};
+		for (const std::vector<uint8_t>* blob : bad)
+		{
+			ScratchArchiveInfo info;
+			CHECK(PeekScratchArchive(blob->data(), static_cast<int64_t>(blob->size()), &info) ==
+				Status::BadFormat);
+			MemArchive corrupt;
+			corrupt.bytes = *blob;
+			ScratchBank target;
+			CHECK(target.Load(corrupt.Reader()) == Status::BadFormat);
+		}
+
+		ScratchArchiveInfo info;
+		CHECK(PeekScratchArchive(nullptr, 32, &info) == Status::InvalidArgument);
+		CHECK(PeekScratchArchive(archive.bytes.data(),
+				  static_cast<int64_t>(archive.bytes.size()), nullptr) ==
+			Status::InvalidArgument);
+	}
+
+	// The header claims the peek allocates nothing — proven, not asserted. Everything the
+	// tracked scope touches is built before it opens.
+	{
+		const ChannelInfo table[2] = {{0, 32}, {32, 32}};
+		ScratchBank bank;
+		CHECK(bank.Create(32, dims, Metric::Cosine, Quantization::Int8, table, 2,
+				  /*retainFloats=*/true) == Status::Ok);
+		std::vector<float> row(static_cast<size_t>(dims));
+		for (int32_t r = 0; r < 12; ++r)
+		{
+			for (auto& v : row)
+			{
+				v = rng.NextFloat();
+			}
+			CHECK(bank.Append(row.data(), dims, nullptr) == Status::Ok);
+		}
+		MemArchive archive;
+		CHECK(bank.Save(archive.Writer()) == Status::Ok);
+		const uint8_t* blob = archive.bytes.data();
+		const int64_t blobBytes = static_cast<int64_t>(archive.bytes.size());
+		ScratchArchiveInfo info;
+		CHECK(PeekScratchArchive(blob, blobBytes, &info) == Status::Ok); // warm
+
+		const uint64_t allocsBefore = AllocationCount();
+		{
+			ScopedRawNewTracking rawTracking;
+			for (int32_t i = 0; i < 20; ++i)
+			{
+				CHECK(PeekScratchArchive(blob, blobBytes, &info) == Status::Ok);
+			}
+			CHECK_MSG(rawTracking.Count() == 0,
+				"PeekScratchArchive allocated %llu time(s) outside the seam",
+				static_cast<unsigned long long>(rawTracking.Count()));
+		}
+		CHECK(AllocationCount() == allocsBefore);
+	}
+}
 
 static void TestScratchBanks()
 {
@@ -11574,6 +12044,16 @@ static void TestChannelQueryOnlyStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended`. An unsynchronized start races the reader's
+	// 300 fast iterations against OS scheduling of the writer thread -- under concurrent
+	// machine load the reader can finish first and the storm never exercises a concurrent
+	// publish at all. Bounded so a genuine append/publish regression fails loudly here
+	// instead of leaving the loop to run vacuously.
+	CHECK_MSG(WaitForPublishPastCount(fx.bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", fx.bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
 	int32_t maxCountSeen = 0;
@@ -11594,7 +12074,11 @@ static void TestChannelQueryOnlyStorm()
 			iter, C);
 
 		// The channel query over the fresh snapshot succeeds with finite scores (a torn /
-		// stale sub-norm would surface here as a non-finite or wrong score).
+		// stale sub-norm would surface here as a non-finite or wrong score). One CHECK per
+		// iteration covering every returned hit -- the hit count `n` itself moves with
+		// scheduling (how far the writer has appended by this iteration), so a per-hit CHECK
+		// would make the suite's total check count scheduling-dependent too. Every score is
+		// still examined; only the number of CHECK calls is now fixed at one per iteration.
 		Workspace ws;
 		Hit hits[10];
 		int32_t n = 0;
@@ -11604,15 +12088,23 @@ static void TestChannelQueryOnlyStorm()
 		params.segmentCount = 1;
 		params.excludeBits = tombs.data();
 		CHECK(Query(snap, qbuf.F32(), params, ws, hits, &n) == Status::Ok);
+		bool allFinite = true;
 		for (int32_t i = 0; i < n; ++i)
 		{
-			CHECK(std::isfinite(hits[i].score));
+			allFinite = allFinite && std::isfinite(hits[i].score);
 		}
+		CHECK_MSG(allFinite, "channel query returned a non-finite score (iter %d, n %d)",
+			iter, n);
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 	// The reader must have observed the count ADVANCE past the initial rows, or the storm
-	// never exercised a concurrent publish (the P-1 defect this rewrite fixes).
+	// never exercised a concurrent publish (the P-1 defect this rewrite fixes). NOT implied
+	// by the wait above: the gate polls bank.Count() directly, while maxCountSeen is
+	// accumulated from snap.count via bank.Snapshot() -- a different read path. This is the
+	// check that catches a regression in Snapshot's own acquire ordering (Snapshot returning
+	// a stale count even though Count() itself has advanced); it is a live guard on a
+	// distinct path from the gate and must not be removed as redundant with it.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -11671,6 +12163,14 @@ static void TestChannelScopedReductionStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended` -- see WaitForPublishPastCount. Without it,
+	// the reader's 200 fast iterations can complete before the OS schedules the writer at
+	// all under concurrent load, and the storm never exercises a concurrent publish.
+	CHECK_MSG(WaitForPublishPastCount(fx.bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", fx.bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	std::vector<float> recomputed(static_cast<size_t>(capacity) * cc);
 	int32_t maxCountSeen = 0;
@@ -11707,6 +12207,11 @@ static void TestChannelScopedReductionStorm()
 	}
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
+	// NOT implied by the wait above: the gate polls bank.Count() directly, while
+	// maxCountSeen is accumulated from snap.count via bank.Snapshot() -- a different read
+	// path. This is the check that catches a regression in Snapshot's own acquire ordering
+	// (Snapshot returning a stale count even though Count() itself has advanced); it is a
+	// live guard on a distinct path from the gate and must not be removed as redundant.
 	CHECK_MSG(maxCountSeen > appended,
 		"reader never observed a freshly-published row (count stayed at %d)", maxCountSeen);
 }
@@ -12502,17 +13007,17 @@ static void TestPerChannelRecallOracle()
 	}
 }
 
-// [hole] Version/header coherence. version.h must declare v3.0.0 for the v3.0 release. RED now
-// (it reads 2/5/0); the header is bumped separately. Kept as a standalone assertion so the release-version
-// truth has a test, not just a header edit.
+// Version/header coherence: version.h declares the release this tree IS. Kept as a
+// standalone assertion so the release-version truth has a test, not just a header edit —
+// the CHANGELOG's newest entry and these three numbers move together or the suite says so.
 static void TestVersionHeaderCoherence()
 {
 	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
-		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.2.1, got %d", SUPERFAISS_VERSION_MAJOR);
-	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 2,
-		"SUPERFAISS_VERSION_MINOR should be 2 for v3.2.1, got %d", SUPERFAISS_VERSION_MINOR);
-	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 1,
-		"SUPERFAISS_VERSION_PATCH should be 1 for v3.2.1, got %d", SUPERFAISS_VERSION_PATCH);
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MAJOR);
+	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 3,
+		"SUPERFAISS_VERSION_MINOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MINOR);
+	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
+		"SUPERFAISS_VERSION_PATCH should be 0 for v3.3.0, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 // ===========================================================================
@@ -13186,6 +13691,16 @@ static void TestRelabelExclusiveDrainStorm()
 		}
 	});
 
+	// Deterministic liveness gate: do not begin the measured loop until the writer has
+	// actually published a row past `appended` -- see WaitForPublishPastCount. Without it,
+	// the reader's 300 fast pin/snapshot iterations can complete before the OS schedules the
+	// writer thread at all under concurrent load, and the storm never exercises a concurrent
+	// publish (or, since the writer's very first iteration is a relabel, a concurrent
+	// relabel either).
+	CHECK_MSG(WaitForPublishPastCount(bank, appended),
+		"writer never published a row past appended before the reader began measuring "
+		"(count stayed at %d)", bank.Count());
+
 	std::vector<uint32_t> tombs(ScratchBank::TombstoneWords(capacity), 0u);
 	int32_t maxCountSeen = 0;
 	for (int32_t iter = 0; iter < 300; ++iter)
@@ -13213,6 +13728,10 @@ static void TestRelabelExclusiveDrainStorm()
 	stop.store(true, std::memory_order_relaxed);
 	writer.join();
 
+	// The writer's own iteration order puts a relabel attempt at iter 0, before its first
+	// append attempt at iter 1 -- so the wait above (which requires at least one successful
+	// append) already implies at least one completed relabel by construction, and this check
+	// is deterministic as a consequence rather than independently scheduling-dependent.
 	CHECK_MSG(relabelCount.load(std::memory_order_relaxed) > 0,
 		"relabel storm: the writer never completed a relabel");
 	BankView finalSnap;
@@ -13230,6 +13749,11 @@ static void TestRelabelExclusiveDrainStorm()
 	CHECK_MSG(matchedSomeTarget,
 		"relabel storm: the final channel table never left the fixture's initial (1-channel) "
 		"table -- Relabel never mutated the bank under concurrent load");
+	// NOT implied by the wait above: the gate polls bank.Count() directly, while
+	// maxCountSeen is accumulated from snap.count via bank.Snapshot() -- a different read
+	// path. This is the check that catches a regression in Snapshot's own acquire ordering
+	// (Snapshot returning a stale count even though Count() itself has advanced); it is a
+	// live guard on a distinct path from the gate and must not be removed as redundant.
 	CHECK_MSG(maxCountSeen > appended,
 		"relabel storm: reader never observed a freshly-published row (count stayed at %d)",
 		maxCountSeen);
@@ -15289,6 +15813,107 @@ static void TestM1TrustBoundaries()
 		CHECK_MSG(BuildKnnNeighbors(b1.view, 1, true, nb1.data(), ws0) == Status::InvalidArgument,
 			"BuildKnnNeighbors on singleton (count=1, self-excluded) must reject — no k-th neighbor");
 	}
+}
+
+// A caller-supplied neighbour value is used to index the neighbours array (MutualFilter)
+// and the union-find scratch (ConnectedComponents). Values are validated for the -1
+// "no neighbour" sentinel; a value >= count is a malformed input that must degrade to a
+// dropped edge, never an out-of-bounds read or write. BuildKnnNeighbors always produces
+// in-range values, so this is reachable only through a hand-built neighbour list — the
+// same trust posture the other core entry points hold on the indices they are handed.
+static void TestGraphOutOfRangeNeighbours()
+{
+	Rng rng(0x60B5);
+	const int32_t dims = 8, count = 6, k = 2;
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank b(src, count, dims, Quantization::Float32, Metric::L2);
+
+	// A neighbour list holding out-of-range values: count (one past the end), a large
+	// positive, and INT32_MAX, mixed with the -1 sentinel. Every slot is poisoned; none
+	// may be dereferenced as an index.
+	std::vector<int32_t> neighbours(static_cast<size_t>(count) * k);
+	for (int32_t i = 0; i < count; ++i)
+	{
+		neighbours[static_cast<size_t>(i) * k + 0] = count;       // exactly one past the end
+		neighbours[static_cast<size_t>(i) * k + 1] = (i % 2) ? INT32_MAX : -1;
+	}
+
+	std::vector<uint8_t> flags(static_cast<size_t>(count) * k, 0xEE);
+	CHECK(MutualFilter(count, k, neighbours.data(), flags.data()) == Status::Ok);
+	// No out-of-range value can be its own mutual: every flag is 0, and nothing crashed.
+	for (uint8_t f : flags)
+	{
+		CHECK(f == 0);
+	}
+
+	// Force the union-find to CONFRONT the out-of-range neighbour: hand it a flag array
+	// with every slot marked mutual, so ConnectedComponents must act on each neighbour
+	// value, and a duplicate-group table whose every representative is INT32_MAX. With the
+	// < count guard both are dropped and each row is its own component. Without it, find()
+	// indexes parent[] with these values — undefined behaviour. This cell asserts the
+	// GUARDED result holds on poisoned input; it is not a crash reproduction, because an
+	// out-of-bounds access in a non-instrumented build is UB that neither reliably crashes
+	// nor changes this observable, so it cannot serve as the guard's oracle here. The
+	// address-sanitizer job in core CI is where the unguarded access is caught as a fault.
+	std::vector<uint8_t> allMutual(static_cast<size_t>(count) * k, 1);
+	std::vector<int32_t> badGroups(static_cast<size_t>(count));
+	for (int32_t i = 0; i < count; ++i)
+	{
+		badGroups[static_cast<size_t>(i)] = INT32_MAX; // every representative wildly out of range
+	}
+	std::vector<int32_t> ids(static_cast<size_t>(count), -999), uf(static_cast<size_t>(count), 0);
+	CHECK(ConnectedComponents(count, k, neighbours.data(), allMutual.data(), badGroups.data(),
+			  ids.data(), uf.data()) == Status::Ok);
+	// Every edge dropped (poisoned neighbours and poisoned groups alike), so each row is
+	// its own component — a defined, in-range result, no corruption, no crash.
+	for (int32_t r = 0; r < count; ++r)
+	{
+		CHECK(ids[r] == r);
+	}
+}
+
+// The int8 channel-analytics legs score their sub-range through detail::DotI8I8, whose
+// SIMD paths assume a length on the 16-byte int8 grid and carry no scalar tail. A
+// validated bank's channel table is grid-aligned, so the archive loader rejects an
+// off-grid table before it can be scored (covered elsewhere); this closes the same gap
+// for a HAND-BUILT BankView that never went through validation, so the analytics
+// functions themselves refuse rather than read SIMD-padded slop.
+static void TestChannelAnalyticsOffGridRejected()
+{
+	Rng rng(0x0FF6);
+	const int32_t dims = 32, count = 8; // int8 grid is 16; 8 is deliberately off it
+	std::vector<float> src;
+	for (int32_t i = 0; i < count * dims; ++i) src.push_back(rng.NextFloat());
+	GBank b(src, count, dims, Quantization::Int8, Metric::Cosine);
+
+	// A hand-built channel table with an off-grid range (offset 0, length 8) — a table a
+	// validated bank could never carry.
+	const ChannelInfo offGrid[1] = {{0, 8}};
+	BankView view = b.view;
+	view.channels = offGrid;
+	view.channelCount = 1;
+
+	Workspace ws;
+	std::vector<XdQuery> qbuf(static_cast<size_t>(count));
+	std::vector<Hit> hbuf(static_cast<size_t>(count));
+	std::vector<int32_t> nbuf(static_cast<size_t>(count));
+	float out = -1.0f;
+	CHECK(MeanNNCrossDeviceChannel(view, nullptr, view, nullptr, 0, qbuf.data(),
+			  hbuf.data(), nbuf.data(), ws, &out) == Status::InvalidArgument);
+	CHECK(MaxNNCrossDeviceChannel(view, nullptr, view, nullptr, 0, qbuf.data(),
+			  hbuf.data(), nbuf.data(), ws, &out) == Status::InvalidArgument);
+
+	std::vector<int8_t> cA(static_cast<size_t>(view.paddedDims));
+	std::vector<int8_t> cB(static_cast<size_t>(view.paddedDims));
+	const int32_t idx[1] = {0};
+	CHECK(CentroidDistanceCrossDeviceChannel(view, idx, 1, nullptr, nullptr, view, idx, 1,
+			  nullptr, nullptr, Metric::Cosine, 0, cA.data(), cB.data(), &out) ==
+		Status::InvalidArgument);
+
+	std::vector<int8_t> cScratch(static_cast<size_t>(view.paddedDims));
+	CHECK(SpreadCrossDeviceChannel(view, idx, 1, nullptr, Reduce::Mean, 0, cScratch.data(),
+			  &out) == Status::InvalidArgument);
 }
 
 // M1 / dim 2 (byte-confirm) + dim 7 (int8 same-decode-different-scale NOT unioned) —
@@ -17864,6 +18489,7 @@ namespace
 		{"scratch.h", "ScratchBank::GetChannels", AllocBinding::Trivial, "TestAllocFlatScratchAccessors", 1},
 		{"scratch.h", "ScratchBank::RecallReportStale", AllocBinding::Trivial,
 			"TestAllocFlatScratchAccessors", 1},
+		{"scratch.h", "PeekScratchArchive", AllocBinding::Binds, "TestPeekScratchArchive", 1},
 
 		// --- topk.h (6 entry points, all Trivial) ---
 		{"topk.h", "Better", AllocBinding::Trivial, "TestAllocFlatHeaderOnlyMath", 1},
@@ -17899,7 +18525,7 @@ namespace
 		{"alloc.h", 26}, {"analytics.h", 10}, {"bake.h", 5}, {"compose.h", 4},
 		{"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
 		{"matching.h", 1}, {"novelty.h", 4}, {"pca.h", 2}, {"query.h", 5},
-		{"scratch.h", 40}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
+		{"scratch.h", 41}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
 		{"validate.h", 5}, {"version.h", 0},
 	};
 
@@ -18716,7 +19342,7 @@ static void TestAllocFlatBakeAndPca()
 	const int32_t componentCount = 2, iterations = 4;
 	std::vector<float> mean(static_cast<size_t>(cosineBank.view.dims));
 	std::vector<float> components(static_cast<size_t>(componentCount) * cosineBank.view.dims);
-	std::vector<float> scratch(static_cast<size_t>(cosineBank.view.dims));
+	std::vector<double> scratch(static_cast<size_t>(cosineBank.view.dims));
 	std::vector<float> coords(static_cast<size_t>(count) * componentCount);
 
 	auto driveOnce = [&]() {
@@ -19254,6 +19880,7 @@ int main()
 	TestIntersect();
 	TestPca();
 	TestSegmentedScan();
+	TestSegmentedEqualsWholeRowAcrossWidths();
 	TestPerChannelCosine();
 	TestScratchBanks();
 	TestScratchChannelCreateRejections();
@@ -19363,6 +19990,8 @@ int main()
 
 	// V3.2 red suite: Bank Inspector I — module M1 graph.h.
 	TestM1TrustBoundaries();
+	TestGraphOutOfRangeNeighbours();
+	TestChannelAnalyticsOffGridRejected();
 	TestM1DuplicateGroupingByteConfirm();
 	TestM1EdgesExactAcrossMetrics();
 	TestM1DuplicateUnionConstructionCounts();
@@ -19393,6 +20022,13 @@ int main()
 	TestS1FlatAllocationNoveltyProbeDistance();
 	TestS1FlatAllocationKthNeighborDistanceProbe();
 	TestS1FlatAllocationMutualNearestMatches();
+
+	// V3.3.0: public-path geometry ceilings, and the archive peek the host trailer
+	// validation is built on.
+	TestScratchGeometryCeilings();
+	TestScratchLoadValidatesRetainedRegion();
+	TestEmptyCosineChannelBankValidates();
+	TestPeekScratchArchive();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every
 	// cell it references above has already executed at least once.

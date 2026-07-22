@@ -77,8 +77,13 @@ Status ValidateBank(const BankView& bank)
 			}
 			prevEnd = channel.offset + channel.length;
 		}
-		// Per-channel cosine requires the baked inverse sub-norms.
-		if (bank.metric == Metric::Cosine && bank.channelInvNorms == nullptr)
+		// Per-channel cosine requires the baked inverse sub-norms — one per row, so a bank
+		// with no rows requires none. Demanding the array unconditionally made a zero-row
+		// Cosine channel bank unrepresentable, which is not a degenerate case: it is what
+		// a channel-carrying scratch bank graduates into when every row has been removed,
+		// and an emptied channel bank is still a channel bank. No scan reads the array at
+		// zero rows, so there is nothing to protect against here.
+		if (bank.metric == Metric::Cosine && bank.count > 0 && bank.channelInvNorms == nullptr)
 		{
 			return Status::BadFormat;
 		}

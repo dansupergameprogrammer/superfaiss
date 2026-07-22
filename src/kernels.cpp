@@ -356,10 +356,18 @@ static float L2I8Sse(const int8_t* row, float scale, const float* query, int32_t
 	return (SumLanes(acc0) + SumLanes(acc1)) + (SumLanes(acc2) + SumLanes(acc3));
 }
 
-// Dispatchers: AVX2+FMA when the CPU has it and the stride fits 8-lane blocks
+// Dispatchers: AVX2+FMA when the CPU has it and the LENGTH fits 8-lane blocks
 // (float32 strides are multiples of 4, not always 8; int8 strides are always multiples
-// of 16). The choice is a pure function of device and bank shape, so per-device
-// determinism is preserved.
+// of 16). The choice is a pure function of device and the length handed in, so
+// per-device determinism is preserved.
+//
+// These dispatchers are the only place the choice is made. The segmented scan reaches
+// them through ResolveRowKernels' function-pointer table and calls them once per scan
+// range, so the deciding length is the RANGE's, not the bank's — which is why the rule
+// lives here, keyed on the argument, rather than being resolved once from bank shape.
+// Wiring an AVX2 kernel into that table directly creates a second selection rule, and
+// the whole-row and segmented paths then compute different last-ulp results on the same
+// row; see TestSegmentedEqualsWholeRowAcrossWidths.
 
 float DotF32(const float* row, const float* query, int32_t paddedDims)
 {
@@ -908,18 +916,33 @@ namespace
 	inline FRowKernels ResolveRowKernels()
 	{
 		FRowKernels k;
+		// The float32 slots hold the DISPATCHERS, never the AVX2 kernels directly. Those
+		// dispatchers apply the `% 8 == 0` rule to the length they are actually handed,
+		// and float32 strides are multiples of 4, not 8 — so wiring the AVX2 kernel in
+		// here made this a second kernel-selection rule, and the segmented scan computed
+		// an 8-lane FMA where the whole-row scan computed a 4-lane mul-add. The results
+		// differ in the last ulp, which falsified two published guarantees: that a
+		// degenerate one-segment query equals the whole-row scan, and that decomposition
+		// contributions sum bit-exactly to the score the scan produced.
+		//
+		// Note the rule keys on the RANGE length, not on paddedDims: this scan calls the
+		// kernel once per scan range, so a bank whose stride is a multiple of 8 can still
+		// present a range that is not. One rule, evaluated on the length in hand, is what
+		// makes the two paths one path.
+		//
+		// int8 needs no such care: channel and segment ranges sit on the 16-byte element
+		// grid, so an int8 length is always a multiple of 16, and its dispatcher carries
+		// no stride condition to diverge over.
+		k.dotF32 = detail::DotF32;
+		k.l2F32 = detail::L2F32;
 #if defined(SUPERFAISS_SIMD_SSE)
 		if (detail::IsAvx2())
 		{
-			k.dotF32 = detail::DotF32Avx2;
-			k.l2F32 = detail::L2F32Avx2;
 			k.dotI8 = detail::DotI8Avx2;
 			k.l2I8 = detail::L2I8Avx2;
 			return k;
 		}
 #endif
-		k.dotF32 = detail::DotF32;
-		k.l2F32 = detail::L2F32;
 		k.dotI8 = detail::DotI8;
 		k.l2I8 = detail::L2I8;
 		return k;

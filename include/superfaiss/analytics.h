@@ -109,8 +109,13 @@ Status SpreadCrossDevice(
 // inherits it once Tier 1 put the channel table on the snapshot. A bank with no channel
 // table, or `channel` outside [0, channelCount), is InvalidArgument; a zero-sub-norm
 // channel member floors to a defined 0 in a reduction, while a single
-// per-channel query on a zero-norm sub-vector still rejects (ZeroNormQuery). The scratch
+// per-channel query on a zero-norm sub-vector still rejects (ZeroNormQuery). The
 // scratch-buffer sizing matches the whole-vector operators.
+//
+// MeanNNCrossDeviceChannel/MaxNNCrossDeviceChannel additionally stage a pre-lift of the
+// target's non-excluded sub-rows in `ws` (each target's self-dot is computed once, not
+// once per source row), so both can return OutOfMemory if that reservation fails, in
+// addition to the InvalidArgument cases above.
 Status CentroidDistanceCrossDeviceChannel(
 	const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
 	const int32_t* weightsA, const uint32_t* excludeBitsA,

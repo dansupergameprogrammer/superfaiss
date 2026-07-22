@@ -398,8 +398,25 @@ inline bool ChannelSubRange(const BankView& bank, int32_t channel, int32_t* outO
 	{
 		return false;
 	}
-	*outOffset = bank.channels[channel].offset;
-	*outLength = bank.channels[channel].length;
+	const int32_t offset = bank.channels[channel].offset;
+	const int32_t length = bank.channels[channel].length;
+	// Every channel leg below scores this sub-range through detail::DotI8I8, whose SIMD
+	// paths assume a length on the int8 grid (kAlignment / ElementSize(Int8) == 16) and
+	// carry no scalar remainder tail — an off-grid range would read SIMD-padded slop. A
+	// validated bank's channel table is grid-aligned by construction (validate.cpp), so
+	// this never fires on production data; it closes the gap for a hand-built BankView,
+	// exactly as novelty.cpp does for its own DotI8I8 channel path. Resolved here, at the
+	// single point all three legs read the range, rather than copied into each.
+	if (bank.quant == Quantization::Int8)
+	{
+		const int32_t grid = kAlignment / ElementSize(Quantization::Int8);
+		if (offset % grid != 0 || length % grid != 0)
+		{
+			return false;
+		}
+	}
+	*outOffset = offset;
+	*outLength = length;
 	return true;
 }
 
@@ -453,12 +470,12 @@ Status MakeChannelCentroid(const BankView& bank, const int32_t* rowIndices, int3
 Status NNDivergenceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel, Reduce reduce,
-	XdQuery* queryScratch, float* outValue)
+	XdQuery* queryScratch, Workspace& ws, float* outValue)
 {
-	// Unlike the whole-vector NNDivergence (which routes through QueryXdBatch), the channel
-	// path scores each nearest in place, so it needs only the source-lift buffer
-	// (queryScratch) — the Hit/count/Workspace scratch the public signature carries for
-	// parity with the whole-vector twin is unused here and not required non-null.
+	// The channel path scores each nearest in place rather than through QueryXdBatch, so it
+	// needs the source-lift buffer (queryScratch) plus the Workspace, which stages the
+	// target lift (below). The Hit/count scratch the public signature carries for parity
+	// with the whole-vector twin is unused here.
 	if (outValue == nullptr || queryScratch == nullptr ||
 		!IsInt8CrossDevice(source) || !IsInt8CrossDevice(target) ||
 		source.paddedDims != target.paddedDims)
@@ -520,6 +537,31 @@ Status NNDivergenceChannel(
 	// ZeroNormQuery rejection is for a SINGLE per-channel query, not a reduction over a pool
 	// (a valid row can have a whole-row-normalized image with one channel exactly zero).
 
+	// Pre-lift the non-excluded target sub-rows ONCE: each target's self-dot
+	// (DotI8I8(timg, timg, length)) is independent of the source, so recomputing it inside
+	// the inner loop scored it m times per target. Stage the target queries in the
+	// Workspace's XdQuery scratch (warm-reusable, zero steady-state allocation) so the
+	// inner loop reads a prebuilt query. The int8 image pointers alias the target bank
+	// directly — targets are not requantized — so only scale and self-dot are computed.
+	if (!ws.ReserveXdQuery(target.paddedDims, target.count))
+	{
+		return Status::OutOfMemory;
+	}
+	XdQuery* targetQueries = ws.XdSlots();
+	int32_t tCount = 0;
+	for (int32_t r = 0; r < target.count; ++r)
+	{
+		if (IsExcluded(targetExcludeBits, r))
+		{
+			continue;
+		}
+		const int8_t* timg = tgtRows + static_cast<int64_t>(r) * tpd + tOff;
+		targetQueries[tCount].q8 = timg;
+		targetQueries[tCount].scale = detail::FloatBitsToDouble(target.scales[r]);
+		targetQueries[tCount].sqSum = detail::DotI8I8(timg, timg, length);
+		++tCount;
+	}
+
 	double acc = 0.0;
 	double best = 0.0;
 	bool have = false;
@@ -529,19 +571,13 @@ Status NNDivergenceChannel(
 		const XdQuery& q = queryScratch[i];
 		double nn = 0.0;
 		bool haveNn = false;
-		for (int32_t r = 0; r < target.count; ++r)
+		for (int32_t t = 0; t < tCount; ++t)
 		{
-			if (IsExcluded(targetExcludeBits, r))
-			{
-				continue;
-			}
-			const int8_t* timg = tgtRows + static_cast<int64_t>(r) * tpd + tOff;
-			const XdQuery tq{timg, detail::FloatBitsToDouble(target.scales[r]),
-				detail::DotI8I8(timg, timg, length)};
 			// A zero sub-norm target is NOT skipped: XdChannelPairScore floors a degenerate
 			// Cosine member to a defined 0 (C-5), so a zero-energy target scores distance 0
 			// and is the nearest -- consistent with Centroid/Spread and never NaN.
-			const double d = static_cast<double>(XdChannelPairScore(q, tq, length, metric));
+			const double d =
+				static_cast<double>(XdChannelPairScore(q, targetQueries[t], length, metric));
 			const bool better = !haveNn || (metric == Metric::Dot ? d > nn : d < nn);
 			if (better)
 			{
@@ -621,21 +657,21 @@ Status CentroidDistanceCrossDeviceChannel(
 Status MeanNNCrossDeviceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
-	XdQuery* queryScratch, Hit*, int32_t*, Workspace&,
+	XdQuery* queryScratch, Hit*, int32_t*, Workspace& ws,
 	float* outValue)
 {
 	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
-		Reduce::Mean, queryScratch, outValue);
+		Reduce::Mean, queryScratch, ws, outValue);
 }
 
 Status MaxNNCrossDeviceChannel(
 	const BankView& source, const uint32_t* sourceExcludeBits,
 	const BankView& target, const uint32_t* targetExcludeBits, int32_t channel,
-	XdQuery* queryScratch, Hit*, int32_t*, Workspace&,
+	XdQuery* queryScratch, Hit*, int32_t*, Workspace& ws,
 	float* outValue)
 {
 	return NNDivergenceChannel(source, sourceExcludeBits, target, targetExcludeBits, channel,
-		Reduce::Max, queryScratch, outValue);
+		Reduce::Max, queryScratch, ws, outValue);
 }
 
 Status SpreadCrossDeviceChannel(
@@ -765,7 +801,10 @@ Status ProjectionReport(const BankView& bank, const float* paddedDirection,
 			{
 				acc += static_cast<double>(row[i]) * static_cast<double>(paddedDirection[i]);
 			}
-			acc *= static_cast<double>(bank.scales[r]);
+			// Decode the stored scale through the DAZ-safe path, as every other scale read
+			// in this file does, so a subnormal scale decodes identically whether or not
+			// the calling thread has denormals-are-zero enabled.
+			acc *= detail::FloatBitsToDouble(bank.scales[r]);
 		}
 		else
 		{

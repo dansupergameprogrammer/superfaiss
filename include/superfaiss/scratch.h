@@ -59,6 +59,37 @@ struct ScratchRecallReport
 	bool informative = false;  // false when liveRows < kRecallInformativeRows
 };
 
+// What a serialized scratch archive declares about itself, read from its header
+// without loading it (PeekScratchArchive below).
+struct ScratchArchiveInfo
+{
+	int32_t capacity = 0;
+	int32_t count = 0;
+	int32_t dims = 0;
+	int32_t paddedDims = 0;
+	Metric metric = Metric::Dot;
+	Quantization quant = Quantization::Float32;
+	bool retainFloats = false;
+	// The archive's channel table, or count 0 for a single-space archive.
+	int32_t channelCount = 0;
+	ChannelInfo channels[kMaxChannels] = {};
+	// Exactly the number of bytes ScratchBank::Load consumes for this archive.
+	int64_t archiveBytes = 0;
+};
+
+// Reads a scratch archive's header (and channel table) from a contiguous byte span and
+// reports its geometry plus the exact byte length a Load will consume — without
+// allocating an arena, reading the payload, or touching any bank. Applies the same
+// header rules Load does, so a header Load would reject is rejected here with the same
+// status; a span shorter than the archive it declares is BadFormat.
+//
+// This exists for hosts that append their own trailer after the archive (the plugin's
+// channel-name frame is one): archiveBytes locates that trailer so it can be validated
+// BEFORE anything is committed. Without it a host must load first and discover a broken
+// trailer with the rows already replaced, which is degrade-then-notice rather than
+// reject-over-degrade. Reading the header twice is free; unwinding a load is not.
+Status PeekScratchArchive(const void* data, int64_t bytes, ScratchArchiveInfo* outInfo);
+
 class ScratchBank
 {
 public:
@@ -78,6 +109,13 @@ public:
 	// Allocates the arena (rows + scales + tombstones + staging) in ONE allocation
 	// through the seam — zero steady-state allocation after Create. Capacity is the
 	// caller's memory budget made explicit. Not valid to call on a created bank.
+	//
+	// Geometry ceilings (every Create overload, and Grow): capacity <= kMaxBankRows and
+	// dims <= kMaxCrossDeviceDims, enforced BEFORE the arena size is computed. The arena
+	// math multiplies capacity by dims in signed int64, so an unbounded pair is overflow
+	// — undefined behavior rather than a refused allocation. Over-cap geometry is
+	// InvalidArgument. These are the immutable format's own caps, so a bank the
+	// constructor refuses is one no archive could carry either.
 	Status Create(
 		int32_t capacity,
 		int32_t dims,
